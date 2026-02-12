@@ -1,0 +1,51 @@
+# config/trading_modes/custom.yaml
+# Пустой шаблон для полностью ручной настройки
+# Используй этот файл, если хочешь создать свой собственный режим
+# Просто раскомментируй нужные строки и задай свои значения
+# Все остальные параметры будут браться из default.yaml
+
+# risk:
+#   default_risk_pct: 1.2               # Твой риск на сделку (в %)
+#   manual_prob_risk_levels:            # Твои уровни риска по вероятности
+#     0.65: 0.8
+#     0.75: 1.2
+#     0.85: 2.0
+#     0.92: 3.0
+#   risk_multiplier_enabled: true
+#   risk_multiplier:
+#     0.80: 1.4
+#     0.90: 1.8
+
+# Фильтр сигналов
+# prob_threshold: 0.72                # Твой минимальный порог вероятности
+# quiet_mode: true                    # Включить/выключить тихий режим
+# quiet_prob_threshold: 0.80          # Порог для тихого
+# use_only_mixed_anomaly: false       # Только CV или все
+# min_pr_threshold: 0.40              # Твой порог PR
+
+# Управление позицией
+# soft_entry_enabled: true
+# soft_levels: [0.68, 0.78, 0.90]     # Твои пороги
+# soft_sizes: [0.3, 0.4, 0.3]         # Твои доли
+# soft_timeout: 6                     # Твой таймаут
+
+# tp_mode: "dynamic_level"            # average_candle / dynamic_level
+# sl_mode: "atr_chandelier"           # classic / atr_chandelier
+# trailing_enabled: true
+# trailing_type: "distance"           # classic / distance
+# trailing_activation_pct: 0.5
+# trailing_distance_pct: 0.8
+
+# pr:
+#   mode: "normalized"                # classic / normalized
+#   min_deals_in_pr_period: 8         # Твой минимум сделок
+#   min_pr_threshold: 0.40            # Твой порог PR
+
+# Дополнительные ограничения
+# max_open_positions: 3               # Твой максимум одновременных позиций
+# max_daily_loss_pct: 5.0             # Твой дневной стоп-лосс в %
+# trading_hours_restriction: false    # true — ограничить часы торговли
+
+# Логи
+# logging:
+#   level: "INFO"                     # DEBUG / INFO / WARNING / ERROR
