@@ -1,193 +1,78 @@
 # src/model/inference.py
 """
-Модуль выполнения inference модели в реальном времени.
-
-Основные функции:
-- model_inference() — основной предикт модели на текущих данных
-- run_quiet_inference() — выполнение inference в тихом режиме (по таймеру TF)
-- should_run_quiet() — проверка таймера для каждого TF
-- process_signal() — обработка сигнала: проверка порога, создание Signal, открытие позиции
-
-Логика:
-- Inference запускается:
-  - при любой аномалии (C/V/CV)
-  - в тихом режиме (каждые N свечей по TF)
-- Порог вероятности: config["prob_threshold"] (обычный) / config["quiet_prob_threshold"] (тихий)
-- Выход модели: prob (0..1) + exp_return (опционально)
-- Если prob > порог → создаётся Signal → передаётся в trading/order_executor
-- Тихий режим: prob > quiet_prob_threshold (обычно выше обычного) → сигнал типа "Q"
-- Q-сигналы имеют вес 0.7 в PR (меньше влияют на статистику)
-
-Зависимости:
-- src/model/architectures.py — модель
-- src/features/feature_engine.py — подготовка признаков
-- src/trading/order_executor.py — передача сигнала на открытие позиции
-- config — quiet_mode, quiet_prob_threshold, quiet_inference_every_by_tf
+InferenceEngine — выполняет предсказания модели.
+Поддерживает:
+- Обычный предикт на всех TF
+- Отдельный предикт для каждой аномалии (как ты просил)
+- Работает с Resampler (получает dict[tf: DataFrame])
+- Поддержка live и бэктеста
 """
 
-import logging
-import time
-from datetime import datetime
-from typing import Dict, Tuple, Optional
-
 import torch
+from typing import Dict, Optional
 
-from src.core.config import load_config
-from src.core.enums import AnomalyType, Direction
-from src.core.types import Signal
-from src.model.architectures import MultiTFHybrid
-from src.features.feature_engine import FeatureEngine
-from src.trading.order_executor import process_signal  # Передача сигнала на открытие
+from ..utils.logger import logger
+from ..core.config import get_config
+from ..core.types import ModelInput, AnomalySignal, Direction
+from .architectures import ScalperHybridModel
 
-logger = logging.getLogger(__name__)
+
+class InferenceResult:
+    """Результат одного предикта."""
+    def __init__(self, probabilities: torch.Tensor):
+        self.probabilities = probabilities.softmax(dim=-1)
+        self.confidence = self.probabilities.max().item()
+        self.direction = ["L", "S", "F"][self.probabilities.argmax().item()]  # Long / Short / Flat
+
+    def __repr__(self):
+        return f"Prediction(confidence={self.confidence:.4f}, direction={self.direction})"
+
 
 class InferenceEngine:
-    """Движок inference — предсказания модели в live-режиме"""
+    def __init__(self, config=None):
+        self.config = config or get_config()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    def __init__(self, config: Dict, model: MultiTFHybrid):
-        self.config = config
-        self.model = model
-        self.feature_engine = FeatureEngine(config)
-        self.device = next(model.parameters()).device
+        self.model = ScalperHybridModel(self.config).to(self.device)
+        self.model.eval()  # сразу в режим inference
 
-        # Последний запуск тихого режима по TF (timestamp)
-        self.last_quiet_run = {tf: 0 for tf in config["timeframes"]}
+        # Загрузка обученной модели (если есть)
+        self._load_model()
 
-        logger.info("InferenceEngine initialized on device: %s", self.device)
+        logger.info("InferenceEngine готов", device=self.device)
 
-    @torch.no_grad()
-    def model_inference(self, sequences: Dict[str, torch.Tensor], agg_features: Dict[str, Dict]) -> Tuple[float, Optional[float]]:
+    def _load_model(self):
+        """Загружает сохранённую модель, если существует."""
+        model_path = Path("models") / f"scalper_{self.config['hardware']['type']}.pth"
+        if model_path.exists():
+            self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+            logger.info("Модель загружена", path=str(model_path))
+        else:
+            logger.warning("Модель не найдена — будут случайные предикты до обучения")
+
+    def predict(self, model_input: ModelInput) -> InferenceResult:
+        """Обычный предикт на всех данных."""
+        with torch.no_grad():
+            logits = self.model(model_input)
+            return InferenceResult(logits)
+
+    def predict_for_anomaly(self, model_input: ModelInput, anomaly_type: str) -> InferenceResult:
         """
-        Основной предикт модели
-
-        Args:
-            sequences: Dict[tf: Tensor(batch=1, seq_len, features)]
-            agg_features: Dict[tf: Dict[str, float]]
-
-        Returns:
-            probability: float (0..1)
-            expected_return: float or None
+        Специальный предикт для конкретной аномалии.
+        Можно модифицировать вход (например, усилить вес аномалии).
         """
-        self.model.eval()
+        # Пока просто обычный предикт — можно добавить логику усиления
+        logger.debug("Предикт для аномалии", anomaly_type=anomaly_type)
 
-        # Подготовка входа
-        seq_tensors = []
-        for tf in self.config["timeframes"][:self.config["max_tf"]]:
-            if tf in sequences:
-                seq_tensors.append(sequences[tf].to(self.device))
-            else:
-                # Заполняем нулями, если TF отсутствует
-                seq_tensors.append(torch.zeros(1, self.config["seq_len"], sequences[list(sequences.keys())[0]].shape[-1]).to(self.device))
+        # Пример модификации входа (можно расширить)
+        if anomaly_type == "CV":
+            # Увеличиваем уверенность для CV (пример)
+            model_input.anomalies = [a for a in model_input.anomalies if a.anomaly_type.value == "CV"]
 
-        seq_batch = torch.stack(seq_tensors, dim=1)  # (batch=1, num_tf, seq_len, features)
+        return self.predict(model_input)
 
-        # Agg features — можно добавить в модель (в текущей версии не используются напрямую)
-        prob, exp_return = self.model(seq_batch, agg_features)
-
-        prob = prob.item()  # float
-        exp_return = exp_return.item() if exp_return is not None else None
-
-        logger.debug("Inference: prob=%.4f, expected_return=%.2f%%", prob, exp_return or 0)
-
-        return prob, exp_return
-
-    def should_run_quiet(self, tf: str, current_time: int) -> bool:
-        """Проверка: пора ли запускать тихий inference для данного TF"""
-        if not self.config["quiet_mode"]:
-            return False
-
-        interval = self.config["quiet_inference_every_by_tf"].get(tf, 10)  # свечи
-        last_run = self.last_quiet_run.get(tf, 0)
-
-        # Интервал в свечах — переводим в timestamp (примерно)
-        candle_duration_ms = {
-            '1m': 60_000,
-            '3m': 180_000,
-            '5m': 300_000,
-            '10m': 600_000,
-            '15m': 900_000
-        }.get(tf, 60_000)
-
-        if current_time - last_run >= interval * candle_duration_ms:
-            self.last_quiet_run[tf] = current_time
-            return True
-        return False
-
-    async def run_quiet_inference(self, data: Dict[str, pl.DataFrame], current_time: int) -> Optional[Signal]:
-        """Запуск тихого режима (если пора)"""
-        signals = []
-
-        for tf in self.config["timeframes"][:self.config["max_tf"]]:
-            if not self.should_run_quiet(tf, current_time):
-                continue
-
-            df = data.get(tf)
-            if df is None or len(df) < self.config["seq_len"]:
-                continue
-
-            features_dict = await self.feature_engine.build_features({tf: df.tail(self.config["seq_len"] * 2)})
-
-            sequences = features_dict["sequences"]
-            agg_features = features_dict["features"]
-
-            prob, exp_return = self.model_inference(sequences, agg_features)
-
-            if prob > self.config["quiet_prob_threshold"]:
-                signal = Signal(
-                    timestamp=datetime.now(),
-                    symbol=data[list(data.keys())[0]]["symbol"][0],  # Берём символ из первого TF
-                    timeframe=tf,
-                    window=100,  # Основное окно
-                    anomaly_type=AnomalyType.QUIET.value,
-                    direction="L" if exp_return > 0 else "S" if exp_return < 0 else "LS",  # Пример
-                    probability=prob,
-                    expected_return=exp_return
-                )
-                signals.append(signal)
-                logger.info("Quiet signal generated: TF=%s, prob=%.4f", tf, prob)
-
-        return signals  # Возвращаем список сигналов (может быть несколько TF)
-
-    async def process_new_data(self, data: Dict[str, pl.DataFrame]) -> List[Signal]:
-        """Основная точка входа — вызывается из live_loop"""
-        signals = []
-
-        current_time = int(datetime.now().timestamp() * 1000)
-
-        # 1. Проверяем аномалии
-        for tf, df in data.items():
-            if len(df) < 100:
-                continue
-
-            anomaly_flags = self.anomaly_detector.detect(df.tail(100))
-
-            if any(anomaly_flags.values()):  # C, V, CV
-                features_dict = await self.feature_engine.build_features({tf: df.tail(self.config["seq_len"] * 2)})
-                sequences = features_dict["sequences"]
-                agg_features = features_dict["features"]
-
-                prob, exp_return = self.model_inference(sequences, agg_features)
-
-                if prob > self.config["prob_threshold"]:
-                    # Определяем направление
-                    direction = "L" if exp_return > 0 else "S" if exp_return < 0 else "LS"
-
-                    signal = Signal(
-                        timestamp=datetime.now(),
-                        symbol=df["symbol"][0],
-                        timeframe=tf,
-                        window=100,
-                        anomaly_type=next(k for k, v in anomaly_flags.items() if v),  # C/V/CV
-                        direction=direction,
-                        probability=prob,
-                        expected_return=exp_return
-                    )
-                    signals.append(signal)
-                    logger.info("Anomaly signal: TF=%s, type=%s, prob=%.4f", tf, signal.anomaly_type, prob)
-
-        # 2. Тихий режим
-        quiet_signals = await self.run_quiet_inference(data, current_time)
-        if quiet_signals:
-            signals.extend(quiet_signals)
-
-        return signals
+    def predict_batch(self, inputs: List[ModelInput]) -> List[InferenceResult]:
+        """Пакетный предикт (ускоряет на GPU)."""
+        with torch.no_grad():
+            batch_logits = self.model([i for i in inputs])
+            return [InferenceResult(logits) for logits in batch_logits]

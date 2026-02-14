@@ -1,8 +1,8 @@
 # src/trading/live_loop.py
 """
-Главный цикл бота.
-Добавлена обработка консольной команды 'pr' — показывает таблицу PR и сохраняет в CSV.
-Вывод только по ручному вводу (без автоповтора каждые 10 минут).
+Главный реал-тайм цикл бота.
+Теперь использует Resampler для получения всех таймфреймов из 1m.
+Обновлено: 14 февраля 2026
 """
 
 import asyncio
@@ -20,6 +20,7 @@ from .order_executor import OrderExecutor
 from .virtual_trader import VirtualTrader
 from .risk_manager import RiskManager
 from .websocket_manager import WebSocketManager
+from ..data.resampler import Resampler
 
 
 class LiveLoop:
@@ -31,17 +32,17 @@ class LiveLoop:
         self.virtual_trader = VirtualTrader()
         self.risk_manager = RiskManager(self.config)
         self.ws_manager = WebSocketManager(self)
+        self.resampler = Resampler()  # ← используем ресэмплинг
 
-        self.current_dfs: Dict[str, Dict[str, pl.DataFrame]] = {}
+        self.current_dfs: Dict[str, Dict[str, pl.DataFrame]] = {}  # coin → {tf: df}
         self.traded_coins: Dict[str, TradeConfig] = {}
 
-        logger.info("LiveLoop инициализирован")
+        logger.info("LiveLoop запущен", hardware=self.config["hardware"]["type"])
 
     async def run(self):
         logger.info("Запуск основного цикла")
         await self.ws_manager.start()
 
-        # Запускаем обработчик консольных команд в фоне
         asyncio.create_task(self._console_command_handler())
 
         try:
@@ -51,7 +52,7 @@ class LiveLoop:
         except asyncio.CancelledError:
             logger.info("Цикл остановлен")
         except Exception as e:
-            logger.exception("Критическая ошибка в live_loop", error=str(e))
+            logger.exception("Критическая ошибка", error=str(e))
         finally:
             await self.ws_manager.stop()
             logger.info("LiveLoop завершён")
@@ -61,16 +62,66 @@ class LiveLoop:
             await self._process_coin(coin, tfs)
 
     async def _process_coin(self, coin: str, tfs: Dict[str, pl.DataFrame]):
-        # Здесь твоя существующая логика обработки монеты
-        # ... (не меняем, оставляем как было)
-        pass
+        """Обработка одной монеты."""
+        try:
+            # 1. Ресэмплим все TF из 1m (если 1m есть)
+            df_1m = tfs.get("1m")
+            if df_1m is None or df_1m.is_empty():
+                logger.debug("Нет 1m данных", coin=coin)
+                return
+
+            all_tfs = self.resampler.get_all_timeframes(coin, df_1m)
+
+            # 2. Feature engineering
+            model_input: ModelInput = self.feature_engine.process(all_tfs)
+
+            # 3. Если нет аномалий — только симуляция закрытия
+            if not model_input.anomalies:
+                self._simulate_existing_positions(coin, all_tfs)
+                return
+
+            logger.info("Аномалии обнаружены", coin=coin, count=len(model_input.anomalies))
+
+            # 4. Отдельный предикт на каждую аномалию
+            for signal in model_input.anomalies:
+                signal.coin = coin
+
+                single_input = self.feature_engine.process_for_single_anomaly(all_tfs, signal.anomaly_type)
+                pred = self.inference.predict(single_input)
+
+                if coin not in self.traded_coins:
+                    self.virtual_trader.process_signal(signal, pred)
+                else:
+                    req = self.traded_coins[coin]
+                    if (signal.tf == req.tf and
+                        signal.anomaly_type == req.anomaly_type and
+                        signal.direction_hint == req.direction and
+                        pred.confidence >= self.config["trading"]["min_confidence"][signal.anomaly_type.value]):
+
+                        position = self.risk_manager.calculate_position(signal, pred, all_tfs[signal.tf])
+                        if position:
+                            await self.order_executor.execute_open(position)
+
+            # 5. Симуляция закрытия виртуальных позиций на текущей свече
+            self._simulate_existing_positions(coin, all_tfs)
+
+        except Exception as e:
+            logger.exception("Ошибка обработки монеты", coin=coin, error=str(e))
+
+    def _simulate_existing_positions(self, coin: str, tfs: Dict[str, pl.DataFrame]):
+        """Проверяет и закрывает виртуальные позиции по TP/SL."""
+        df_1m = tfs.get("1m")
+        if df_1m is None or df_1m.is_empty():
+            return
+
+        latest = df_1m.tail(1)
+        new_price = latest["close"][0]
+        timestamp = latest["timestamp"][0]
+
+        self.virtual_trader.update_on_new_candle(coin, new_price, timestamp)
 
     async def _console_command_handler(self):
-        """
-        Фоновая задача для чтения команд из терминала.
-        Поддерживается только команда 'pr' — показывает таблицу PR и сохраняет CSV.
-        """
-        logger.info("Консольный ввод активирован. Доступные команды: pr, exit")
+        logger.info("Консольные команды: pr, exit")
 
         while True:
             try:
@@ -78,67 +129,59 @@ class LiveLoop:
                 cmd = cmd.strip().lower()
 
                 if cmd == "pr":
-                    await self.show_pr_table(min_pr=0.0, min_deals=5, limit=30)
-                elif cmd in ("exit", "quit", "q"):
-                    logger.info("Выход из консольного ввода по команде")
+                    await self.show_pr_table()
+                elif cmd in ("exit", "quit"):
+                    logger.info("Выход из консоли")
                     break
                 elif cmd:
-                    logger.warning("Неизвестная команда", cmd=cmd)
-                    print("Доступные команды: pr, exit")
-
-            except EOFError:  # Ctrl+D или конец ввода
-                logger.info("Конец ввода (EOF)")
+                    print("Команды: pr, exit")
+            except EOFError:
                 break
             except Exception as e:
-                logger.error("Ошибка в консольном обработчике", error=str(e))
+                logger.error("Ошибка консоли", error=str(e))
 
-            await asyncio.sleep(0.1)  # не жрём CPU
+            await asyncio.sleep(0.1)
 
     async def show_pr_table(self, min_pr: float = 0.0, min_deals: int = 5, limit: int = 30):
-        """
-        Выводит таблицу PR в консоль (топ по pr_value) и сразу сохраняет в CSV.
-        Вызывается ТОЛЬКО по команде 'pr' из терминала.
-        """
         df = self.storage.get_pr_table(min_pr=min_pr, min_deals=min_deals)
 
         if df.is_empty():
-            logger.info("Таблица PR пуста или не прошла фильтр",
-                        min_pr=min_pr,
-                        min_deals=min_deals)
-            print("Нет монет, удовлетворяющих условиям (PR ≥ {} и сделок ≥ {}).".format(min_pr, min_deals))
+            print("PR таблица пуста.")
             return
 
         top = df.head(limit)
 
-        logger.info("Команда 'pr' выполнена",
-                    shown_rows=len(top),
-                    total_rows=len(df),
-                    min_pr=min_pr,
-                    min_deals=min_deals)
-
-        # Красивый текстовый вывод в консоль
-        print("\n" + "="*110)
-        print(f"Текущий топ-{limit} монет по Profitable Rating "
-              f"(фильтр: PR ≥ {min_pr}, сделок ≥ {min_deals})")
-        print("="*110)
+        print("\n" + "="*100)
+        print(f"Топ-{limit} по PR (PR ≥ {min_pr}, сделок ≥ {min_deals})")
+        print("="*100)
         print(top.select([
-            "symbol",
-            "tf",
-            "period",
-            "anomaly_type",
-            "direction",
+            "symbol", "tf", "period", "anomaly_type", "direction",
             pl.col("pr_value").round(4).alias("PR"),
             pl.col("winrate").round(2).alias("Win%"),
-            "total_deals",
-            "tp_hits",
-            "sl_hits",
-            "last_update"
+            "total_deals", "tp_hits", "sl_hits", "last_update"
         ]).to_pandas().to_string(index=False))
-        print("="*110 + "\n")
+        print("="*100 + "\n")
 
-        # Автоматический экспорт в CSV
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        csv_path = f"pr_table_{timestamp}.csv"
-        top.write_csv(csv_path)
-        logger.info("Топ PR сохранён в CSV", path=csv_path, rows=len(top))
-        print(f"Таблица сохранена в файл: {csv_path}\n")
+        path = f"pr_table_{timestamp}.csv"
+        top.write_csv(path)
+        logger.info("PR сохранён", path=path)
+
+    async def on_new_candle(self, coin: str, tf: str, candle: dict):
+        """Точка входа из WebSocket."""
+        if tf != "1m":
+            return  # основной источник — 1m
+
+        new_row = pl.DataFrame([candle])
+
+        if coin not in self.current_dfs:
+            self.current_dfs[coin] = {}
+        if "1m" not in self.current_dfs[coin]:
+            self.current_dfs[coin]["1m"] = new_row
+        else:
+            self.current_dfs[coin]["1m"] = pl.concat([
+                self.current_dfs[coin]["1m"],
+                new_row
+            ]).unique("timestamp").sort("timestamp")
+
+        await self._process_coin(coin, self.current_dfs[coin])

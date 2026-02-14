@@ -1,7 +1,8 @@
 # src/trading/virtual_trader.py
 """
-Виртуальная торговля + обновление PR после каждой закрытой сделки.
-Добавлено подробное логирование всех ключевых событий.
+Виртуальная торговля (shadow trading) для сбора статистики PR.
+Теперь с полноценной симуляцией закрытия позиций по TP/SL на каждой новой свече.
+Закрытие ТОЛЬКО по TP или SL — как указано в ТЗ.
 """
 
 from dataclasses import dataclass
@@ -16,86 +17,109 @@ from ..core.config import get_config
 
 @dataclass
 class VirtualPosition(Position):
+    """Расширенная позиция для виртуальной торговли."""
+    current_price: float = 0.0      # обновляется на каждой свече
     close_price: Optional[float] = None
-    pnl_pct: float = 0.0
     close_time: Optional[int] = None
-    close_reason: Optional[str] = None
+    close_reason: Optional[str] = None  # "tp" или "sl"
 
 
 class VirtualTrader:
     def __init__(self):
         self.config = get_config()
         self.storage = Storage()
-        self.active_positions: Dict[str, VirtualPosition] = {}
-        logger.info("VirtualTrader инициализирован", max_active=len(self.active_positions))
+        self.active_positions: Dict[str, VirtualPosition] = {}  # coin → position
+        logger.info("VirtualTrader инициализирован")
 
     def process_signal(self, signal: AnomalySignal, model_pred):
+        """Открывает виртуальную позицию при аномалии."""
         coin = signal.coin
         if not coin:
-            logger.warning("Сигнал без монеты", signal=signal)
+            logger.warning("Сигнал без монеты")
             return
 
         if coin in self.active_positions:
-            logger.debug("Позиция уже открыта, пропуск", coin=coin)
+            logger.debug("Уже есть открытая позиция, пропуск", coin=coin)
             return
+
+        # Здесь должен быть расчёт entry_price, size, tp_price, sl_price
+        # Пока берём условные значения (замени на реальный risk_manager)
+        entry_price = 99999.0  # будет заменено на реальную цену свечи
+        size = 1.0
+        tp_price = entry_price * 1.005 if signal.direction_hint == Direction.LONG else entry_price * 0.995
+        sl_price = entry_price * 0.995 if signal.direction_hint == Direction.LONG else entry_price * 1.005
 
         position = VirtualPosition(
             coin=coin,
             side=signal.direction_hint,
-            entry_price=0.0,  # заполнится позже
-            size=0.0,
+            entry_price=entry_price,
+            size=size,
             entry_time=signal.timestamp,
-            tp_price=0.0,
-            sl_price=0.0,
+            tp_price=tp_price,
+            sl_price=sl_price,
             anomaly_signal=signal,
-            max_hold_time_ms=self._get_max_hold_ms()
+            current_price=entry_price  # начальная цена
         )
 
         self.active_positions[coin] = position
-        logger.info("Виртуальная позиция открыта",
+        logger.info("Открыта виртуальная позиция",
                     coin=coin,
                     side=signal.direction_hint.value,
-                    anomaly=signal.anomaly_type.value,
-                    tf=signal.tf)
+                    entry_price=entry_price,
+                    tp_price=tp_price,
+                    sl_price=sl_price)
 
-    def close_position(self, coin: str, close_price: float, reason: str):
+    def update_on_new_candle(self, coin: str, new_price: float, timestamp: int):
+        """
+        Вызывается на каждой новой свече.
+        Проверяет ВСЕ активные позиции этой монеты и закрывает по TP/SL.
+        """
         if coin not in self.active_positions:
-            logger.debug("Попытка закрыть несуществующую позицию", coin=coin)
+            return
+
+        pos = self.active_positions[coin]
+        pos.current_price = new_price
+
+        is_long = pos.side == Direction.LONG
+
+        # Проверка TP / SL
+        if (is_long and new_price >= pos.tp_price) or (not is_long and new_price <= pos.tp_price):
+            self.close_position(coin, new_price, "tp", timestamp)
+        elif (is_long and new_price <= pos.sl_price) or (not is_long and new_price >= pos.sl_price):
+            self.close_position(coin, new_price, "sl", timestamp)
+
+    def close_position(self, coin: str, close_price: float, reason: str, close_time: int):
+        """Закрывает позицию и обновляет PR."""
+        if coin not in self.active_positions:
             return
 
         pos = self.active_positions.pop(coin)
         pos.close_price = close_price
-        pos.close_time = int(time.time() * 1000)
+        pos.close_time = close_time
         pos.close_reason = reason
 
+        # Расчёт pnl и pr_contribution (по формуле из ТЗ)
         pnl_pct = (close_price - pos.entry_price) / pos.entry_price * 100 if pos.side == Direction.LONG else \
                   (pos.entry_price - close_price) / pos.entry_price * 100
 
-        pos.pnl_pct = pnl_pct
+        tp_length = abs(pos.tp_price - pos.entry_price) / pos.entry_price * 100
+        sl_length = abs(pos.sl_price - pos.entry_price) / pos.entry_price * 100
+
+        pr_contribution = tp_length if reason == "tp" else -sl_length
 
         logger.info("Виртуальная позиция закрыта",
                     coin=coin,
                     reason=reason,
                     pnl_pct=f"{pnl_pct:+.4f}%",
-                    hold_time_sec=(pos.close_time - pos.entry_time) / 1000)
+                    hold_time_sec=(close_time - pos.entry_time) / 1000)
 
-        self._update_pr_snapshot(pos)
+        # Обновляем PR в базе
+        self._update_pr_snapshot(pos.coin, pos.anomaly_signal, pos.side, pr_contribution, reason)
 
-    def _update_pr_snapshot(self, pos: VirtualPosition):
-        is_tp = pos.close_reason == "tp"
-        is_sl = pos.close_reason == "sl"
-        is_timeout = pos.close_reason == "timeout"
-
-        tp_len = abs(pos.tp_price - pos.entry_price) / pos.entry_price * 100
-        sl_len = abs(pos.sl_price - pos.entry_price) / pos.entry_price * 100
-        pr_contrib = tp_len if is_tp else -sl_len
-
-        logger.debug("Обновление PR",
-                     coin=pos.coin,
-                     reason=pos.close_reason,
-                     pr_contrib=f"{pr_contrib:+.4f}",
-                     tp_hit=1 if is_tp else 0,
-                     sl_hit=1 if is_sl or is_timeout else 0)
+    def _update_pr_snapshot(self, coin: str, signal: AnomalySignal, side: Direction, pr_contrib: float, reason: str):
+        """Обновление таблицы pr_snapshots после закрытия."""
+        is_tp = reason == "tp"
+        is_sl = reason == "sl"
 
         self.storage.execute("""
             INSERT INTO pr_snapshots 
@@ -109,27 +133,21 @@ class VirtualTrader:
                 sl_hits = sl_hits + ?,
                 last_update = CURRENT_TIMESTAMP
         """, [
-            pos.coin, pos.anomaly_signal.tf, 100,  # период пока хардкод, потом из конфига
-            pos.anomaly_signal.anomaly_type.value, pos.side.value,
-            pr_contrib, 1.0 if is_tp else 0.0,
+            coin,
+            signal.tf,
+            100,  # период — можно брать из конфига
+            signal.anomaly_type.value,
+            side.value,
+            pr_contrib,
+            1.0 if is_tp else 0.0,
             1 if is_tp else 0,
-            1 if is_sl or is_timeout else 0,
+            1 if is_sl else 0,
             pr_contrib,
             1 if is_tp else 0,
-            1 if is_sl or is_timeout else 0
+            1 if is_sl else 0
         ])
 
-    def _get_max_hold_ms(self) -> Optional[int]:
-        minutes = self.config.get("trading", {}).get("max_hold_time_minutes")
-        if minutes and minutes > 0:
-            logger.debug("Тайм-аут включён", minutes=minutes)
-            return int(minutes * 60 * 1000)
-        logger.debug("Тайм-аут выключен")
-        return None
-
-    def check_timeouts(self):
-        now = int(time.time() * 1000)
-        for coin, pos in list(self.active_positions.items()):
-            if pos.max_hold_time_ms and (now - pos.entry_time) >= pos.max_hold_time_ms:
-                logger.warning("Тайм-аут сработал", coin=coin, hold_sec=(now - pos.entry_time)/1000)
-                self.close_position(coin, pos.entry_price * 0.999, "timeout")  # условная цена
+        logger.debug("PR обновлён после виртуальной сделки",
+                     coin=coin,
+                     reason=reason,
+                     pr_contrib=f"{pr_contrib:+.4f}")

@@ -1,127 +1,119 @@
 # src/data/resampler.py
 """
-Модуль ресэмплинга (пересчёта) данных с 1m на более высокие таймфреймы.
+Ресэмплинг 1m свечей в higher таймфреймы (3m, 5m, 10m, 15m).
+Используется как в live_loop, так и в бэктесте.
 
-Функционал:
-- Берёт 1m свечи из БД или API
-- Пересчитывает OHLCV + volume + bid_volume + ask_volume на 3m, 5m, 10m, 15m
-- Использует Polars (быстрее pandas, columnar)
-- Учитывает конфиг (какие TF нужно ресэмплить)
-- Сохраняет результат в БД (чтобы не пересчитывать каждый раз)
-
-Когда использовать:
-- Если high TF нет в API или данные устарели
-- На телефоне — экономия API-запросов
-- Для проверки целостности данных (1m → 5m должен совпадать с нативным 5m)
-
-Зависимости:
-- polars (быстрый DataFrame)
-- src/data/storage.py (для чтения/записи)
+Особенности:
+- Работает на Polars (очень быстро)
+- Инкрементальный ресэмплинг (в live не пересчитывает всё заново)
+- Кэширование в памяти (coin → tf → DataFrame)
+- Возвращает dict[str, pl.DataFrame] — именно то, что ожидает feature_engine.process()
+- Поддержка всех TF из ТЗ
+- Логирование + обработка ошибок
 """
 
-import logging
-from typing import List, Dict, Optional
-from datetime import datetime
-
 import polars as pl
+from typing import Dict, Optional
+from datetime import timedelta
 
-from src.core.config import load_config
-from src.data.storage import Storage
+from ..utils.logger import logger
+from ..core.config import get_config
 
-logger = logging.getLogger(__name__)
-
-# Маппинг: сколько 1m свечей в одном high TF
-TIMEFRAME_MINUTES = {
-    '1m': 1,
-    '3m': 3,
-    '5m': 5,
-    '10m': 10,
-    '15m': 15,
-}
 
 class Resampler:
-    """Ресэмплинг 1m данных на higher timeframes"""
-
-    def __init__(self, config: Dict):
-        self.config = config
-        self.storage = Storage(config)
-
-    async def resample(self, symbol: str, target_tf: str, since: Optional[int] = None, limit: int = 10000):
-        """
-        Пересчитывает 1m свечи на target_tf (3m, 5m и т.д.)
+    def __init__(self):
+        self.config = get_config()
+        self.timeframes = ["1m", "3m", "5m", "10m", "15m"]
         
-        Args:
-            symbol: "BTCUSDT"
-            target_tf: "5m", "15m" и т.д.
-            since: timestamp (ms) — с какого момента
-            limit: сколько 1m свечей взять (для безопасности)
+        # Кэш для live-режима: coin → {tf: DataFrame}
+        self.cache: Dict[str, Dict[str, pl.DataFrame]] = {}
 
-        Returns:
-            List[Dict] — свечи в формате target_tf
-        """
-        if target_tf == '1m':
-            logger.warning("Resample to 1m requested — returning raw data")
-            return await self.storage.get_candles(symbol, '1m', since, limit)
+        logger.info("Resampler инициализирован", timeframes=self.timeframes[1:])
 
-        minutes = TIMEFRAME_MINUTES.get(target_tf)
-        if not minutes:
-            raise ValueError(f"Unsupported timeframe for resample: {target_tf}")
+    def resample(self, df_1m: pl.DataFrame, target_tf: str) -> pl.DataFrame:
+        """Ресэмплит 1m → target_tf (3m, 5m, 10m, 15m)."""
+        if target_tf == "1m":
+            return df_1m
 
-        # 1. Берём 1m свечи
-        one_min_candles = await self.storage.get_candles(symbol, '1m', since, limit * minutes)
-        if not one_min_candles:
-            logger.warning("No 1m candles for %s", symbol)
-            return []
+        interval_map = {
+            "3m": "3m",
+            "5m": "5m",
+            "10m": "10m",
+            "15m": "15m"
+        }
 
-        # 2. Преобразуем в Polars DataFrame
-        df = pl.DataFrame(one_min_candles)
-        df = df.with_columns(
-            pl.col("timestamp").cast(pl.Int64).alias("ts_ms")
-        ).sort("ts_ms")
+        if target_tf not in interval_map:
+            raise ValueError(f"Неподдерживаемый таймфрейм: {target_tf}")
 
-        # 3. Группируем по target_tf (каждые N минут)
-        df = df.with_columns(
-            (pl.col("ts_ms") // (minutes * 60 * 1000)).alias("group")
+        # Преобразуем timestamp в datetime для group_by_dynamic
+        df = df_1m.with_columns(
+            pl.col("timestamp").cast(pl.Datetime("ms")).alias("dt")
         )
 
-        # 4. Ресэмплинг OHLCV + volume + bid/ask
-        resampled = df.group_by("group").agg(
-            pl.col("ts_ms").min().alias("timestamp"),               # Время открытия новой свечи
-            pl.col("open").first().alias("open"),                   # Первая open
-            pl.col("high").max().alias("high"),                     # Максимум high
-            pl.col("low").min().alias("low"),                       # Минимум low
-            pl.col("close").last().alias("close"),                  # Последняя close
-            pl.col("volume").sum().alias("volume"),                 # Сумма volume
-            pl.col("bid_volume").sum().alias("bid_volume"),         # Сумма bid_volume
-            pl.col("ask_volume").sum().alias("ask_volume")          # Сумма ask_volume
-        ).sort("timestamp")
+        resampled = df.group_by_dynamic(
+            "dt",
+            every=interval_map[target_tf],
+            closed="left"
+        ).agg(
+            open=pl.first("open"),
+            high=pl.max("high"),
+            low=pl.min("low"),
+            close=pl.last("close"),
+            volume=pl.sum("volume"),
+            buy_volume=pl.sum("buy_volume")
+        )
 
-        # 5. Преобразуем обратно в список словарей
-        candles = resampled.to_dicts()
+        # Возвращаем timestamp обратно в int (ms)
+        resampled = resampled.with_columns(
+            pl.col("dt").cast(pl.Int64).alias("timestamp")
+        ).drop("dt").sort("timestamp")
 
-        # 6. Сохраняем в БД (если нужно)
-        if self.config["data"]["resample_higher_tf"]:
-            await self.storage.save_ohlcv(symbol, target_tf, candles)
+        return resampled
 
-        logger.info("Resampled %d candles from 1m to %s for %s", len(candles), target_tf, symbol)
-        return candles
+    def get_all_timeframes(self, coin: str, df_1m: pl.DataFrame) -> Dict[str, pl.DataFrame]:
+        """
+        Возвращает все таймфреймы для монеты.
+        Использует кэш + инкрементальный ресэмплинг (очень важно для live).
+        """
+        if coin not in self.cache:
+            self.cache[coin] = {}
 
-    async def validate_resample(self, symbol: str, target_tf: str):
-        """Проверка: ресэмпл 1m → target_tf совпадает с нативными данными Binance"""
-        # Опциональная функция для отладки
-        native = await self.client.fetch_ohlcv(symbol, target_tf, limit=100)
-        resampled = await self.resample(symbol, target_tf, limit=100 * TIMEFRAME_MINUTES[target_tf])
-        # Сравнение (можно добавить assert или лог)
-        logger.debug("Validation resample for %s %s: native=%d, resampled=%d", symbol, target_tf, len(native), len(resampled))
+        # Обновляем 1m
+        self.cache[coin]["1m"] = df_1m
 
-# Пример использования (для тестов)
-if __name__ == "__main__":
-    import asyncio
+        # Ресэмплим higher TF (инкрементально)
+        for tf in self.timeframes[1:]:
+            cached = self.cache[coin].get(tf)
 
-    async def test():
-        config = load_config()
-        resampler = Resampler(config)
-        candles = await resampler.resample("BTCUSDT", "5m", limit=1000)
-        print("Resampled 5m candles:", len(candles))
+            if cached is None or len(cached) == 0:
+                # Полный ресэмплинг
+                new_tf = self.resample(df_1m, tf)
+                self.cache[coin][tf] = new_tf
+            else:
+                # Добавляем только новые свечи
+                last_ts = cached["timestamp"].max()
+                new_rows = df_1m.filter(pl.col("timestamp") > last_ts)
 
-    asyncio.run(test())
+                if not new_rows.is_empty():
+                    new_resampled = self.resample(new_rows, tf)
+                    self.cache[coin][tf] = pl.concat([cached, new_resampled]).unique("timestamp").sort("timestamp")
+
+        logger.debug("Ресэмплинг завершён", coin=coin, tfs=list(self.cache[coin].keys()))
+        return self.cache[coin]
+
+    def clear_cache(self, coin: Optional[str] = None):
+        """Очищает кэш (полезно при перезапуске или смене монет)."""
+        if coin:
+            self.cache.pop(coin, None)
+            logger.debug("Кэш очищен для монеты", coin=coin)
+        else:
+            self.cache.clear()
+            logger.info("Весь кэш ресэмплинга очищен")
+
+    def get_cache_size(self) -> int:
+        """Возвращает количество свечей во всех кэшах (для мониторинга)."""
+        total = 0
+        for coin_data in self.cache.values():
+            for df in coin_data.values():
+                total += len(df)
+        return total
