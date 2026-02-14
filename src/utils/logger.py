@@ -1,85 +1,54 @@
 # src/utils/logger.py
 """
-Централизованное логирование проекта.
+Централизованное логирование для всего проекта.
+Используем structlog + logging — структурированные логи в JSON для продакшена,
+читаемые в консоли для разработки.
 
-Настройки:
-- Формат: 2026-02-07 14:35:22 [INFO] module_name: Сообщение
-- Уровни: DEBUG / INFO / WARNING / ERROR
-- Вывод: в консоль + файл (logs/bot.log)
-- Ротация: max 50 МБ, хранит 5 последних файлов
-- На телефоне: уровень INFO (экономия батареи и места)
-- На сервере: уровень DEBUG (полная отладка)
+Уровни:
+- DEBUG   — детальная отладка (аномалии, каждый предикт, подписки WS)
+- INFO    — важные события (открытие/закрытие позиции, PR-обновление)
+- WARNING — потенциальные проблемы (много аномалий, тайм-аут, низкая уверенность)
+- ERROR   — критические сбои
 
-Использование:
-    logger = logging.getLogger(__name__)
-    logger.info("Сообщение")
-    logger.debug("Отладка")
-    logger.error("Ошибка: %s", exc)
-
-Все модули проекта используют этот логгер — единый стиль и файл.
+В проде включаем INFO/WARNING, в разработке — DEBUG.
 """
 
 import logging
-import logging.handlers
-from pathlib import Path
+import sys
+import structlog
 
-from src.core.config import load_config
+def configure_logging(level: str = "DEBUG"):
+    """Вызывается один раз при старте приложения."""
+    shared_processors = [
+        structlog.processors.add_log_level,
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+        structlog.processors.TimeStamper(fmt="iso", utc=True),
+    ]
 
-def setup_logger():
-    """Инициализация глобального логгера"""
-    config = load_config()  # Загружаем конфиг для определения уровня и путей
+    if level.upper() == "DEBUG":
+        # Для разработки — красивый цветной вывод в консоль
+        processors = shared_processors + [structlog.dev.ConsoleRenderer()]
+    else:
+        # Для продакшена — JSON для парсинга (ELK, Grafana Loki и т.д.)
+        processors = shared_processors + [structlog.processors.JSONRenderer()]
 
-    # Базовые настройки
-    log_level = config["logging"].get("level", "INFO").upper()
-    log_file = config["logging"].get("file", "logs/bot.log")
-    max_mb = config["logging"].get("file_max_mb", 50)
-    backup_count = config["logging"].get("backup_count", 5)
-
-    # Создаём папку logs, если нет
-    log_dir = Path(log_file).parent
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    # Форматтер
-    formatter = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
+    structlog.configure(
+        processors=processors,
+        wrapper_class=structlog.make_filtering_bound_logger(getattr(logging, level.upper())),
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        cache_logger_on_first_use=True,
     )
 
-    # Консоль
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    console_handler.setLevel(log_level)
-
-    # Файл с ротацией
-    file_handler = logging.handlers.RotatingFileHandler(
-        log_file,
-        maxBytes=max_mb * 1024 * 1024,
-        backupCount=backup_count,
-        encoding="utf-8"
+    # Базовая настройка Python logging (чтобы работали обычные logger)
+    logging.basicConfig(
+        format="%(message)s",
+        stream=sys.stdout,
+        level=getattr(logging, level.upper()),
     )
-    file_handler.setFormatter(formatter)
-    file_handler.setLevel(log_level)
 
-    # Глобальный логгер
-    root_logger = logging.getLogger()
-    root_logger.setLevel(log_level)
-    root_logger.addHandler(console_handler)
-    root_logger.addHandler(file_handler)
+    # Глобальный логгер проекта
+    return structlog.get_logger("crypto_scalper")
 
-    # Убираем дублирование логов (если есть другие handlers)
-    root_logger.propagate = False
-
-    logger = logging.getLogger(__name__)
-    logger.info("Logger initialized: level=%s, file=%s (max %dMB, %d backups)", 
-                log_level, log_file, max_mb, backup_count)
-
-    # Специально для телефона — INFO минимум
-    if config.get("low_power_mode", False):
-        root_logger.setLevel(logging.INFO)
-        logger.info("Low power mode: logging level forced to INFO")
-
-    return logger
-
-
-# Инициализация при импорте модуля
-setup_logger()
+# Инициализация при импорте модуля (можно вызвать явно в main)
+logger = configure_logging("DEBUG")  # или "INFO" в проде
