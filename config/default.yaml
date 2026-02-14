@@ -1,96 +1,64 @@
 # config/default.yaml
-# Базовый конфиг проекта — общие настройки, которые используются всегда
-# Переопределяются профилями hardware/ и trading_modes/
-# Все значения — разумные по умолчанию для сбалансированной работы
+# Основной конфиг проекта. Все параметры можно переопределять в hardware/ и trading_modes/
 
-# Основные параметры модели и данных
-model:
-  seq_len: 100                     # Длина последовательности свечей для GRU (50–100, телефон: 50)
-  num_features: 12                 # Базовых признаков (по ТЗ)
-  num_conditions: 4                # C, V, CV, Q (бинарные флаги)
-  hidden_size: 64                  # Размер hidden GRU (32–128, телефон: 32)
-  epochs: 50                       # Кол-во эпох обучения (телефон: 10–20, сервер: 100+)
-  test_split: 0.2                  # 20% на тест (валидацию)
+project:
+  name: "Crypto Scalper Bot"
+  version: "2026.02"
 
-# Таймфреймы и окна (можно добавлять/убирать)
-timeframes:                        # Список TF для мульти-TF анализа
-  - 1m
-  - 3m
-  - 5m
-  - 10m
-  - 15m
-
-windows:                           # Окна анализа (кол-во свечей)
-  - 24
-  - 50
-  - 74
-  - 100
-
-# Аномалии и тихий режим
-anomalies:
-  use_delta_in_volume: true        # Использовать delta bid/ask в объёмной аномалии (модель сама учится)
-  quiet_mode: false                # Включён ли тихий режим (по умолчанию выключен на телефоне)
-  quiet_prob_threshold: 0.78       # Порог вероятности для тихого режима (выше обычного)
-  quiet_inference_every_by_tf:     # Таймер inference в тихом режиме по TF (в свечах)
-    1m: 10
-    3m: 8
-    5m: 6
-    10m: 4
-    15m: 3
-
-# Торговля и риск
-trading:
-  risk_base: "initial"             # initial (от начального депозита) / current (от текущего)
-  default_risk_pct: 0.5            # Риск на сделку в % (если не заданы manual_prob_risk_levels)
-  manual_prob_risk_levels:         # Ручные уровни риска по вероятности (опционально)
-    0.60: 0.5
-    0.70: 0.75
-    0.80: 1.0
-    0.90: 1.25
-  soft_entry_enabled: false        # Мягкие входы (частями)
-  soft_levels: [0.65, 0.78, 0.85]  # Пороги вероятности для частей
-  soft_sizes: [0.3, 0.4, 0.3]      # Доли позиции
-  soft_timeout: 3                  # Сколько свечей ждать следующую часть (если не пришло — отменяем)
-
-  tp_mode: "average_candle"        # average_candle / dynamic_level (VAH/VAL или channel)
-  sl_mode: "classic"               # classic (HH/LL) / atr_chandelier
-  trailing_enabled: true
-  trailing_type: "distance"        # classic (активация + шаг) / distance (% от high/low)
-  trailing_activation_pct: 0.5     # Активация trailing при +X% профита
-  trailing_distance_pct: 0.6       # Расстояние SL от max/min цены (для distance)
-
-# PR и фильтр монет
-pr:
-  analysis_period_candles: 250     # Период расчёта PR в свечах (на основном TF)
-  mode: "normalized"               # classic / normalized
-  min_deals_in_pr_period: 8        # Минимум сделок в периоде для активации монеты
-  decay_factor: 0.8                # Вес старых сделок (старше 150 свечей) — опционально
-
-# Общие лимиты
-limits:
-  max_coins: 50                    # Максимум монет (переопределяется hardware)
-  max_tf: 5                        # Максимум TF (переопределяется)
-  max_windows: 4                   # Максимум окон (переопределяется)
-
-# Binance
+# ================================================
+# Binance API (никогда не коммить реальные ключи!)
+# ================================================
 binance:
-  api_key: "YOUR_API_KEY"
-  api_secret: "YOUR_API_SECRET"
-  testnet: false                   # true — тестнет, false — реал
+  api_key: ""          # ← заполни позже
+  secret_key: ""       # ← заполни позже
+  testnet: true        # true = тестовый режим (рекомендуется сначала)
 
-# Логи и мониторинг
-logging:
-  level: "INFO"                    # DEBUG / INFO / WARNING / ERROR
-  file: "logs/bot.log"             # Путь к лог-файлу
-  shadow_trading: true             # Включить shadow trading (симуляция реальных исходов)
+# ================================================
+# Общие настройки торговли
+# ================================================
+trading:
+  initial_balance: 1000.0      # стартовый депозит в USDT
+  leverage: 20                 # базовое плечо
+  risk_mode: "balanced"        # low / medium / high / manual / auto
+  manual_risk_pct: 1.0         # риск в % при ручном режиме
+  min_model_confidence: 0.65   # минимальная уверенность модели
+  max_hold_time_minutes: null  # null = выключен (по твоему желанию)
 
-# Дополнительно
-warm_up:
+# ================================================
+# Фильтр монет (по ТЗ)
+# ================================================
+filter:
+  min_age_months: 6            # минимальный возраст монеты на фьючерсах
+  min_pr: 0.8                  # минимальный Profitable Rating
+  min_deals: 15                # минимальное количество сделок для учёта
+
+# ================================================
+# Аномалии и расчёты
+# ================================================
+anomalies:
+  lookback: 25
+  min_perc: 0.94
+  max_perc: 0.99
+  flat_mult: 1.18
+
+# ================================================
+# Модель и обучение
+# ================================================
+model:
+  main_period: 100
+  seq_len: 100
+  in_channels: 8               # open,high,low,close,volume + признаки
+  live_retrain_every: 10000    # свечей
+
+# ================================================
+# Backtest и PR
+# ================================================
+backtest:
   enabled: true
-  duration_candles: 1000           # Сколько свечей warm-up (виртуал + частое переобучение)
 
-phone_low_power_mode:
-  enabled: false                   # Авто-включение на телефоне (если detect_hardware)
-  reduce_tf: 3                     # До скольки TF снижать
-  reduce_windows: 3                # До скольки окон
-  quiet_every_multiplier: 1.5      # Увеличивать таймер тихого режима в 1.5 раза
+# ================================================
+# Хранение данных
+# ================================================
+storage:
+  backend: "duckdb"            # "duckdb" или "sqlite"
+  path: "data/live.duckdb"
