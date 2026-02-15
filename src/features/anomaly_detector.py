@@ -1,156 +1,198 @@
-# ================================================
-# 2. src/features/anomaly_detector.py
-# ================================================
+# src/features/anomaly_detector.py
 """
-ЕДИНЫЙ ДЕТЕКТОР всех трёх аномалий (C, V, CV).
-Работает на любом таймфрейме, возвращает унифицированный список сигналов.
+Детектор аномалий — основной триггер для вызова модели.
+
+По ТЗ:
+- 3 основных условия: свечная аномалия, объёмная, свечная+объёмная
+- Добавлено 4-е условие: q_condition (Quiet mode) — когда НЕТ ни одной из 3-х аномалий
+- q_condition активируется только если quiet_mode включён в конфиге
+- Обучение на всех TF и окнах, выявление лучшего TF в момент аномалии
+- Аномалия — сигнал для подачи последовательности в модель
+
+Вывод: словарь с 4-мя флагами (candle, volume, cv, q) + тип + сила
 """
 
-from dataclasses import dataclass
-from enum import Enum
 import polars as pl
-from typing import List, Tuple
+from typing import Dict, Tuple, Any
+from src.core.config import load_config
+from src.utils.logger import get_logger
 
-class AnomalyType(Enum):
-    CANDLE = "C"
-    VOLUME = "V"
-    CANDLE_VOLUME = "CV"
-
-class Direction(Enum):
-    LONG = "L"
-    SHORT = "S"
-
-@dataclass
-class AnomalySignal:
-    """Унифицированный сигнал аномалии."""
-    tf: str
-    anomaly_type: AnomalyType
-    direction_hint: Direction      # подсказка для отскока
-    strength: float                # 0.0–1.0
-    threshold: float
-    current_volume: float
-    candle_size_pct: float
-    timestamp: int                 # unix ms закрытия свечи
-
+logger = get_logger(__name__)
 
 class AnomalyDetector:
-    """Центральный класс обнаружения аномалий по ТЗ."""
-
     def __init__(self, config: dict):
-        """Загружаем параметры из выбранного режима торговли."""
-        mode = config["trading_mode"]
-        self.cfg = config["anomalies"][mode]
-        self.lookback = self.cfg["lookback"]          # 25
-        self.min_perc = self.cfg["min_perc"]          # 0.94
-        self.max_perc = self.cfg["max_perc"]          # 0.99
-        self.flat_mult = self.cfg["flat_mult"]        # 1.18
+        anomalies_cfg = config.get("anomalies", {})
 
-    def detect_all(self, dfs: dict[str, pl.DataFrame]) -> List[AnomalySignal]:
+        # Периоды расчёта (из ТЗ)
+        self.candle_lookback       = anomalies_cfg.get("candle_lookback",      100)  # для свечной аномалии
+        self.volume_lookback       = anomalies_cfg.get("volume_lookback",      25)   # для объёмной
+        self.quiet_mode_enabled    = config.get("quiet_mode", False)                  # флаг Q-режима
+
+        # Пороги
+        self.candle_std_multiplier = anomalies_cfg.get("candle_std_multiplier", 1.5)
+        self.volume_perc_threshold = anomalies_cfg.get("volume_perc_threshold", 75)   # перцентиль
+        self.norm_factor           = anomalies_cfg.get("norm_factor",           1.5)   # тренд/флет
+
+        # Опционально: игнорировать сверхсильные импульсы (пампы/дампы)
+        self.max_candle_multiplier = anomalies_cfg.get("max_candle_multiplier", None)  # None = отключено
+
+        self.debug = config.get("debug", False)
+
+    def detect(self, df: pl.DataFrame) -> Dict[str, Any]:
         """
-        Главный метод.
-        Принимает словарь датафреймов по всем TF и возвращает все найденные аномалии.
+        Проверяет последнюю свечу на 4 условия:
+        - candle_anomaly
+        - volume_anomaly
+        - cv_anomaly (комбинированная)
+        - q_condition (только если quiet_mode включён и нет других аномалий)
+
+        Возвращает:
+        {
+            "candle_anomaly": bool,
+            "volume_anomaly": bool,
+            "cv_anomaly":     bool,
+            "q_condition":    bool,
+            "anomaly_type":   str or None,  # "candle", "volume", "cv", "q" или None
+            "strength":       float,
+            "details":        dict
+        }
         """
-        signals = []
-        
-        for tf, df in dfs.items():
-            if len(df) < self.lookback + 10:
-                continue
-                
-            tf_minutes = int(tf[:-1]) if tf.endswith("m") else 1
-            
-            # Свечная аномалия
-            is_c, strength_c = self._candle_anomaly(df)
-            if is_c:
-                signals.append(self._create_signal(tf, AnomalyType.CANDLE, df, strength_c))
-            
-            # Объёмная аномалия
-            is_v, strength_v, _ = self._volume_anomaly(df, tf_minutes)
-            if is_v:
-                signals.append(self._create_signal(tf, AnomalyType.VOLUME, df, strength_v))
-            
-            # Комбинированная CV
-            if is_c and is_v:
-                signals.append(self._create_signal(tf, AnomalyType.CANDLE_VOLUME, df, max(strength_c, strength_v)))
+        if len(df) < max(self.candle_lookback, self.volume_lookback):
+            return {
+                "candle_anomaly": False,
+                "volume_anomaly": False,
+                "cv_anomaly": False,
+                "q_condition": False,
+                "anomaly_type": None,
+                "strength": 0.0,
+                "details": {"error": "недостаточно свечей"}
+            }
 
-        return signals
+        # Последняя свеча
+        last = df[-1]
 
-    def _candle_anomaly(self, df: pl.DataFrame) -> Tuple[bool, float]:
-        """Реализация свечной аномалии точно по описанию в ТЗ (PDF стр.6)."""
-        period = 100
-        if len(df) < period:
-            return False, 0.0
-            
-        sizes = ((df["high"] - df["low"]) / df["close"] * 100).tail(period)
+        # 1. Свечная аномалия
+        candle_anomaly, candle_strength = self._detect_candle_anomaly(df)
+
+        # 2. Объёмная аномалия
+        volume_anomaly, volume_strength = self._detect_volume_anomaly(df)
+
+        # 3. Комбинированная
+        cv_anomaly = candle_anomaly and volume_anomaly
+
+        # 4. Quiet condition — только если включён режим и нет других аномалий
+        q_condition = self.quiet_mode_enabled and not (candle_anomaly or volume_anomaly or cv_anomaly)
+
+        # Определяем основной тип (приоритет: cv > candle > volume > q)
+        if cv_anomaly:
+            anomaly_type = "cv"
+            strength = max(candle_strength, volume_strength)
+        elif candle_anomaly:
+            anomaly_type = "candle"
+            strength = candle_strength
+        elif volume_anomaly:
+            anomaly_type = "volume"
+            strength = volume_strength
+        elif q_condition:
+            anomaly_type = "q"
+            strength = 1.0  # базовая сила для quiet
+        else:
+            anomaly_type = None
+            strength = 0.0
+
+        result = {
+            "candle_anomaly": candle_anomaly,
+            "volume_anomaly": volume_anomaly,
+            "cv_anomaly":     cv_anomaly,
+            "q_condition":    q_condition,
+            "anomaly_type":   anomaly_type,
+            "strength":       min(strength, 5.0),
+            "details": {
+                "candle_strength": candle_strength,
+                "volume_strength": volume_strength,
+                "last_candle_size_pct": candle_strength * 100 if candle_anomaly else 0,
+                "last_volume_pct": volume_strength * 100 if volume_anomaly else 0
+            }
+        }
+
+        if self.debug and anomaly_type:
+            logger.debug(f"[ANOMALY] {anomaly_type.upper()} | strength: {strength:.2f} | symbol: {df['symbol'][0] if 'symbol' in df.columns else 'unknown'}")
+
+        return result
+
+    def _detect_candle_anomaly(self, df: pl.DataFrame) -> Tuple[bool, float]:
+        """Свечная аномалия: размер свечи > mean + N*std"""
+        recent = df.tail(self.candle_lookback)
+
+        tr_pct = ((recent["high"] - recent["low"]) / recent["close"]) * 100
+        body_pct = ((recent["close"] - recent["open"]).abs() / recent["close"]) * 100
+        sizes = pl.max_horizontal(tr_pct, body_pct)
+
         mean_size = sizes.mean()
-        deviations = (sizes - mean_size).abs()
-        mean_dev = deviations.mean()
-        anomaly_threshold = mean_size + mean_dev
-        
+        std_size  = sizes.std()
         last_size = sizes[-1]
-        is_anomaly = last_size > anomaly_threshold
-        strength = min(1.0, last_size / anomaly_threshold) if is_anomaly else 0.0
-        
+
+        threshold = mean_size + self.candle_std_multiplier * std_size
+
+        is_anomaly = last_size > threshold
+        strength   = last_size / mean_size if mean_size > 0 else 0.0
+
+        # Опциональный фильтр на сверхсильные движения
+        if is_anomaly and self.max_candle_multiplier is not None:
+            if strength > self.max_candle_multiplier:
+                is_anomaly = False
+                strength = 0.0
+                if self.debug:
+                    logger.debug(f"[IGNORED] Candle too strong: {strength:.2f}x")
+
         return is_anomaly, strength
 
-    def _volume_anomaly(self, df: pl.DataFrame, tf_minutes: int) -> Tuple[bool, float, float]:
-        """Полностью адаптированный код из PDF (стр.7-9) на Polars."""
-        past = df.tail(self.lookback + 1).head(self.lookback)
-        if len(past) < self.lookback:
-            return False, 0.0, 0.0
-            
-        vols = past["volume"]
-        ranges = past["high"] - past["low"]
-        
-        med_vol = vols.median()
-        med_range = ranges.median()
-        
-        # Масштабирование перцентиля по TF (как в Pine Script)
-        tf_factor = max(1.0, tf_minutes / 5.0)
-        perc_level = max(self.min_perc, self.max_perc - (1.0 / (self.lookback / tf_factor)))
-        
-        perc_threshold = vols.sort().quantile(perc_level)
-        
-        # Нормализация по ширине текущей свечи
-        current = df.tail(1)
-        current_range_pct = ((current["high"] - current["low"]) / current["close"])[0]
-        avg_range = ranges.mean()
-        norm_factor = avg_range / current_range_pct if current_range_pct > 0 else 1.0
-        
-        adjusted_threshold = perc_threshold * max(1.0, norm_factor * 0.8)
-        
-        current_vol = current["volume"][0]
-        is_high_vol = current_vol > adjusted_threshold
-        
-        if not is_high_vol:
-            return False, 0.0, perc_threshold
-            
-        # Проверка трендовости
-        price_change = abs(current["close"][0] - df["close"][-self.lookback-1])
-        trend_threshold = med_range * (self.lookback / 3.8)
-        is_trend = price_change > trend_threshold
-        
-        is_anomaly = is_trend or (current_vol > med_vol * self.flat_mult)
-        strength = min(1.0, current_vol / adjusted_threshold) if is_anomaly else 0.0
-        
-        return is_anomaly, strength, perc_threshold
+    def _detect_volume_anomaly(self, df: pl.DataFrame) -> Tuple[bool, float]:
+        """Объёмная аномалия — адаптивный алгоритм (Pine-подобный)"""
+        recent = df.tail(self.volume_lookback)
 
-    def _create_signal(self, tf: str, atype: AnomalyType, df: pl.DataFrame, strength: float) -> AnomalySignal:
-        """Создаёт унифицированный сигнал с правильной направленностью для отскока."""
-        current = df.tail(1)
-        is_bullish = current["close"][0] > current["open"][0]
-        
-        direction = Direction.LONG if is_bullish else Direction.SHORT
-        # Для отскока: бычья свеча → шорт, медвежья → лонг
-        if atype in (AnomalyType.CANDLE, AnomalyType.CANDLE_VOLUME):
-            direction = Direction.SHORT if is_bullish else Direction.LONG
-            
-        return AnomalySignal(
-            tf=tf,
-            anomaly_type=atype,
-            direction_hint=direction,
-            strength=strength,
-            threshold=0.0,
-            current_volume=current["volume"][0],
-            candle_size_pct=((current["high"]-current["low"])/current["close"]*100)[0],
-            timestamp=int(current["timestamp"][0])
-        )
+        total_vol = recent["volume"].sum()
+        if total_vol == 0:
+            return False, 0.0
+
+        last_vol = recent["volume"][-1]
+        avg_vol  = recent["volume"].mean()
+        vol_ratio = last_vol / avg_vol if avg_vol > 0 else 0.0
+
+        # Перцентиль объёма
+        perc = (recent["volume"] <= last_vol).mean() * 100
+
+        # Учёт тренда (последние 5 свечей)
+        trend_factor = 1.0
+        if len(recent) >= 5:
+            if recent["close"][-1] > recent["close"][-5]:
+                trend_factor = 1.2
+            elif recent["close"][-1] < recent["close"][-5]:
+                trend_factor = 0.8
+
+        threshold = self.volume_perc_threshold + (100 - self.volume_perc_threshold) * (1 - 1/self.norm_factor)
+
+        is_anomaly = (perc >= threshold) and (vol_ratio > trend_factor)
+        strength   = (perc / 100) * vol_ratio
+
+        return is_anomaly, strength
+
+
+# Тестовый запуск
+if __name__ == "__main__":
+    config = load_config()
+    config["quiet_mode"] = True  # для теста Q-режима
+    detector = AnomalyDetector(config)
+
+    # Тестовый датафрейм (без аномалий → q_condition должен быть True)
+    df = pl.DataFrame({
+        "open_time": list(range(100)),
+        "open":  [60000.0] * 100,
+        "high":  [60100.0] * 100,
+        "low":   [59900.0] * 100,
+        "close": [60000.0 + i*0.1 for i in range(100)],
+        "volume": [10.0] * 100
+    })
+
+    result = detector.detect(df)
+    print(result)

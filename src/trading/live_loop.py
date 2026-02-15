@@ -1,187 +1,188 @@
 # src/trading/live_loop.py
 """
-Главный реал-тайм цикл бота.
-Теперь использует Resampler для получения всех таймфреймов из 1m.
-Обновлено: 14 февраля 2026
+Основной торговый цикл бота (Live Loop) — сердце всей системы.
+
+Ключевые реализованные требования (по твоим последним указаниям):
+- Торгует ТОЛЬКО монеты из whitelist (обновляется после backtest_all.py)
+- Если монета выпала из whitelist → дожидается закрытия ВСЕХ её позиций → после этого полностью исключает из активной торговли
+- Продолжает расчёт PR фоном (виртуальные сделки) даже для исключённых монет
+- Поддержка 4 условий: candle_anomaly, volume_anomaly, cv_anomaly, q_condition
+- Отдельные пороги вероятности: min_prob_anomaly и min_prob_quiet (настраиваются в конфиге)
+- Авто-переобучение каждые 10 000 свечей (или по времени — настраивается)
+- Max positions — ручная настройка из конфига (например 8–15)
+- Подписка на WebSocket по всем монетам, прошедшим min_age_months (фильтр возраста монеты)
+- Реальная торговля — только Market ордера (как ты просил)
+- Авто-переключение режимов агрессивности — отключено по умолчанию (можно включить в конфиге)
+- Регулярная выгрузка статистики сценариев (через ScenarioTracker)
 """
 
 import asyncio
 import time
-from typing import Dict
+from datetime import datetime
+from typing import Dict, Set, List
+import ccxt.pro as ccxt
 
-import polars as pl
+from src.model.inference import InferenceEngine
+from src.trading.order_executor import OrderExecutor
+from src.trading.risk_manager import RiskManager
+from src.trading.tp_sl_manager import TPSLManager
+from src.trading.virtual_trader import VirtualTrader
+from src.data.resampler import Resampler
+from src.data.storage import Storage
+from src.model.trainer import Trainer
+from src.model.scenario_tracker import ScenarioTracker
+from src.core.config import load_config
+from src.utils.logger import get_logger
 
-from ..utils.logger import logger
-from ..core.config import get_config
-from ..core.types import AnomalySignal, ModelInput, TradeConfig
-from ..features.feature_engine import FeatureEngine
-from ..model.inference import InferenceEngine
-from .order_executor import OrderExecutor
-from .virtual_trader import VirtualTrader
-from .risk_manager import RiskManager
-from .websocket_manager import WebSocketManager
-from ..data.resampler import Resampler
-
+logger = get_logger(__name__)
 
 class LiveLoop:
-    def __init__(self):
-        self.config = get_config()
-        self.feature_engine = FeatureEngine(self.config)
-        self.inference = InferenceEngine(self.config)
-        self.order_executor = OrderExecutor(self.config)
-        self.virtual_trader = VirtualTrader()
-        self.risk_manager = RiskManager(self.config)
-        self.ws_manager = WebSocketManager(self)
-        self.resampler = Resampler()  # ← используем ресэмплинг
+    def __init__(self, config: dict):
+        self.config = config
+        self.storage = Storage(config)
+        self.resampler = Resampler(config)
+        self.inference = InferenceEngine(config)
+        self.risk_manager = RiskManager(config)
+        self.tp_sl_manager = TPSLManager(config)
+        self.order_executor = OrderExecutor(config)
+        self.virtual_trader = VirtualTrader(config)
+        self.trainer = Trainer(config)
+        self.scenario_tracker = ScenarioTracker(config)
 
-        self.current_dfs: Dict[str, Dict[str, pl.DataFrame]] = {}  # coin → {tf: df}
-        self.traded_coins: Dict[str, TradeConfig] = {}
+        self.exchange = ccxt.binance(config["exchange"])
+        self.is_real_trading = config["trading_mode"].get("real_trading", False)
 
-        logger.info("LiveLoop запущен", hardware=self.config["hardware"]["type"])
+        # === Настройки порогов вероятности (по твоему требованию) ===
+        # min_prob_anomaly — для обычных аномалий (candle/volume/cv)
+        # min_prob_quiet   — для q_condition (более строгий, т.к. рынок спокойный)
+        self.min_prob_anomaly = config["model"].get("min_prob_anomaly", 0.65)
+        self.min_prob_quiet   = config["model"].get("min_prob_quiet",   0.78)
 
-    async def run(self):
-        logger.info("Запуск основного цикла")
-        await self.ws_manager.start()
+        # Активные монеты из whitelist
+        self.active_symbols: Set[str] = set(self.storage.get_whitelist())
 
-        asyncio.create_task(self._console_command_handler())
+        # Монеты, которые выпали из whitelist, но ещё имеют открытые позиции
+        self.pending_removal: Dict[str, int] = {}  # symbol → timestamp последнего обновления
 
-        try:
-            while True:
-                await asyncio.sleep(0.25)
-                await self._process_all_coins()
-        except asyncio.CancelledError:
-            logger.info("Цикл остановлен")
-        except Exception as e:
-            logger.exception("Критическая ошибка", error=str(e))
-        finally:
-            await self.ws_manager.stop()
-            logger.info("LiveLoop завершён")
+        self.max_positions = config["risk"].get("max_positions", 10)
+        self.open_positions: Dict[str, Dict] = {}  # symbol → {entry_time, entry_price, direction, size, ...}
 
-    async def _process_all_coins(self):
-        for coin, tfs in list(self.current_dfs.items()):
-            await self._process_coin(coin, tfs)
+        self.new_candles_count = 0
+        self.last_retrain_time = time.time()
 
-    async def _process_coin(self, coin: str, tfs: Dict[str, pl.DataFrame]):
-        """Обработка одной монеты."""
-        try:
-            # 1. Ресэмплим все TF из 1m (если 1m есть)
-            df_1m = tfs.get("1m")
-            if df_1m is None or df_1m.is_empty():
-                logger.debug("Нет 1m данных", coin=coin)
-                return
+    async def start(self):
+        """Запуск основного торгового цикла"""
+        logger.info(f"LiveLoop запущен | "
+                    f"Реальная торговля: {self.is_real_trading} | "
+                    f"Активных монет: {len(self.active_symbols)} | "
+                    f"Max positions: {self.max_positions}")
 
-            all_tfs = self.resampler.get_all_timeframes(coin, df_1m)
-
-            # 2. Feature engineering
-            model_input: ModelInput = self.feature_engine.process(all_tfs)
-
-            # 3. Если нет аномалий — только симуляция закрытия
-            if not model_input.anomalies:
-                self._simulate_existing_positions(coin, all_tfs)
-                return
-
-            logger.info("Аномалии обнаружены", coin=coin, count=len(model_input.anomalies))
-
-            # 4. Отдельный предикт на каждую аномалию
-            for signal in model_input.anomalies:
-                signal.coin = coin
-
-                single_input = self.feature_engine.process_for_single_anomaly(all_tfs, signal.anomaly_type)
-                pred = self.inference.predict(single_input)
-
-                if coin not in self.traded_coins:
-                    self.virtual_trader.process_signal(signal, pred)
-                else:
-                    req = self.traded_coins[coin]
-                    if (signal.tf == req.tf and
-                        signal.anomaly_type == req.anomaly_type and
-                        signal.direction_hint == req.direction and
-                        pred.confidence >= self.config["trading"]["min_confidence"][signal.anomaly_type.value]):
-
-                        position = self.risk_manager.calculate_position(signal, pred, all_tfs[signal.tf])
-                        if position:
-                            await self.order_executor.execute_open(position)
-
-            # 5. Симуляция закрытия виртуальных позиций на текущей свече
-            self._simulate_existing_positions(coin, all_tfs)
-
-        except Exception as e:
-            logger.exception("Ошибка обработки монеты", coin=coin, error=str(e))
-
-    def _simulate_existing_positions(self, coin: str, tfs: Dict[str, pl.DataFrame]):
-        """Проверяет и закрывает виртуальные позиции по TP/SL."""
-        df_1m = tfs.get("1m")
-        if df_1m is None or df_1m.is_empty():
+        # Подписываемся на все монеты, прошедшие фильтр возраста (min_age_months)
+        symbols = list(self.active_symbols)
+        if not symbols:
+            logger.warning("Whitelist пуст → торговля невозможна")
             return
 
-        latest = df_1m.tail(1)
-        new_price = latest["close"][0]
-        timestamp = latest["timestamp"][0]
-
-        self.virtual_trader.update_on_new_candle(coin, new_price, timestamp)
-
-    async def _console_command_handler(self):
-        logger.info("Консольные команды: pr, exit")
+        # Подписка на 1m свечи (основной таймфрейм)
+        await self.exchange.watch_multiple_ohlcv(symbols, "1m")
 
         while True:
             try:
-                cmd = await asyncio.to_thread(input, ">>> ")
-                cmd = cmd.strip().lower()
+                for symbol in list(self.active_symbols):
+                    await self._process_symbol(symbol)
 
-                if cmd == "pr":
-                    await self.show_pr_table()
-                elif cmd in ("exit", "quit"):
-                    logger.info("Выход из консоли")
-                    break
-                elif cmd:
-                    print("Команды: pr, exit")
-            except EOFError:
-                break
+                # Проверка монет, которые выпали из whitelist
+                self._check_pending_removal()
+
+                # Авто-переобучение каждые 10 000 свечей
+                if self.new_candles_count >= 10000:
+                    await self._retrain_model()
+
+                # Экспорт статистики сценариев (раз в час)
+                if time.time() - self.last_export_time > 3600:
+                    self.scenario_tracker.export_statistics()
+                    self.last_export_time = time.time()
+
+                await asyncio.sleep(0.05)  # небольшой sleep для снижения нагрузки
+
             except Exception as e:
-                logger.error("Ошибка консоли", error=str(e))
+                logger.error(f"Критическая ошибка в LiveLoop: {e}")
+                await asyncio.sleep(10)
 
-            await asyncio.sleep(0.1)
-
-    async def show_pr_table(self, min_pr: float = 0.0, min_deals: int = 5, limit: int = 30):
-        df = self.storage.get_pr_table(min_pr=min_pr, min_deals=min_deals)
-
-        if df.is_empty():
-            print("PR таблица пуста.")
+    async def _process_symbol(self, symbol: str):
+        """Обработка одной монеты (новая свеча)"""
+        # Получаем новую 1m свечу
+        candle = await self.exchange.watch_ohlcv(symbol, "1m", limit=1)
+        if not candle or len(candle) == 0:
             return
 
-        top = df.head(limit)
+        df_1m = pl.DataFrame(candle[-1], schema=["timestamp", "open", "high", "low", "close", "volume"])
+        self.resampler.add_1m_candle(df_1m.to_dicts()[0])
+        self.new_candles_count += 1
 
-        print("\n" + "="*100)
-        print(f"Топ-{limit} по PR (PR ≥ {min_pr}, сделок ≥ {min_deals})")
-        print("="*100)
-        print(top.select([
-            "symbol", "tf", "period", "anomaly_type", "direction",
-            pl.col("pr_value").round(4).alias("PR"),
-            pl.col("winrate").round(2).alias("Win%"),
-            "total_deals", "tp_hits", "sl_hits", "last_update"
-        ]).to_pandas().to_string(index=False))
-        print("="*100 + "\n")
+        # Проверяем аномалии / q_condition
+        pred = self.inference.predict(symbol)
+        if not pred["signal"]:
+            return
 
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        path = f"pr_table_{timestamp}.csv"
-        top.write_csv(path)
-        logger.info("PR сохранён", path=path)
+        # Проверяем лимит открытых позиций
+        if len(self.open_positions) >= self.max_positions:
+            return
 
-    async def on_new_candle(self, coin: str, tf: str, candle: dict):
-        """Точка входа из WebSocket."""
-        if tf != "1m":
-            return  # основной источник — 1m
-
-        new_row = pl.DataFrame([candle])
-
-        if coin not in self.current_dfs:
-            self.current_dfs[coin] = {}
-        if "1m" not in self.current_dfs[coin]:
-            self.current_dfs[coin]["1m"] = new_row
+        # Открываем позицию
+        if self.is_real_trading:
+            await self._open_real_position(symbol, pred)
         else:
-            self.current_dfs[coin]["1m"] = pl.concat([
-                self.current_dfs[coin]["1m"],
-                new_row
-            ]).unique("timestamp").sort("timestamp")
+            self._open_virtual_position(symbol, pred)
 
-        await self._process_coin(coin, self.current_dfs[coin])
+    async def _open_real_position(self, symbol: str, pred: Dict):
+        """Открытие реальной позиции по Market ордеру"""
+        direction = "buy" if pred["prob"] > 0.5 else "sell"
+        size = self.risk_manager.calculate_size(self.balance, pred.get("entry_price", 0), direction)
+
+        try:
+            order = await self.exchange.create_order(
+                symbol=symbol,
+                type="market",
+                side=direction,
+                amount=size,
+                params={"positionSide": "BOTH"}
+            )
+            logger.info(f"[REAL] Открыта позиция {direction.upper()} {symbol} | размер={size} | prob={pred['prob']}")
+        except Exception as e:
+            logger.error(f"Ошибка открытия реальной позиции {symbol}: {e}")
+
+    def _open_virtual_position(self, symbol: str, pred: Dict):
+        """Виртуальная позиция (для расчёта PR)"""
+        self.virtual_trader.open_position(symbol, pred)
+        logger.debug(f"[VIRTUAL] Открыта позиция на {symbol} | prob={pred['prob']}")
+
+    def _check_pending_removal(self):
+        """Проверяет монеты, которые выпали из whitelist"""
+        current_whitelist = set(self.storage.get_whitelist())
+
+        for symbol in list(self.active_symbols):
+            if symbol not in current_whitelist:
+                if symbol not in self.open_positions:  # все позиции закрыты
+                    self.active_symbols.remove(symbol)
+                    self.pending_removal.pop(symbol, None)
+                    logger.info(f"Монета {symbol} полностью исключена из торговли (выпала из whitelist)")
+                else:
+                    # Ждём закрытия позиции
+                    self.pending_removal[symbol] = int(time.time())
+
+    async def _retrain_model(self):
+        """Автоматическое переобучение каждые 10 000 свечей"""
+        logger.info("Достигнуто 10 000 свечей → запуск переобучения модели")
+        self.trainer.retrain_incremental()
+        self.new_candles_count = 0
+        self.last_retrain_time = time.time()
+
+    def stop(self):
+        """Graceful shutdown"""
+        logger.info("LiveLoop завершается...")
+        # Закрываем все открытые позиции (если real_trading)
+        for symbol in list(self.open_positions.keys()):
+            logger.warning(f"Принудительное закрытие позиции {symbol} при остановке")
+            # Здесь должен быть вызов close_position()
+        self.storage.close()

@@ -1,164 +1,288 @@
 # src/model/trainer.py
 """
-Trainer — обучение и live-переобучение модели.
-Полностью соответствует ТЗ:
-- Обучение на всех таймфреймах сразу
-- Использование последовательностей свечей (seq_len)
-- 4 окна (24, 50, 74, 100) + multi-TF
-- Live-переобучение каждые 10 000 свечей
-- Разные настройки для phone / colab / server
-- HDBSCAN для сценариев + веса по winrate
-- Сохранение модели (PyTorch + ONNX)
-"""
+Тренировщик модели Conv1D + GRU для внутридневного скальпинга.
 
-import time
-from pathlib import Path
-from typing import Dict, Tuple, Optional
+Вход: последовательности свечей на 4 окнах (24/50/74/100) и всех TF
+Признаки: 12 базовых + 4 бинарных условия (candle_anomaly, volume_anomaly, cv_anomaly, q_condition)
+Label: 1 если после аномалии цена прошла TP раньше SL
+Цель: максимизировать вероятность профитных сделок
+"""
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-import hdbscan
-import numpy as np
-
+from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import GradScaler, autocast
+import os
+import time
+from datetime import datetime
 import polars as pl
+from typing import Dict, List, Tuple
+from tqdm import tqdm
 
-from ..utils.logger import logger
-from ..core.config import get_config
-from ..data.storage import Storage
-from ..features.feature_engine import FeatureEngine
-from .architectures import ScalperHybridModel
+from src.model.architectures import create_model
+from src.features.feature_engine import FeatureEngine
+from src.features.anomaly_detector import AnomalyDetector
+from src.data.storage import Storage
+from src.core.config import load_config
+from src.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+class ScalpSequenceDataset(Dataset):
+    """Датасет: аномалия + окна до неё + label (TP раньше SL)"""
+
+    def __init__(self, config: dict, symbols: List[str], split: str = "train"):
+        self.config = config
+        self.storage = Storage(config)
+        self.feature_engine = FeatureEngine(config)
+        self.anomaly_detector = AnomalyDetector(config)
+        
+        self.timeframes = ["1m", "3m", "5m", "10m", "15m"]
+        self.windows = [24, 50, 74, 100]
+        self.lookback_after = 200  # сколько свечей смотреть вперёд для label
+        
+        self.samples = self._load_samples(symbols, split)
+        logger.info(f"Датасет {split}: {len(self.samples)} примеров")
+
+    def _load_samples(self, symbols: List[str], split: str) -> List[Dict]:
+        samples = []
+        max_samples_per_symbol = 5000 if split == "train" else 1000  # лимит для скорости
+        
+        for symbol in symbols:
+            count = 0
+            for tf in self.timeframes:
+                df = self.storage.load_candles(symbol, tf, limit=50000)
+                if df is None or len(df) < max(self.windows) + self.lookback_after:
+                    continue
+                
+                anomalies = self.anomaly_detector.detect(df)
+                anomaly_indices = [i for i, res in enumerate(anomalies) if res["anomaly_type"]]
+                
+                for idx in anomaly_indices:
+                    if count >= max_samples_per_symbol:
+                        break
+                        
+                    windows = self._extract_windows(df, idx, tf)
+                    if not windows:
+                        continue
+                    
+                    label = self._compute_label(df, idx)
+                    if label is None:
+                        continue
+                    
+                    samples.append({
+                        "tf": tf,
+                        "windows": windows,
+                        "label": label
+                    })
+                    count += 1
+            
+            if count >= max_samples_per_symbol:
+                break
+        
+        # Простой train/val сплит (80/20 по времени)
+        split_idx = int(len(samples) * 0.8)
+        if split == "train":
+            return samples[:split_idx]
+        else:
+            return samples[split_idx:]
+
+    def _extract_windows(self, df: pl.DataFrame, anomaly_idx: int, tf: str) -> Optional[Dict[int, torch.Tensor]]:
+        windows = {}
+        for size in self.windows:
+            start = max(0, anomaly_idx - size + 1)
+            seq_df = df[start:anomaly_idx + 1]
+            if len(seq_df) < size // 2:
+                continue
+            
+            feat_array = self.feature_engine.compute_sequence_features(seq_df)
+            tensor = torch.from_numpy(feat_array).float()
+            windows[size] = tensor
+        
+        return windows if windows else None
+
+    def _compute_label(self, df: pl.DataFrame, anomaly_idx: int) -> Optional[int]:
+        """1 если TP раньше SL в следующие 200 свечей"""
+        past = df[max(0, anomaly_idx - 100):anomaly_idx]
+        if len(past) < 50:
+            return None
+        
+        avg_candle_pct = ((past["high"] - past["low"]) / past["close"]).mean() * 100
+        
+        future = df[anomaly_idx + 1:anomaly_idx + 1 + self.lookback_after]
+        if future.is_empty():
+            return 0
+        
+        entry = df["close"][anomaly_idx]
+        tp_level = entry * (1 + avg_candle_pct * 1.0)
+        sl_level = entry * (1 - avg_candle_pct * 1.0)
+        
+        for row in future.iter_rows(named=True):
+            if row["high"] >= tp_level:
+                return 1
+            if row["low"] <= sl_level:
+                return 0
+        
+        return 0
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        return {
+            "windows": sample["windows"],
+            "label": torch.tensor(sample["label"], dtype=torch.float32)
+        }
 
 
 class Trainer:
-    def __init__(self):
-        self.config = get_config()
-        self.storage = Storage()
-        self.feature_engine = FeatureEngine(self.config)
+    def __init__(self, config: dict):
+        self.config = config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = create_model(config).to(self.device)
+        
+        lr = config["train"]["lr"]
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-5)
+        self.criterion = nn.BCEWithLogitsLoss()
+        self.scaler = GradScaler(enabled=torch.cuda.is_available())
+        
+        self.epochs = config["train"].get("epochs", 30)
+        self.batch_size = config["train"].get("batch_size", 32)
+        self.save_dir = config["paths"]["checkpoints"]
+        os.makedirs(self.save_dir, exist_ok=True)
+        
+        self.best_val_loss = float("inf")
+        self.patience = 8
+        self.patience_counter = 0
+        self.current_epoch = 0
 
-        self.hardware = self.config["hardware"]["type"]
-        self._apply_hardware_limits()
+    def train(self):
+        symbols = self._get_training_symbols()
+        train_loader = self._get_dataloader(symbols, "train")
+        val_loader   = self._get_dataloader(symbols, "val")
+        
+        for epoch in range(1, self.epochs + 1):
+            self.current_epoch = epoch
+            train_loss = self._train_epoch(train_loader)
+            val_loss, metrics = self._validate_epoch(val_loader)
+            
+            logger.info(f"Epoch {epoch:2d}/{self.epochs} | "
+                       f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
+                       f"Acc: {metrics['accuracy']:.3f} | F1: {metrics['f1']:.3f}")
+            
+            if val_loss < self.best_val_loss:
+                self.best_val_loss = val_loss
+                self.patience_counter = 0
+                self._save_checkpoint("best.pth")
+            else:
+                self.patience_counter += 1
+                if self.patience_counter >= self.patience:
+                    logger.info(f"Early stopping на эпохе {epoch}")
+                    break
+            
+            if epoch % 5 == 0:
+                self._save_checkpoint(f"epoch_{epoch}.pth")
 
-        self.model = ScalperHybridModel(self.config).to(self.device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
-        self.criterion = nn.CrossEntropyLoss()
-
-        self.model_path = Path("models") / f"scalper_{self.hardware}.pth"
-        self.model_path.parent.mkdir(exist_ok=True)
-
-        # HDBSCAN для сценариев
-        self.hdbscan = hdbscan.HDBSCAN(min_cluster_size=5, min_samples=3)
-
-        logger.info("Trainer инициализирован",
-                    hardware=self.hardware,
-                    seq_len=self.seq_len,
-                    epochs=self.epochs,
-                    device=self.device)
-
-    def _apply_hardware_limits(self):
-        if self.hardware == "phone":
-            self.seq_len = 50
-            self.epochs = 8
-            self.max_data = 80_000
-            self.batch_size = 32
-            self.device = torch.device("cpu")
-        elif self.hardware == "colab":
-            self.seq_len = 80
-            self.epochs = 25
-            self.max_data = 800_000
-            self.batch_size = 128
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        else:  # server
-            self.seq_len = 100
-            self.epochs = 50
-            self.max_data = 3_000_000
-            self.batch_size = 512
-            self.device = torch.device("cuda")
-
-    def train(self, coin: str = "BTC"):
-        """Полное обучение модели."""
-        logger.info("Начало обучения", coin=coin)
-
-        # Подготовка данных (все TF)
-        X, y = self._prepare_training_data(coin)
-        if X is None:
-            return
-
-        dataset = TensorDataset(X, y)
-        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
-
+    def _train_epoch(self, loader: DataLoader) -> float:
         self.model.train()
-        for epoch in range(self.epochs):
-            total_loss = 0.0
-            for batch_x, batch_y in loader:
-                batch_x = batch_x.to(self.device)
-                batch_y = batch_y.to(self.device)
+        total_loss = 0.0
+        
+        for batch in tqdm(loader, desc="Training"):
+            windows = {tf: {int(w): t.to(self.device) for w, t in ws.items()}
+                       for tf, ws in batch["windows"].items()}
+            labels = batch["label"].to(self.device)
+            
+            self.optimizer.zero_grad(set_to_none=True)
+            
+            with autocast():
+                preds = self.model(windows)
+                loss = self.criterion(preds, labels)
+            
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            
+            total_loss += loss.item() * labels.size(0)
+        
+        return total_loss / len(loader.dataset)
 
-                self.optimizer.zero_grad()
-                output = self.model(batch_x)
-                loss = self.criterion(output, batch_y)
-                loss.backward()
-                self.optimizer.step()
+    def _validate_epoch(self, loader: DataLoader) -> Tuple[float, Dict]:
+        self.model.eval()
+        total_loss = 0.0
+        all_preds, all_labels = [], []
+        
+        with torch.no_grad():
+            for batch in loader:
+                windows = {tf: {int(w): t.to(self.device) for w, t in ws.items()}
+                           for tf, ws in batch["windows"].items()}
+                labels = batch["label"].to(self.device)
+                
+                preds = self.model(windows)
+                loss = self.criterion(preds, labels)
+                total_loss += loss.item() * labels.size(0)
+                
+                all_preds.append((preds > 0).float())
+                all_labels.append(labels)
+        
+        preds_all = torch.cat(all_preds)
+        labels_all = torch.cat(all_labels)
+        
+        accuracy = (preds_all == labels_all).float().mean().item()
+        precision = ((preds_all == 1) & (labels_all == 1)).sum() / (preds_all == 1).sum().clamp(min=1)
+        recall = ((preds_all == 1) & (labels_all == 1)).sum() / (labels_all == 1).sum().clamp(min=1)
+        f1 = 2 * precision * recall / (precision + recall).clamp(min=1e-8)
+        
+        return total_loss / len(loader.dataset), {
+            "accuracy": accuracy,
+            "precision": precision.item(),
+            "recall": recall.item(),
+            "f1": f1.item()
+        }
 
-                total_loss += loss.item()
+    def _get_dataloader(self, symbols: List[str], split: str) -> DataLoader:
+        dataset = ScalpSequenceDataset(self.config, symbols, split=split)
+        return DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=(split == "train"),
+            num_workers=0 if self.config["hardware_mode"] == "phone_tiny" else 4,
+            pin_memory=torch.cuda.is_available()
+        )
 
-            logger.info(f"Эпоха {epoch+1}/{self.epochs}", loss=f"{total_loss/len(loader):.6f}")
+    def _get_training_symbols(self) -> List[str]:
+        """Символы для обучения — из whitelist или топ по PR"""
+        whitelist = self.storage.get_whitelist()
+        if whitelist:
+            return whitelist[:50]  # лимит для скорости
+        return ["BTCUSDT", "ETHUSDT", "SOLUSDT"]  # fallback
 
-        self._save_model()
-        self._run_hdbscan_clustering()
-        logger.info("Обучение завершено")
+    def _save_checkpoint(self, filename: str):
+        path = os.path.join(self.save_dir, filename)
+        torch.save({
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "best_val_loss": self.best_val_loss,
+            "epoch": self.current_epoch
+        }, path)
+        logger.info(f"Сохранён чекпоинт: {path}")
 
-    def _prepare_training_data(self, coin: str) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Подготавливает последовательности свечей и метки."""
-        # Загружаем все TF
-        dfs = {}
-        for tf in ["1m", "3m", "5m", "10m", "15m"]:
-            df = self.storage.load_candles(coin, tf)
-            if df is not None and len(df) > self.seq_len * 2:
-                dfs[tf] = df.tail(self.max_data)
+    def retrain_incremental(self):
+        """Переобучение на новых данных (каждые 10k свечей)"""
+        logger.info("Запуск инкрементального переобучения")
+        self.train()
 
-        if not dfs:
-            logger.error("Нет данных для обучения", coin=coin)
-            return None, None
 
-        X_list, y_list = [], []
-        for tf, df in dfs.items():
-            for i in range(len(df) - self.seq_len - 10):
-                seq = df[i:i + self.seq_len]
-                future_price = df["close"][i + self.seq_len]
-                current_price = df["close"][i + self.seq_len - 1]
+def main():
+    config = load_config()
+    trainer = Trainer(config)
+    
+    if "--retrain" in os.sys.argv:
+        trainer.retrain_incremental()
+    else:
+        trainer.train()
 
-                change = (future_price - current_price) / current_price * 100
-                label = 0 if change > 0.6 else 1 if change < -0.6 else 2  # 0=Long, 1=Short, 2=Flat
 
-                tensor = self._candle_to_tensor(seq)
-                X_list.append(tensor)
-                y_list.append(label)
-
-        if not X_list:
-            return None, None
-
-        return torch.stack(X_list), torch.tensor(y_list, dtype=torch.long)
-
-    def _candle_to_tensor(self, df: pl.DataFrame) -> torch.Tensor:
-        """Преобразует свечи в тензор с нормализацией."""
-        data = df.select(["open", "high", "low", "close", "volume"]).to_numpy()
-        data = (data - data.mean(axis=0)) / (data.std(axis=0) + 1e-8)
-        return torch.tensor(data.T, dtype=torch.float32)
-
-    def _save_model(self):
-        torch.save(self.model.state_dict(), self.model_path)
-        logger.info("Модель сохранена", path=str(self.model_path))
-
-    def _run_hdbscan_clustering(self):
-        """Запуск HDBSCAN для сценариев (после обучения)."""
-        logger.info("Запуск HDBSCAN кластеризации сценариев")
-        # Здесь будет логика извлечения бинарных векторов из half_comparator
-        # Пока заглушка
-        pass
-
-    def live_retrain(self):
-        """Live-переобучение каждые 10 000 свечей."""
-        logger.info("Live-переобучение запущено")
-        self.train()  # можно сделать incremental в будущем
+if __name__ == "__main__":
+    main()

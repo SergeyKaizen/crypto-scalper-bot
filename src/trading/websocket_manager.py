@@ -1,169 +1,147 @@
 # src/trading/websocket_manager.py
 """
-Реальный асинхронный WebSocket-клиент для Binance Futures USDT perpetual.
-Использует ccxt.pro — лучший выбор для скальпинга в 2026 году.
+Менеджер WebSocket-подписок на Binance Futures.
 
-Особенности:
-- Динамическая подписка: traded_coins → все нужные TF, остальные → только 1m
-- Автоматический reconnect при разрыве (backoff 1–30 сек)
-- Обработка только закрытых свечей ("x": true)
-- Мгновенный вызов live_loop.on_new_candle
-- Публичный режим без ключей (для начала)
-- Полная поддержка приватных стримов после добавления ключей
-- Логирование всех событий + метрики задержки
+Ключевые требования и особенности:
+- Подписка на 1m свечи для всех монет из whitelist (может быть 250+ монет)
+- Разбиение на батчи по 30–50 монет (настраивается в конфиге), чтобы не превышать лимиты Binance (~200–300 подписок на соединение)
+- Автоматическое переподключение при разрыве (экспоненциальная задержка: 1→2→4→8→16→60 сек)
+- Обновление списка монет при изменении whitelist (раз в 5 минут или по событию)
+- Если монета выпала из whitelist → отписка (через переподключение)
+- Передача новых свечей в Resampler
+- Логирование подключений, батчей, ошибок и количества подписок
+- Heartbeat встроен в ccxt.pro — не влияет на лимиты REST API
 """
 
 import asyncio
 import time
-from typing import Dict, Set, Tuple
-
+from typing import List, Set
 import ccxt.pro as ccxt
-from ccxt.base.errors import NetworkError, ExchangeError
 
-from ..utils.logger import logger
-from ..core.config import get_config
+from src.core.config import load_config
+from src.data.resampler import Resampler
+from src.data.storage import Storage
+from src.utils.logger import get_logger
 
+logger = get_logger(__name__)
 
 class WebSocketManager:
-    def __init__(self, live_loop):
-        self.live_loop = live_loop
-        self.config = get_config()
+    def __init__(self, config: dict, resampler: Resampler):
+        self.config = config
+        self.resampler = resampler
+        self.storage = Storage(config)
 
-        # ccxt.pro клиент
-        self.exchange = ccxt.binance({
-            'enableRateLimit': True,
-            'asyncio_loop': asyncio.get_running_loop(),
-            'options': {
-                'defaultType': 'future',           # USDT perpetual
-                'watchOrderBookLimit': 100,        # не нужен сейчас
-                'adjustForTimeDifference': True,
-            },
-            # Раскомментируй, когда добавишь ключи
-            # 'apiKey': self.config['binance']['api_key'],
-            # 'secret': self.config['binance']['secret_key'],
-            # 'enableRateLimit': True,
-        })
+        self.exchange = ccxt.binance(config["exchange"])
+        self.exchange.enableRateLimit = True
 
-        self.running = False
-        self.task = None
-        self.last_reconnect = 0
+        # Батч-размер подписки (оптимально 30–50, лимит Binance ~200–300 на соединение)
+        self.batch_size = config.get("websocket", {}).get("batch_size", 40)
 
-        # Подписки
-        self.active_subscriptions: Dict[str, Set[str]] = {}  # symbol → {tf1, tf2, ...}
-        self.shadow_subscriptions: Set[str] = set()           # только 1m
+        # Текущие активные подписки и whitelist
+        self.active_subscriptions: Set[str] = set()
+        self.current_whitelist: Set[str] = set(self.storage.get_whitelist())
 
-        logger.info("WebSocketManager создан (ccxt.pro)")
+        # Статус и задержка переподключения
+        self.is_connected = False
+        self.reconnect_delay = 1  # начальная задержка в секундах
 
     async def start(self):
-        self.running = True
-        logger.info("Запуск WebSocketManager")
-        self.task = asyncio.create_task(self._run())
+        """Запуск менеджера подписок"""
+        logger.info(f"WebSocketManager запущен | Батч-размер: {self.batch_size} | "
+                    f"Монет в whitelist: {len(self.current_whitelist)}")
 
-    async def stop(self):
-        self.running = False
-        if self.task:
-            self.task.cancel()
-        await self.exchange.close()
-        logger.info("WebSocketManager остановлен")
-
-    async def _run(self):
-        backoff = 1
-        while self.running:
+        while True:
             try:
-                await self._rebalance_subscriptions()
-                await self._watch_klines()
-                backoff = 1  # сброс backoff после успешного подключения
-            except (NetworkError, ExchangeError, asyncio.CancelledError) as e:
-                logger.warning("WebSocket ошибка/разрыв", error=str(e), backoff=backoff)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30)  # экспоненциальный backoff до 30 сек
+                await self._maintain_subscriptions()
+                await asyncio.sleep(60)  # проверка каждую минуту
             except Exception as e:
-                logger.exception("Критическая ошибка в WS", error=str(e))
-                await asyncio.sleep(30)
+                logger.error(f"Критическая ошибка в WebSocketManager: {e}")
+                await asyncio.sleep(10)
 
-    async def _rebalance_subscriptions(self):
-        """Обновляет список подписок каждые 5 минут."""
-        logger.debug("Перебалансировка подписок")
+    async def _maintain_subscriptions(self):
+        """Основной цикл поддержания актуальных подписок"""
+        # Проверяем актуальный whitelist
+        new_whitelist = set(self.storage.get_whitelist())
 
-        # Active монеты (реальная торговля)
-        new_active = {}
-        for coin, cfg in self.live_loop.traded_coins.items():
-            symbol = f"{coin.lower()}/usdt:usdt"  # формат ccxt для futures
-            tfs = {cfg.tf}  # только нужный TF
-            new_active[symbol] = tfs
+        if new_whitelist != self.current_whitelist:
+            logger.info(f"Whitelist изменился: было {len(self.current_whitelist)}, стало {len(new_whitelist)}")
+            await self._resubscribe(new_whitelist)
+            self.current_whitelist = new_whitelist
 
-        # Shadow монеты (для PR) — только 1m
-        new_shadow = set()
-        # Пока пример — все монеты из конфига или топ по volume
-        # В реальности — динамический список из фильтра
-        shadow_list = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]  # ← замени
-        for sym in shadow_list:
-            if sym not in new_active:
-                new_shadow.add(sym)
+        # Если не подключены — подключаемся
+        if not self.is_connected:
+            await self._connect_and_subscribe()
 
-        self.active_subscriptions = new_active
-        self.shadow_subscriptions = new_shadow
-
-        logger.info("Подписки обновлены",
-                    active_coins=len(self.active_subscriptions),
-                    shadow_coins=len(self.shadow_subscriptions))
-
-    async def _watch_klines(self):
-        """Главный метод стриминга kline."""
-        # Собираем все нужные пары (symbol, timeframe)
-        streams: List[Tuple[str, str]] = []
-        for symbol, tfs in self.active_subscriptions.items():
-            for tf in tfs:
-                streams.append((symbol, tf))
-        for symbol in self.shadow_subscriptions:
-            streams.append((symbol, '1m'))
-
-        if not streams:
-            logger.debug("Нет активных стримов, ждём 10 сек")
-            await asyncio.sleep(10)
+    async def _connect_and_subscribe(self):
+        """Подключение и подписка на текущий whitelist"""
+        symbols = list(self.current_whitelist)
+        if not symbols:
+            logger.warning("Whitelist пуст → подписка невозможна")
+            self.is_connected = False
             return
 
-        logger.info("Запуск стриминга kline", streams_count=len(streams))
+        batches = [symbols[i:i + self.batch_size] for i in range(0, len(symbols), self.batch_size)]
+        logger.info(f"Разбиваем подписку на {len(batches)} батчей по {self.batch_size} монет")
 
-        while self.running:
+        self.is_connected = True
+        self.reconnect_delay = 1  # сбрасываем задержку
+
+        for batch in batches:
+            asyncio.create_task(self._subscribe_batch(batch))
+
+    async def _subscribe_batch(self, symbols: List[str]):
+        """Подписка на один батч монет"""
+        logger.info(f"Подписка на батч ({len(symbols)} монет): {', '.join(symbols[:5])}...")
+
+        while True:
             try:
-                async for ohlcv in self.exchange.watch_ohlcv_batch(streams):
-                    if ohlcv is None:
-                        continue
-
-                    symbol, timeframe, candle = ohlcv
-
-                    # candle = [timestamp, open, high, low, close, volume]
-                    if candle is None:
-                        continue
-
-                    # Проверяем, свеча закрыта (по времени)
-                    current_ts = int(time.time() * 1000)
-                    candle_ts = candle[0]
-                    candle_age = current_ts - candle_ts
-
-                    # Если свеча старше 1.5× интервала — считаем закрытой
-                    tf_seconds = {'1m': 60, '3m': 180, '5m': 300, '10m': 600, '15m': 900}.get(timeframe, 60)
-                    if candle_age > tf_seconds * 1.5 * 1000:
-                        candle_dict = {
-                            "timestamp": candle[0],
-                            "open": candle[1],
-                            "high": candle[2],
-                            "low": candle[3],
-                            "close": candle[4],
-                            "volume": candle[5],
-                        }
-                        coin = symbol.split('/')[0].upper()
-                        await self.live_loop.on_new_candle(coin, timeframe, candle_dict)
-                        logger.debug("Закрытая свеча получена",
-                                     coin=coin,
-                                     tf=timeframe,
-                                     close=candle[4],
-                                     age_sec=candle_age / 1000)
+                async for ohlcv in self.exchange.watch_ohlcv(symbols, timeframe="1m"):
+                    for candle in ohlcv:
+                        symbol = candle["symbol"]
+                        if symbol not in symbols:
+                            continue
+                        
+                        # Передаём свечу в resampler
+                        df_candle = pl.DataFrame({
+                            "timestamp": [candle["timestamp"]],
+                            "open": [candle["open"]],
+                            "high": [candle["high"]],
+                            "low": [candle["low"]],
+                            "close": [candle["close"]],
+                            "volume": [candle["volume"]]
+                        })
+                        
+                        self.resampler.add_1m_candle(df_candle.to_dicts()[0])
+                        logger.debug(f"Получена свеча {symbol} | close={candle['close']}")
 
             except ccxt.NetworkError as e:
-                logger.warning("Сеть упала", error=str(e))
-                await asyncio.sleep(3)
+                logger.warning(f"Сеть упала на батче {symbols[:3]}...: {e}")
+                self.is_connected = False
+                await asyncio.sleep(self.reconnect_delay)
+                self.reconnect_delay = min(self.reconnect_delay * 2, 60)  # экспоненциальная задержка
+            except ccxt.RateLimitExceeded:
+                logger.warning("Rate limit WebSocket — ждём 30 сек")
+                await asyncio.sleep(30)
             except Exception as e:
-                logger.exception("Ошибка стриминга", error=str(e))
+                logger.error(f"Ошибка подписки на батч {symbols[:3]}...: {e}")
                 await asyncio.sleep(10)
+
+    async def _resubscribe(self, new_whitelist: Set[str]):
+        """Полная переподписка при изменении whitelist"""
+        to_subscribe = new_whitelist - self.active_subscriptions
+        to_unsubscribe = self.active_subscriptions - new_whitelist
+
+        logger.info(f"Переподписка: +{len(to_subscribe)} | -{len(to_unsubscribe)}")
+
+        # Закрываем текущее соединение и очищаем подписки
+        await self.exchange.close()
+        self.active_subscriptions.clear()
+        self.is_connected = False
+
+        # Запускаем новую подписку
+        await self._connect_and_subscribe()
+
+    def stop(self):
+        """Остановка менеджера"""
+        logger.info("WebSocketManager останавливается...")
+        asyncio.create_task(self.exchange.close())

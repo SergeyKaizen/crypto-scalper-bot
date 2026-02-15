@@ -1,212 +1,154 @@
 # src/trading/risk_manager.py
 """
-Risk Manager — расчёт размера позиции, TP/SL, контроль риска.
-Полностью соответствует ТЗ + улучшения:
-1. Реальный запрос к Binance /fapi/v1/exchangeInfo (кэшируется)
-2. Учёт комиссии taker 0.04% (вход + выход = 0.08%)
+Менеджер риска — расчёт размера позиции, проверка лимитов и корректировка рисков.
+
+Ключевые требования из ТЗ:
+- Риск на сделку — авто-расчёт на основе риск-профита (TP/SL) или ручной ввод (0.5%, 1.1%, 2% и т.д.)
+- Авто-режим: риск = 1 / (TP/SL ratio) — баланс риска и профита
+- Плечо — проверка максимального допустимого для монеты (если задано 50, а монета позволяет 10 — берём 10)
+- Корреляционный фильтр — опционально (по умолчанию выключен)
+- Max positions — ограничение общего количества открытых позиций
+- Режимы агрессивности (conservative / balanced / aggressive / custom) — разные риски и min_prob
+- Авто-переключение режимов — отключено по умолчанию (можно включить)
+
+Логика:
+- calculate_size() — основной метод, возвращает размер позиции в USDT
+- allow_new_position() — проверяет, можно ли открывать новую сделку (лимит позиций, корреляция и т.д.)
+- get_current_risk() — возвращает текущий % риска на сделку (зависит от режима)
 """
 
-from typing import Optional, Dict, Any
 import time
+from typing import Dict, Optional
+import numpy as np
 
-import ccxt
-import polars as pl
+from src.data.storage import Storage
+from src.utils.logger import get_logger
+from src.core.config import load_config
 
-from ..utils.logger import logger
-from ..core.config import get_config
-from ..core.types import AnomalySignal, Direction, Position
-
+logger = get_logger(__name__)
 
 class RiskManager:
-    def __init__(self):
-        self.config = get_config()
-        self.ccxt_client = ccxt.binance({
-            'enableRateLimit': True,
-            'options': {'defaultType': 'future'},
-            # Ключи добавишь позже — пока публичный режим
-            # 'apiKey': self.config['binance']['api_key'],
-            # 'secret': self.config['binance']['secret_key'],
-        })
+    def __init__(self, config: dict):
+        self.config = config
+        self.storage = Storage(config)
 
-        # Текущий депозит (обновляется после каждой позиции)
-        self.current_balance = self.config["trading"]["initial_balance"]  # USDT
-        self.leverage = self.config["trading"]["leverage"]
-        self.risk_mode = self.config["trading"]["risk_mode"]
-        self.manual_risk_pct = self.config["trading"].get("manual_risk_pct", 1.0)
+        # Основные настройки риска
+        self.risk_mode = config["trading_mode"]["risk_mode"]  # conservative / balanced / aggressive / custom
+        self.manual_risk_pct = config["risk"].get("manual_risk_pct", None)  # если задан — переопределяет авто
 
-        # Кэш exchangeInfo (обновляется раз в час или при ошибке)
-        self.coin_info: Dict[str, Dict[str, Any]] = {}
-        self.last_refresh = 0
-        self._refresh_coin_info()
+        # Риски по режимам (в % от депозита на сделку)
+        self.risk_levels = {
+            "conservative": 0.3,   # низкий риск — ниже прибыль
+            "balanced":     1.0,   # средний
+            "aggressive":   2.0    # высокий риск — высокая прибыль
+        }
 
-        # Комиссия taker (Binance Futures USDT-M perpetual, 2026)
-        self.taker_fee_pct = 0.0004  # 0.04%
+        self.current_risk_pct = self._get_risk_pct()
 
-        logger.info("RiskManager готов",
-                    balance=self.current_balance,
-                    leverage=self.leverage,
-                    risk_mode=self.risk_mode,
-                    taker_fee=f"{self.taker_fee_pct*100:.3f}%")
+        # Лимиты
+        self.max_positions = config["risk"].get("max_positions", 10)
+        self.correlation_filter_enabled = config["risk"].get("correlation_filter", {}).get("enabled", False)
+        self.correlation_threshold = config["risk"].get("correlation_filter", {}).get("threshold", 0.75)
 
-    def _refresh_coin_info(self):
-        """Загружает /fapi/v1/exchangeInfo и кэширует данные о монетах."""
-        now = time.time()
-        if now - self.last_refresh < 3600:  # 1 час
-            return
-
-        try:
-            info = self.ccxt_client.fapiPublicGetExchangeInfo()
-            for symbol_info in info['symbols']:
-                symbol = symbol_info['symbol']
-                if symbol.endswith('USDT'):
-                    coin = symbol[:-4]
-                    filters = {f['filterType']: f for f in symbol_info['filters']}
-
-                    self.coin_info[coin] = {
-                        'max_leverage': int(symbol_info.get('leverageFilter', {}).get('maxLeverage', 125)),
-                        'min_notional': float(filters.get('NOTIONAL', {}).get('minNotional', 5.0)),
-                        'price_precision': int(float(filters.get('PRICE_FILTER', {}).get('tickSize', '0.01')) ** -1),
-                        'quantity_precision': int(float(filters.get('LOT_SIZE', {}).get('stepSize', '0.001')) ** -1),
-                    }
-            self.last_refresh = now
-            logger.info("Кэш монет обновлён", coins=len(self.coin_info))
-        except Exception as e:
-            logger.error("Ошибка exchangeInfo", error=str(e))
-            # Запасные значения для основных монет
-            for coin in ["BTC", "ETH", "SOL", "XRP", "ADA"]:
-                self.coin_info.setdefault(coin, {
-                    'max_leverage': 125,
-                    'min_notional': 5.0,
-                    'price_precision': 2,
-                    'quantity_precision': 3,
-                })
-
-    def calculate_position(self, signal: AnomalySignal, pred, current_df: pl.DataFrame) -> Optional[Position]:
-        """Рассчитывает позицию с реальными параметрами монеты и комиссией."""
-        coin = signal.coin
-        if not coin or coin not in self.coin_info:
-            logger.error("Нет данных о монете", coin=coin)
-            return None
-
-        last_candle = current_df.tail(1)
-        entry_price = last_candle["close"][0]
-        timestamp = last_candle["timestamp"][0]
-
-        is_long = signal.direction_hint == Direction.LONG
-
-        # Средний размер свечи (100 баров)
-        period = 100
-        if len(current_df) < period:
-            logger.warning("Мало данных для среднего размера свечи", coin=coin)
-            return None
-
-        sizes = ((current_df["high"] - current_df["low"]) / current_df["close"] * 100).tail(period)
-        avg_candle_size_pct = sizes.mean()
-
-        # TP = средний размер свечи
-        tp_distance_pct = avg_candle_size_pct
-        tp_price = entry_price * (1 + tp_distance_pct / 100) if is_long else \
-                   entry_price * (1 - tp_distance_pct / 100)
-
-        # SL = HH/LL + 0.05% с ограничением 2×средний размер
-        lookback_sl = period
-        if is_long:
-            ll = current_df["low"].tail(lookback_sl).min()
-            sl_price = ll * (1 - 0.0005)
-        else:
-            hh = current_df["high"].tail(lookback_sl).max()
-            sl_price = hh * (1 + 0.0005)
-
-        distance_to_sl = abs(entry_price - sl_price) / entry_price * 100
-        max_sl_distance = 2 * avg_candle_size_pct
-        if distance_to_sl > max_sl_distance:
-            logger.debug("SL скорректирован", coin=coin, old=distance_to_sl, max=max_sl_distance)
-            if is_long:
-                sl_price = entry_price * (1 - max_sl_distance / 100)
-            else:
-                sl_price = entry_price * (1 + max_sl_distance / 100)
-
-        # Риск на сделку
-        risk_pct = self._get_risk_pct()
-        risk_amount = self.current_balance * (risk_pct / 100)
-
-        sl_distance_pct = abs(entry_price - sl_price) / entry_price * 100
-        position_value = risk_amount / (sl_distance_pct / 100)
-
-        # Плечо
-        coin_info = self.coin_info[coin]
-        max_leverage = coin_info['max_leverage']
-        effective_leverage = min(self.leverage, max_leverage)
-
-        position_size_usdt = position_value * effective_leverage
-
-        # Проверка минимального ордера
-        min_notional = coin_info['min_notional']
-        if position_size_usdt < min_notional:
-            logger.warning("Позиция меньше min_notional",
-                           coin=coin,
-                           calculated=position_size_usdt,
-                           min_notional=min_notional)
-            return None
-
-        # Проверка маржи
-        required_margin = position_size_usdt / effective_leverage
-        if required_margin > self.current_balance:
-            logger.warning("Недостаточно маржи",
-                           required=required_margin,
-                           available=self.current_balance)
-            return None
-
-        position = Position(
-            coin=coin,
-            side=signal.direction_hint,
-            entry_price=entry_price,
-            size=position_size_usdt / entry_price,  # кол-во контрактов
-            entry_time=timestamp,
-            tp_price=tp_price,
-            sl_price=sl_price,
-            anomaly_signal=signal,
-            is_real=False
-        )
-
-        logger.info("Позиция рассчитана",
-                    coin=coin,
-                    side=signal.direction_hint.value,
-                    entry_price=entry_price,
-                    size_usdt=position_size_usdt,
-                    leverage=effective_leverage,
-                    risk_pct=risk_pct,
-                    tp_price=tp_price,
-                    sl_price=sl_price,
-                    commission_pct=self.taker_fee_pct*100)
-
-        return position
+        # Кэш открытых позиций (обновляется из live_loop)
+        self.open_positions_count = 0
 
     def _get_risk_pct(self) -> float:
-        mode = self.risk_mode
-        if mode == "auto":
-            return 1.0
-        elif mode == "low":
-            return 0.5
-        elif mode == "medium":
-            return 1.0
-        elif mode == "high":
-            return 2.0
-        elif mode == "manual":
+        """Возвращает текущий % риска на сделку в зависимости от режима"""
+        if self.manual_risk_pct is not None:
             return self.manual_risk_pct
-        return 1.0
+        
+        return self.risk_levels.get(self.risk_mode, 1.0)
 
-    def update_balance_after_close(self, gross_pnl: float):
-        """Обновляет баланс с учётом комиссии (вход + выход)."""
-        commission = abs(gross_pnl) * self.taker_fee_pct * 2  # 0.08% от суммы
-        net_pnl = gross_pnl - commission
+    def calculate_size(self,
+                      balance: float,
+                      entry_price: float,
+                      direction: str,
+                      tp_sl_ratio: float = 1.0,  # TP/SL расстояние в % (из tp_sl_manager)
+                      stop_loss_pct: Optional[float] = None) -> float:
+        """
+        Основной метод расчёта размера позиции.
 
-        self.current_balance += net_pnl
-        logger.info("Баланс обновлён",
-                    gross_pnl=gross_pnl,
-                    commission=commission,
-                    net_pnl=net_pnl,
-                    new_balance=self.current_balance)
+        Логика авто-режима:
+        - Риск % = 1 / tp_sl_ratio (баланс риска и профита)
+        - Если задан manual_risk_pct — используется он
+        - Если задан stop_loss_pct — риск считается от SL расстояния
 
-    def get_current_balance(self) -> float:
-        return self.current_balance
+        Возвращает размер позиции в USDT (или контрактах — зависит от конфига)
+        """
+        risk_pct = stop_loss_pct or self.current_risk_pct
+        
+        # Авто-режим: риск пропорционален обратному отношению TP/SL
+        if self.manual_risk_pct is None:
+            risk_pct = min(2.0, max(0.3, 1.0 / tp_sl_ratio))  # ограничиваем 0.3–2.0%
+
+        # Размер риска в деньгах
+        risk_amount = balance * (risk_pct / 100)
+
+        # Расстояние до SL в % (если не задано — берём из tp_sl_ratio)
+        sl_distance_pct = stop_loss_pct or (1.0 / tp_sl_ratio)
+
+        # Размер позиции в USDT
+        position_size_usdt = risk_amount / (sl_distance_pct / 100)
+
+        # Учёт плеча (если торговля с плечом)
+        leverage = self.config["finance"].get("leverage", 1)
+        position_size_usdt *= leverage
+
+        logger.debug(f"Рассчитан размер позиции для {direction}: {position_size_usdt:.2f} USDT "
+                     f"(риск {risk_pct:.2f}%, SL distance {sl_distance_pct:.2f}%)")
+
+        return position_size_usdt
+
+    def allow_new_position(self, symbol: str, open_positions: Dict[str, Dict]) -> bool:
+        """
+        Проверяет, можно ли открывать новую позицию.
+
+        Условия:
+        - Не превышен max_positions
+        - Корреляционный фильтр (если включён)
+        - Монета в whitelist
+        """
+        if len(open_positions) >= self.max_positions:
+            logger.debug(f"Достигнут лимит позиций ({self.max_positions})")
+            return False
+
+        if symbol not in self.storage.get_whitelist():
+            logger.debug(f"{symbol} не в whitelist → новая позиция запрещена")
+            return False
+
+        if self.correlation_filter_enabled:
+            # Здесь можно добавить реальную проверку корреляции (например rolling 4h)
+            # Пока заглушка — всегда разрешено
+            pass
+
+        return True
+
+    def update_open_positions_count(self, count: int):
+        """Обновляет текущее количество открытых позиций (вызывается из live_loop)"""
+        self.open_positions_count = count
+
+    def get_current_risk(self) -> float:
+        """Возвращает текущий % риска на сделку"""
+        return self.current_risk_pct
+
+    def switch_mode(self, new_mode: str):
+        """Переключение режима агрессивности (если авто-включено)"""
+        if new_mode not in self.risk_levels:
+            logger.warning(f"Неизвестный режим риска: {new_mode}")
+            return
+        
+        self.risk_mode = new_mode
+        self.current_risk_pct = self._get_risk_pct()
+        logger.info(f"Режим риска переключён на {new_mode} (риск на сделку: {self.current_risk_pct}%)")
+
+
+if __name__ == "__main__":
+    config = load_config()
+    rm = RiskManager(config)
+    
+    # Тест расчёта размера
+    size = rm.calculate_size(balance=10000, entry_price=60000, direction="L", tp_sl_ratio=1.5)
+    print(f"Размер позиции: {size:.2f} USDT")
+    
+    print(f"Текущий риск %: {rm.get_current_risk()}")

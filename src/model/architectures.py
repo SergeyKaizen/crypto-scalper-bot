@@ -1,120 +1,184 @@
 # src/model/architectures.py
 """
-Архитектура основной модели — гибрид Conv1D + GRU с multi-scale и multi-TF подходом.
+Гибридная архитектура Conv1D + GRU для скальпинга на крипте (Binance futures).
+
+Ключевые принципы из ТЗ:
+- Данные подаются как последовательности свечей (time-series sequences)
+- 4 окна: 24, 50, 74, 100 свечей
+- Модель видит полный ряд для анализа переходов между половинами, TF и окнами
+- Обучение сразу на всех TF: 1m, 3m, 5m, 10m, 15m
+- Вход: 16 признаков (12 базовых + 4 бинарных условия: candle, volume, cv, q)
+- Гибрид Conv1D + GRU
+- Адаптация под железо: tiny (телефон) — маленький hidden, меньше окон
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from typing import Dict, Optional
 
-
-class ScalperHybridModel(nn.Module):
+class WindowBranch(nn.Module):
     """
-    Основная модель скальпера 2026 года.
-    
-    Входы:
-    • глобальный контекст (сравнение двух половин 100 свечей) → простая MLP-ветка
-    • 4 окна разного масштаба (24,50,74,100) → отдельные Conv1D+GRU ветки
-    • 5 таймфреймов (1m,3m,5m,10m,15m) → отдельные Conv1D+GRU ветки
-    
-    Выход: вероятности [Long, Short, Flat]
+    Одна ветка для конкретного окна (24/50/74/100).
+    Conv1D → GRU → delta половин + last hidden → фичи окна
     """
-
-    def __init__(self, config):
+    def __init__(self, in_features: int, hidden_size: int, seq_len: int):
         super().__init__()
-        self.cfg = config
+        self.seq_len = seq_len
+        self.half = seq_len // 2
         
-        # Размерность признаков на свечу (open,high,low,close,volume,bid,ask,delta,...)
-        self.in_channels = config["model"]["in_channels"]           # обычно ~12–16
-        
-        # 1. Ветка для глобального сравнения половин (16 бит + процентные изменения)
-        self.half_branch = nn.Sequential(
-            nn.Linear(32, 64),      # 16 бит + 16 процентов изменений
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(64, 32)
+        self.conv = nn.Conv1d(
+            in_channels=in_features,
+            out_channels=hidden_size,
+            kernel_size=3,
+            padding=1,
+            stride=1
         )
         
-        # 2. Conv1D+GRU ветки для каждого окна
-        self.window_branches = nn.ModuleDict()
-        for size in [24, 50, 74, 100]:
-            self.window_branches[str(size)] = self._make_scale_branch(seq_len=size)
+        self.gru = nn.GRU(
+            input_size=hidden_size,
+            hidden_size=hidden_size,
+            num_layers=1,
+            batch_first=True
+        )
         
-        # 3. Conv1D+GRU ветки для каждого таймфрейма
-        self.tf_branches = nn.ModuleDict()
-        for tf in ["1m", "3m", "5m", "10m", "15m"]:
-            self.tf_branches[tf] = self._make_scale_branch(seq_len=100)
+        self.fc_delta = nn.Linear(hidden_size * 2, hidden_size)  # last + delta половин
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [batch, seq_len, in_features] → [batch, in_features, seq_len]
+        x = x.permute(0, 2, 1)
         
-        # Финальный fusion слой
-        # 32 от half + 32×4 от окон + 32 от tf (усреднённые или concat — зависит от реализации)
-        fusion_in = 32 + 32 * 4 + 32
+        x = self.conv(x)
+        x = F.relu(x)
+        x = x.permute(0, 2, 1)  # [batch, seq, hidden]
+        
+        _, hn = self.gru(x)
+        last_hidden = hn[-1]  # [batch, hidden]
+        
+        # Delta половин (среднее по левой и правой части)
+        left_mean  = x[:, :self.half, :].mean(dim=1)
+        right_mean = x[:, self.half:, :].mean(dim=1)
+        delta = right_mean - left_mean
+        
+        combined = torch.cat([last_hidden, delta], dim=1)
+        out = self.fc_delta(combined)
+        out = F.relu(out)
+        
+        return out
+
+
+class MultiWindowHybrid(nn.Module):
+    """
+    Основная модель: 4 параллельные ветки → fusion → вероятность профита.
+    Поддерживает multi-TF через словарь входов.
+    """
+    def __init__(self, 
+                 in_features: int = 16,               # 12 базовых + 4 условия
+                 hidden_size: int = 64,
+                 windows: list = [24, 50, 74, 100],
+                 dropout: float = 0.1,
+                 tiny_mode: bool = False):
+        super().__init__()
+        
+        self.windows = windows
+        self.tiny_mode = tiny_mode
+        
+        # Уменьшаем hidden на телефоне
+        branch_hidden = hidden_size // (2 if tiny_mode else 1)
+        
+        self.branches = nn.ModuleDict({
+            str(w): WindowBranch(
+                in_features=in_features,
+                hidden_size=branch_hidden,
+                seq_len=w
+            ) for w in windows
+        })
+        
+        fusion_in = branch_hidden * len(windows)
         self.fusion = nn.Sequential(
-            nn.Linear(fusion_in, 128),
+            nn.Linear(fusion_in, hidden_size),
             nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 3)                # Long / Short / Flat
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, 1)
         )
 
-    def _make_scale_branch(self, seq_len: int):
-        """Шаблон ветки для одного масштаба (окна или TF)."""
-        return nn.Sequential(
-            # Conv1D по времени
-            nn.Conv1d(
-                in_channels=self.in_channels,
-                out_channels=32,
-                kernel_size=3,
-                padding=1
-            ),
-            nn.ReLU(),
-            nn.BatchNorm1d(32),
+    def forward(self, inputs: Dict[str, Dict[int, torch.Tensor]]) -> torch.Tensor:
+        """
+        inputs = {
+            "1m":  {24: tensor[bs,24,16], 50: ..., 74: ..., 100: ...},
+            "3m":  {...},
+            ...
+        }
+        """
+        all_outputs = []
+        
+        for tf, windows_dict in inputs.items():
+            tf_outputs = []
+            for w_str, branch in self.branches.items():
+                w = int(w_str)
+                if w in windows_dict:
+                    x = windows_dict[w]  # [batch, seq_w, 16]
+                    out = branch(x)
+                    tf_outputs.append(out)
             
-            # GRU по последовательности
-            nn.GRU(
-                input_size=32,
-                hidden_size=64,
-                num_layers=1,
-                batch_first=True,
-                bidirectional=False
-            ),
-            
-            # Берём последнее скрытое состояние
-            nn.Linear(64, 32)
+            if tf_outputs:
+                tf_out = torch.mean(torch.stack(tf_outputs), dim=0)
+                all_outputs.append(tf_out)
+        
+        if not all_outputs:
+            raise ValueError("Нет данных для модели")
+        
+        fused = torch.cat(all_outputs, dim=1)
+        logits = self.fusion(fused)
+        prob = torch.sigmoid(logits).squeeze(-1)  # [batch]
+        
+        return prob
+
+
+def create_model(config: dict) -> nn.Module:
+    """
+    Фабрика моделей по hardware-режиму
+    """
+    hardware = config["hardware_mode"]
+    
+    if hardware == "phone_tiny":
+        return MultiWindowHybrid(
+            in_features=16,          # 12 + 4 условия
+            hidden_size=32,
+            windows=[50, 100],       # на телефоне только 2 окна
+            dropout=0.15,
+            tiny_mode=True
+        )
+    elif hardware == "server":
+        return MultiWindowHybrid(
+            in_features=16,
+            hidden_size=128,
+            windows=[24, 50, 74, 100],
+            dropout=0.1,
+            tiny_mode=False
+        )
+    else:  # colab
+        return MultiWindowHybrid(
+            in_features=16,
+            hidden_size=64,
+            windows=[24, 50, 74, 100],
+            dropout=0.1,
+            tiny_mode=False
         )
 
-    def forward(self, model_input):
-        # model_input — экземпляр ModelInput
-        
-        # 1. Глобальный контекст половин
-        half_vec = torch.tensor(model_input.half.binary_vector + 
-                               list(model_input.half.percent_changes.values()), 
-                               dtype=torch.float32, device=self.device)
-        half_feat = self.half_branch(half_vec)                      # [batch, 32]
 
-        # 2. Окна
-        window_feats = []
-        for size_str, df in model_input.windows.items():
-            x = self._df_to_tensor(df)                              # [batch, channels, seq_len]
-            feat = self.window_branches[size_str](x)                # [batch, 32]
-            window_feats.append(feat)
-        window_feats = torch.cat(window_feats, dim=1)               # [batch, 32*4]
-
-        # 3. Multi-TF (усредняем или конкатенируем — здесь усредняем для простоты)
-        tf_feats_list = []
-        for tf, df in model_input.multi_tf.items():
-            x = self._df_to_tensor(df)
-            feat = self.tf_branches[tf](x)
-            tf_feats_list.append(feat)
-        tf_feat = torch.mean(torch.stack(tf_feats_list), dim=0)     # [batch, 32]
-
-        # 4. Объединяем всё
-        combined = torch.cat([half_feat, window_feats, tf_feat], dim=1)
-        logits = self.fusion(combined)
-        
-        return logits  # [batch, 3] → softmax на Long/Short/Flat
-
-    def _df_to_tensor(self, df: pl.DataFrame) -> torch.Tensor:
-        """Преобразование Polars DataFrame свечей в тензор [batch=1, channels, time]."""
-        # Здесь должна быть реальная реализация (выбор колонок, нормализация и т.д.)
-        # Пока заглушка
-        return torch.zeros(1, self.in_channels, len(df), device=self.device)
+if __name__ == "__main__":
+    config = {"hardware_mode": "phone_tiny"}
+    model = create_model(config)
+    print(model)
+    
+    # Тестовый вход (заглушка)
+    dummy = {
+        "1m": {
+            50: torch.randn(2, 50, 16),
+            100: torch.randn(2, 100, 16)
+        }
+    }
+    with torch.no_grad():
+        out = model(dummy)
+    print("Output shape:", out.shape)
