@@ -2,11 +2,11 @@
 """
 Менеджер WebSocket-подписок на Binance Futures.
 
-Ключевые требования и особенности:
-- Подписка на 1m свечи для всех монет из whitelist (может быть 250+ монет)
-- Разбиение на батчи по 30–50 монет (настраивается в конфиге), чтобы не превышать лимиты Binance (~200–300 подписок на соединение)
-- Автоматическое переподключение при разрыве (экспоненциальная задержка: 1→2→4→8→16→60 сек)
-- Обновление списка монет при изменении whitelist (раз в 5 минут или по событию)
+Ключевые особенности:
+- Подписка на 1m свечи для всех монет из whitelist (до 250+ монет)
+- Разбиение на батчи по 40 монет (настраивается) — чтобы не превышать лимит Binance (~200–300 подписок на соединение)
+- Автоматическое переподключение при разрыве (экспоненциальная задержка)
+- Обновление списка монет при изменении whitelist (раз в 5 минут)
 - Если монета выпала из whitelist → отписка (через переподключение)
 - Передача новых свечей в Resampler
 - Логирование подключений, батчей, ошибок и количества подписок
@@ -37,38 +37,34 @@ class WebSocketManager:
         # Батч-размер подписки (оптимально 30–50, лимит Binance ~200–300 на соединение)
         self.batch_size = config.get("websocket", {}).get("batch_size", 40)
 
-        # Текущие активные подписки и whitelist
+        # Текущие подписки и whitelist
         self.active_subscriptions: Set[str] = set()
         self.current_whitelist: Set[str] = set(self.storage.get_whitelist())
 
-        # Статус и задержка переподключения
         self.is_connected = False
         self.reconnect_delay = 1  # начальная задержка в секундах
 
     async def start(self):
         """Запуск менеджера подписок"""
-        logger.info(f"WebSocketManager запущен | Батч-размер: {self.batch_size} | "
-                    f"Монет в whitelist: {len(self.current_whitelist)}")
+        logger.info(f"WebSocketManager запущен | Батч: {self.batch_size} | Монет: {len(self.current_whitelist)}")
 
         while True:
             try:
                 await self._maintain_subscriptions()
                 await asyncio.sleep(60)  # проверка каждую минуту
             except Exception as e:
-                logger.error(f"Критическая ошибка в WebSocketManager: {e}")
+                logger.error(f"Критическая ошибка WebSocketManager: {e}")
                 await asyncio.sleep(10)
 
     async def _maintain_subscriptions(self):
-        """Основной цикл поддержания актуальных подписок"""
-        # Проверяем актуальный whitelist
+        """Поддержание актуальных подписок"""
         new_whitelist = set(self.storage.get_whitelist())
 
         if new_whitelist != self.current_whitelist:
-            logger.info(f"Whitelist изменился: было {len(self.current_whitelist)}, стало {len(new_whitelist)}")
+            logger.info(f"Whitelist изменился: {len(self.current_whitelist)} → {len(new_whitelist)}")
             await self._resubscribe(new_whitelist)
             self.current_whitelist = new_whitelist
 
-        # Если не подключены — подключаемся
         if not self.is_connected:
             await self._connect_and_subscribe()
 
@@ -84,14 +80,14 @@ class WebSocketManager:
         logger.info(f"Разбиваем подписку на {len(batches)} батчей по {self.batch_size} монет")
 
         self.is_connected = True
-        self.reconnect_delay = 1  # сбрасываем задержку
+        self.reconnect_delay = 1
 
         for batch in batches:
             asyncio.create_task(self._subscribe_batch(batch))
 
     async def _subscribe_batch(self, symbols: List[str]):
         """Подписка на один батч монет"""
-        logger.info(f"Подписка на батч ({len(symbols)} монет): {', '.join(symbols[:5])}...")
+        logger.info(f"Подписка на батч ({len(symbols)}): {', '.join(symbols[:5])}...")
 
         while True:
             try:
@@ -100,8 +96,7 @@ class WebSocketManager:
                         symbol = candle["symbol"]
                         if symbol not in symbols:
                             continue
-                        
-                        # Передаём свечу в resampler
+
                         df_candle = pl.DataFrame({
                             "timestamp": [candle["timestamp"]],
                             "open": [candle["open"]],
@@ -110,7 +105,7 @@ class WebSocketManager:
                             "close": [candle["close"]],
                             "volume": [candle["volume"]]
                         })
-                        
+
                         self.resampler.add_1m_candle(df_candle.to_dicts()[0])
                         logger.debug(f"Получена свеча {symbol} | close={candle['close']}")
 
@@ -118,30 +113,24 @@ class WebSocketManager:
                 logger.warning(f"Сеть упала на батче {symbols[:3]}...: {e}")
                 self.is_connected = False
                 await asyncio.sleep(self.reconnect_delay)
-                self.reconnect_delay = min(self.reconnect_delay * 2, 60)  # экспоненциальная задержка
+                self.reconnect_delay = min(self.reconnect_delay * 2, 60)
             except ccxt.RateLimitExceeded:
                 logger.warning("Rate limit WebSocket — ждём 30 сек")
                 await asyncio.sleep(30)
             except Exception as e:
-                logger.error(f"Ошибка подписки на батч {symbols[:3]}...: {e}")
+                logger.error(f"Ошибка батча {symbols[:3]}...: {e}")
                 await asyncio.sleep(10)
 
     async def _resubscribe(self, new_whitelist: Set[str]):
         """Полная переподписка при изменении whitelist"""
-        to_subscribe = new_whitelist - self.active_subscriptions
-        to_unsubscribe = self.active_subscriptions - new_whitelist
+        logger.info(f"Переподписка: +{len(new_whitelist - self.active_subscriptions)} | -{len(self.active_subscriptions - new_whitelist)}")
 
-        logger.info(f"Переподписка: +{len(to_subscribe)} | -{len(to_unsubscribe)}")
-
-        # Закрываем текущее соединение и очищаем подписки
         await self.exchange.close()
         self.active_subscriptions.clear()
         self.is_connected = False
 
-        # Запускаем новую подписку
         await self._connect_and_subscribe()
 
     def stop(self):
-        """Остановка менеджера"""
         logger.info("WebSocketManager останавливается...")
         asyncio.create_task(self.exchange.close())

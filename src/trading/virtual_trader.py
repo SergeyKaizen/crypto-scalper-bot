@@ -4,17 +4,19 @@
 
 Ключевые особенности:
 - Работает независимо от реальной торговли (даже для монет вне whitelist)
-- Поддерживает partial TP с учётом minNotional биржи
-- Динамический вызов minNotional через ccxt (кэшируется на 24 часа)
+- Поддерживает partial TP с учётом minNotional биржи (динамический вызов через ccxt)
 - Если позиция слишком мала для частичной фиксации — закрывает весь остаток одним ордером
-- Учитывает комиссии, slippage (моделируем)
+- Учитывает комиссии (round-trip), slippage (моделируем 0.05–0.2%)
 - Обновляет ScenarioTracker после каждой закрытой сделки
+- Хранит историю виртуальных сделок для PR, винрейта и экспорта
+- Продолжает считать PR фоном даже для исключённых монет
 """
 
 import time
 from typing import Dict, List, Optional
 import numpy as np
 import polars as pl
+import ccxt
 
 from src.trading.tp_sl_manager import TPSLManager
 from src.trading.risk_manager import RiskManager
@@ -33,16 +35,25 @@ class VirtualTrader:
         self.scenario_tracker = ScenarioTracker(config)
         self.storage = Storage(config)
 
+        # Виртуальный баланс для симуляции P&L
         self.virtual_balance = config["finance"].get("deposit", 10000.0)
-        self.positions: Dict[str, Dict] = {}
+
+        # Открытые виртуальные позиции
+        self.positions: Dict[str, Dict] = {}  # symbol → position dict
+
+        # История закрытых сделок
         self.closed_trades: List[Dict] = []
 
-        self.commission_rate = config["trading_mode"].get("commission_rate", 0.0004)
-        self.slippage_rate = config["trading_mode"].get("slippage_rate", 0.001)
+        # Комиссия и slippage
+        self.commission_rate = config["trading_mode"].get("commission_rate", 0.0004)  # 0.04% round-trip
+        self.slippage_rate = config["trading_mode"].get("slippage_rate", 0.001)      # 0.1%
 
         # Кэш minNotional для символов (обновляется раз в 24 часа)
         self.min_notional_cache: Dict[str, float] = {}
         self.last_cache_update = 0
+
+        # ccxt для получения minNotional
+        self.exchange = ccxt.binance(config["exchange"])
 
     async def _get_min_notional(self, symbol: str) -> float:
         """Динамический вызов minNotional с биржи (кэшируется на 24 часа)"""
@@ -54,7 +65,7 @@ class VirtualTrader:
             markets = await self.exchange.load_markets()
             market = markets.get(symbol)
             if not market:
-                logger.warning(f"Символ {symbol} не найден → minNotional = 5.0")
+                logger.warning(f"Символ {symbol} не найден → minNotional = 5.0 USDT")
                 min_notional = 5.0
             else:
                 min_notional = market["limits"]["cost"]["min"] or 5.0
@@ -68,6 +79,9 @@ class VirtualTrader:
             return 5.0  # дефолт
 
     def open_position(self, symbol: str, pred: Dict, current_price: float):
+        """
+        Открытие виртуальной позиции по сигналу inference.
+        """
         if symbol in self.positions:
             logger.debug(f"Виртуальная позиция {symbol} уже открыта — игнорируем")
             return
@@ -93,14 +107,17 @@ class VirtualTrader:
             "scenario_key": pred.get("scenario_key"),
             "unrealized_pnl": 0.0,
             "partial_closed": False,
-            "remaining_size": size,
-            "partial_tp1_closed": False
+            "remaining_size": size
         }
 
         self.positions[symbol] = position
-        logger.info(f"[VIRTUAL OPEN] {direction} {symbol} @ {current_price:.2f} | size={size:.4f}")
+        logger.info(f"[VIRTUAL OPEN] {direction} {symbol} @ {current_price:.2f} | size={size:.4f} | prob={pred['prob']:.4f}")
 
     def update_positions(self, symbol: str, current_candle: Dict):
+        """
+        Обновление виртуальных позиций на новой свече.
+        Поддерживает partial TP с учётом minNotional биржи.
+        """
         position = self.positions.get(symbol)
         if not position:
             return
@@ -112,7 +129,7 @@ class VirtualTrader:
         tp_sl = position["tp_sl_levels"]
         direction = position["direction"]
 
-        # Динамический minNotional
+        # Динамический minNotional (в USDT)
         min_notional = await self._get_min_notional(symbol)
         min_close_size = min_notional / current_price if current_price > 0 else float('inf')
 
@@ -133,7 +150,7 @@ class VirtualTrader:
                     actual_partial = remaining_size
                     logger.info(f"{symbol}: позиция мала — закрываем весь остаток одним ордером (TP1)")
                 else:
-                    logger.debug(f"{symbol}: позиция слишком мала для TP1 — пропускаем")
+                    logger.debug(f"{symbol}: позиция слишком мала для TP1 ({remaining_size:.6f} < {min_close_size:.6f}) — пропускаем")
 
                 if actual_partial > 0:
                     pnl = self._calculate_pnl(position, tp1_price, actual_partial)
@@ -141,10 +158,9 @@ class VirtualTrader:
 
                     position["partial_closed"] = True
                     position["remaining_size"] -= actual_partial
-                    position["partial_tp1_closed"] = True
 
         # Partial TP 2 (обычно 30%)
-        if position.get("partial_tp1_closed") and tp_sl.get("tp2"):
+        if position["partial_closed"] and tp_sl.get("tp2"):
             tp2_price = tp_sl["tp2"]["price"]
             tp2_portion = tp_sl["tp2"]["portion"]
 
@@ -158,15 +174,15 @@ class VirtualTrader:
                     actual_partial = remaining_size
                     logger.info(f"{symbol}: остаток мал — закрываем весь остаток на TP2")
                 else:
-                    logger.debug(f"{symbol}: остаток слишком мал для TP2 — пропускаем")
+                    logger.debug(f"{symbol}: остаток слишком мал для TP2 ({remaining_size:.6f} < {min_close_size:.6f}) — пропускаем")
 
                 if actual_partial > 0:
                     pnl = self._calculate_pnl(position, tp2_price, actual_partial)
                     self._apply_partial_close(symbol, pnl, "TP2", actual_partial)
                     position["remaining_size"] -= actual_partial
 
-        # Trailing на остаток
-        if position["remaining_size"] > 0 and position.get("partial_closed"):
+        # Trailing на остаток (если включён и была хотя бы одна фиксация)
+        if position["remaining_size"] > 0 and position["partial_closed"]:
             new_sl = self.tp_sl_manager.update_trailing(current_price, position)
             if new_sl:
                 position["current_sl"] = new_sl
@@ -177,10 +193,12 @@ class VirtualTrader:
                 self._close_position(symbol, pnl, "SL")
                 return
 
+            # Обновляем нереализованный P&L на остаток
             position["unrealized_pnl"] = (current_price - position["entry_price"]) * position["remaining_size"] if direction == "L" else \
                                          (position["entry_price"] - current_price) * position["remaining_size"]
 
     def _apply_partial_close(self, symbol: str, pnl: float, reason: str, partial_size: float):
+        """Фиксация части позиции"""
         self.virtual_balance += pnl
         self.closed_trades.append({
             "symbol": symbol,
@@ -195,6 +213,7 @@ class VirtualTrader:
         logger.info(f"[VIRTUAL PARTIAL] {symbol} | {reason} | pnl={pnl:.2f} | size={partial_size:.4f}")
 
     def _close_position(self, symbol: str, pnl: float, reason: str):
+        """Полное закрытие позиции"""
         position = self.positions.pop(symbol, None)
         if not position:
             return
@@ -224,6 +243,7 @@ class VirtualTrader:
         self.storage.save_trade(trade)
 
     def _calculate_pnl(self, position: Dict, exit_price: float, size: float) -> float:
+        """Расчёт P&L с комиссией и slippage"""
         if position["direction"] == "L":
             gross_pnl = (exit_price - position["entry_price"]) * size
         else:
@@ -235,6 +255,7 @@ class VirtualTrader:
         return gross_pnl - commission - slippage
 
     def get_stats(self) -> Dict[str, Any]:
+        """Метрики виртуальной торговли"""
         trades_count = len(self.closed_trades)
         if trades_count == 0:
             return {"trades_count": 0, "winrate": 0.0, "profit_factor": 0.0, "max_dd": 0.0}
@@ -257,6 +278,7 @@ class VirtualTrader:
         }
 
     def _calculate_max_drawdown(self) -> float:
+        """Максимальная просадка по equity curve"""
         equity = [self.config["finance"].get("deposit", 10000.0)]
         for trade in self.closed_trades:
             equity.append(equity[-1] + trade["pnl"])
@@ -272,6 +294,7 @@ class VirtualTrader:
         return max_dd * 100
 
     def reset(self):
+        """Сброс состояния (для тестов)"""
         self.virtual_balance = self.config["finance"].get("deposit", 10000.0)
         self.positions.clear()
         self.closed_trades.clear()

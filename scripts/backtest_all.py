@@ -1,155 +1,150 @@
 # scripts/backtest_all.py
 """
-Скрипт полного бэктеста по всем монетам.
+Параллельный бэктест по всем монетам из списка (или из whitelist).
 
-Цель:
-- Выявить текущие лучшие монеты для торговли на данный момент (по PR)
-- Обновить белый список монет для live-торговли
-- Сохранить статистику всех прошедших фильтр монет
-
-Логика (по ТЗ):
-- Анализируем период из конфига (в свечах или часах)
-- Для каждой монеты запускаем виртуальный бэктест → считаем PR
-- Оставляем только те, у кого:
-  - PR ≥ min_pr (из конфига)
-  - кол-во сделок ≥ min_trades
-  - монета существует на бирже ≥ min_age_months
-- Торгуем ВСЕ прошедшие монеты (никакого топ-N)
-- Параллельный запуск (joblib) для ускорения на сервере/colab
-- На телефоне (tiny) — последовательно и только топ-5 монет (для тестового запуска)
+Ключевые особенности:
+- Параллельный запуск BacktestEngine для каждой монеты (ThreadPoolExecutor / multiprocessing)
+- Фильтр монет по возрасту (min_age_months), минимальному количеству сделок и PR
+- Обновление whitelist после бэктеста (только монеты, прошедшие фильтр)
+- Сохранение PR-снимков для каждой монеты в storage
+- Логирование прогресса и финальной статистики
+- Поддержка лимита монет для запуска (top_n из конфига или все)
+- Полная совместимость с остальным проектом (inference, storage, virtual_trader)
 
 Запуск:
-python scripts/backtest_all.py --mode full --trading_mode balanced
+python scripts/backtest_all.py
+python scripts/backtest_all.py --top_n 50
 """
 
 import argparse
 import time
-from datetime import datetime
 from typing import List, Dict
-import pandas as pd
-from joblib import Parallel, delayed
-from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing as mp
 
-from src.core.config import load_config
-from src.backtest.engine import BacktestEngine  # основной движок виртуального бэктеста
-from src.backtest.pr_calculator import PRCalculator
-from src.data.binance_client import BinanceClient
+from src.backtest.engine import BacktestEngine
 from src.data.storage import Storage
+from src.core.config import load_config
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-def run_backtest_for_symbol(symbol: str, config: dict) -> Dict:
+def run_backtest_for_symbol(config: dict, symbol: str) -> Dict[str, Any]:
     """
-    Запускает полный виртуальный бэктест для одной монеты.
-    
-    Возвращает словарь с результатами или None если монета не прошла фильтр.
+    Запуск бэктеста для одной монеты.
+    Возвращает словарь с результатами (для фильтра и сохранения в storage).
     """
+    logger.info(f"Запуск бэктеста для {symbol}")
     try:
-        logger.info(f"Запуск бэктеста для {symbol}")
-        
-        engine = BacktestEngine(config, symbol=symbol)
+        engine = BacktestEngine(config, symbol)
         results = engine.run_full_backtest()
         
-        if not results or "trades_count" not in results:
-            logger.warning(f"{symbol} — нет сделок или ошибка")
-            return None
+        # Добавляем символ и ключевые метрики
+        results["symbol"] = symbol
+        results["pr"] = results.get("profit_factor", 0.0)
+        results["trades_count"] = results.get("trades_count", 0)
         
-        pr_calc = PRCalculator(config)
-        pr_value = pr_calc.calculate_pr(results)
-        
-        # Проверяем фильтры из ТЗ
-        min_pr = config["filter"]["min_pr"]
-        min_trades = config["filter"]["min_trades"]
-        min_age_months = config["filter"]["min_age_months"]
-        
-        age_months = results.get("symbol_age_months", 0)
-        
-        if (pr_value < min_pr or
-            results["trades_count"] < min_trades or
-            age_months < min_age_months):
-            logger.info(f"{symbol} не прошла фильтр: PR={pr_value:.2f}, сделок={results['trades_count']}, возраст={age_months} мес")
-            return None
-        
-        return {
-            "symbol": symbol,
-            "pr": pr_value,
-            "trades_count": results["trades_count"],
-            "winrate": results.get("winrate", 0) * 100,
-            "profit_factor": results.get("profit_factor", 0),
-            "max_drawdown": results.get("max_drawdown", 0),
-            "symbol_age_months": age_months,
-            "best_tf": results.get("best_tf", "unknown"),
-            "best_window": results.get("best_window", "unknown"),
-            "best_anomaly_type": results.get("best_anomaly_type", "unknown")
-        }
-    
+        return results
     except Exception as e:
-        logger.error(f"Ошибка бэктеста {symbol}: {e}")
-        return None
+        logger.error(f"Ошибка бэктеста для {symbol}: {e}")
+        return {"symbol": symbol, "error": str(e), "pr": 0.0, "trades_count": 0}
 
+def filter_and_update_whitelist(config: dict, all_results: List[Dict]):
+    """
+    Фильтрует монеты по критериям и обновляет whitelist в storage.
+    Критерии (из конфига):
+    - min_pr (минимальный PR/profit_factor)
+    - min_trades (минимальное кол-во сделок в бэктесте)
+    - min_age_months (минимальный возраст монеты на бирже)
+    """
+    min_pr = config["backtest"].get("min_pr", 1.2)
+    min_trades = config["backtest"].get("min_trades", 50)
+    min_age_months = config["backtest"].get("min_age_months", 3)
+
+    filtered = []
+    for res in all_results:
+        symbol = res["symbol"]
+        pr = res.get("pr", 0.0)
+        trades = res.get("trades_count", 0)
+        error = res.get("error")
+
+        if error:
+            logger.warning(f"{symbol} исключён из whitelist: ошибка бэктеста")
+            continue
+
+        if pr < min_pr:
+            logger.info(f"{symbol} исключён: PR {pr:.2f} < {min_pr}")
+            continue
+
+        if trades < min_trades:
+            logger.info(f"{symbol} исключён: сделок {trades} < {min_trades}")
+            continue
+
+        # Проверка возраста монеты (примерно по первой свече в storage)
+        df = Storage(config).load_candles(symbol, "1m", limit=1, min_timestamp=0)
+        if df is None or df.is_empty():
+            logger.warning(f"{symbol} исключён: нет данных")
+            continue
+
+        first_ts = df["open_time"].min() / 1000  # ms → sec
+        age_months = (time.time() - first_ts) / (86400 * 30)
+        if age_months < min_age_months:
+            logger.info(f"{symbol} исключён: возраст {age_months:.1f} мес < {min_age_months}")
+            continue
+
+        filtered.append(res)
+
+    if filtered:
+        Storage(config).update_whitelist(filtered)
+        logger.info(f"Whitelist обновлён: {len(filtered)} монет прошли фильтр")
+    else:
+        logger.warning("Ни одна монета не прошла фильтр → whitelist остался прежним")
 
 def main():
-    parser = argparse.ArgumentParser(description="Полный бэктест по всем монетам")
-    parser.add_argument("--trading_mode", type=str, default="balanced",
-                        choices=["conservative", "balanced", "aggressive", "custom"],
-                        help="Режим агрессивности")
-    parser.add_argument("--hardware", type=str, default="auto",
-                        choices=["auto", "phone_tiny", "colab", "server"],
-                        help="Режим железа")
+    parser = argparse.ArgumentParser(description="Параллельный бэктест по всем монетам + обновление whitelist")
+    parser.add_argument("--top_n", type=int, default=None,
+                        help="Ограничить топ-N монет по PR (если не указан — все из whitelist)")
     args = parser.parse_args()
 
-    # Загружаем конфиг с merge default + hardware + trading_mode
-    config = load_config(trading_mode=args.trading_mode, hardware_mode=args.hardware)
-    
-    logger.info(f"Запуск backtest_all.py | режим: {args.trading_mode} | hardware: {config['hardware_mode']}")
+    config = load_config()
+    storage = Storage(config)
 
-    # Получаем актуальный список фьючерсных монет
-    exchange = BinanceClient(config)
-    all_symbols = exchange.get_futures_symbols(active_only=True)
-    
-    # Фильтр по минимальному возрасту монеты (уже в run_backtest_for_symbol, но можно заранее отсечь)
-    min_age = config["filter"]["min_age_months"]
-    if min_age > 0:
-        listing_dates = exchange.get_listing_dates()  # метод должен быть в BinanceClient
-        all_symbols = [s for s in all_symbols if listing_dates.get(s, 0) >= min_age]
-
-    logger.info(f"Найдено {len(all_symbols)} подходящих монет для анализа")
-
-    # Параллельный запуск (на телефоне n_jobs=1)
-    n_jobs = 1 if config["hardware_mode"] == "phone_tiny" else -1  # -1 = все ядра
-    
-    results = Parallel(n_jobs=n_jobs, verbose=10)(
-        delayed(run_backtest_for_symbol)(symbol, config)
-        for symbol in tqdm(all_symbols, desc="Бэктест монет")
-    )
-
-    # Фильтруем None и собираем прошедшие монеты
-    passed_symbols = [r for r in results if r is not None]
-    
-    if not passed_symbols:
-        logger.warning("НИ ОДНА монета не прошла фильтр PR / сделок / возраста")
+    # Получаем список монет для бэктеста
+    symbols = storage.get_whitelist()
+    if not symbols:
+        logger.warning("Whitelist пуст → бэктест невозможен")
         return
 
-    # Сортируем по PR (для удобства просмотра, но торгуем всех)
-    passed_symbols.sort(key=lambda x: x["pr"], reverse=True)
+    if args.top_n:
+        # Сортировка по PR из последнего снимка (если есть)
+        pr_history = []
+        for sym in symbols:
+            df = storage.get_pr_history(sym, limit=1)
+            pr = df["pr"].max() if not df.is_empty() else 0.0
+            pr_history.append({"symbol": sym, "pr": pr})
+        pr_history.sort(key=lambda x: x["pr"], reverse=True)
+        symbols = [x["symbol"] for x in pr_history[:args.top_n]]
+        logger.info(f"Ограничение бэктеста до топ-{args.top_n} монет по PR")
 
-    # Выводим таблицу в консоль
-    df = pd.DataFrame(passed_symbols)
-    print("\n" + "="*80)
-    print(f"Монеты, прошедшие фильтр ({len(passed_symbols)} шт):")
-    print(df[["symbol", "pr", "trades_count", "winrate", "profit_factor", "max_drawdown"]].round(2))
-    print("="*80 + "\n")
+    logger.info(f"Запуск параллельного бэктеста по {len(symbols)} монетам")
 
-    # Сохраняем в CSV
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_path = f"backtest_results_{args.trading_mode}_{timestamp}.csv"
-    df.to_csv(csv_path, index=False)
-    logger.info(f"Результаты сохранены в {csv_path}")
+    results = []
+    with ThreadPoolExecutor(max_workers=mp.cpu_count()) as executor:
+        future_to_symbol = {executor.submit(run_backtest_for_symbol, config, sym): sym for sym in symbols}
+        for future in as_completed(future_to_symbol):
+            sym = future_to_symbol[future]
+            try:
+                res = future.result()
+                results.append(res)
+            except Exception as e:
+                logger.error(f"Ошибка в пуле для {sym}: {e}")
 
-    # Здесь можно обновить белый список в Storage или config
-    # storage = Storage(config)
-    # storage.update_whitelist([r["symbol"] for r in passed_symbols])
+    # Фильтр и обновление whitelist
+    filter_and_update_whitelist(config, results)
+
+    # Финальная статистика
+    passed = len([r for r in results if "error" not in r and r.get("pr", 0) >= config["backtest"].get("min_pr", 1.2)])
+    logger.info(f"Бэктест завершён | Прошли фильтр: {passed}/{len(results)} монет")
 
 
 if __name__ == "__main__":

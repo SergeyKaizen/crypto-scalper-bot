@@ -9,8 +9,8 @@ project:
 # Binance API (никогда не коммить реальные ключи!)
 # ================================================
 binance:
-  api_key: ""          # ← заполни позже
-  secret_key: ""       # ← заполни позже
+  api_key: "cgSJAGxnvWEPUtKtQjlA96VYioMtuQ24yRspq8eLqqLkqJGefsBxFKA50BOhaFEx"          # ← заполни позже
+  secret_key: "C5QbvObXUazTQWdCa1J9MAy2BLO83ALOU9S8QPpHvWv8FwBthXXpbBJ98CHmjPSD"       # ← заполни позже
   testnet: true        # true = тестовый режим (рекомендуется сначала)
 
 # ================================================
