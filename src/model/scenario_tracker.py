@@ -3,16 +3,15 @@
 Отслеживание бинарных сценариев и их весов (по ТЗ).
 
 Что делает:
-- Для каждого сценария (комбинация 4 бинарных условий: candle, volume, cv, q) ведётся статистика:
+- Каждый сценарий — это комбинация 4 бинарных условий (candle_anomaly, volume_anomaly, cv_anomaly, q_condition)
+- Всего 16 возможных сценариев (2^4)
+- Для каждого сценария ведётся статистика:
   - count — сколько раз сценарий встретился
-  - wins — сколько раз сценарий принёс профит
-  - winrate = wins / count
-- Вес сценария = winrate × log(count + 1)  (логарифмический рост для редких, но надёжных сценариев)
-- Кластеризация сценариев с помощью HDBSCAN (после накопления ≥50 сценариев)
+  - wins — сколько раз сценарий принёс профит (сделка закрыта по TP)
+- Вес сценария = winrate × log(count + 1) — используется для корректировки вероятности в inference
+- Кластеризация сценариев HDBSCAN (после накопления ≥50 сценариев)
 - Автоматический экспорт статистики в CSV (раз в 500 обновлений + по команде export_scenarios.py)
-- Экспорт готов к импорту в Google Sheets (Ctrl+V → Импорт)
-- Обновление весов после каждой закрытой сделки (из virtual_trader или real)
-- Полная совместимость с inference.py (get_scenario_weight)
+- Готов к импорту в Google Sheets (Ctrl+V → Импорт)
 
 Логика:
 - update_scenario() — вызывается после закрытия сделки
@@ -38,7 +37,7 @@ class ScenarioTracker:
         self.config = config
         
         # Хранилище сценариев: ключ (tuple из 4 битов) → статистика
-        self.scenarios: Dict[Tuple[int, ...], Dict[str, Any]] = defaultdict(lambda: {
+        self.scenarios: Dict[Tuple[int, int, int, int], Dict[str, Any]] = defaultdict(lambda: {
             "count": 0,
             "wins": 0,
             "cluster_id": -1  # -1 = не кластеризован или шум
@@ -55,11 +54,11 @@ class ScenarioTracker:
         self.export_dir = config.get("paths", {}).get("export_dir", "exports")
         os.makedirs(self.export_dir, exist_ok=True)
 
-    def update_scenario(self, scenario_key: Tuple[int, ...], is_win: bool):
+    def update_scenario(self, scenario_key: Tuple[int, int, int, int], is_win: bool):
         """
         Обновляет статистику сценария после закрытия сделки.
         scenario_key — tuple из 4 битов (candle, volume, cv, q)
-        is_win — True если сделка закрыта в плюс
+        is_win — True если сделка закрыта по TP (профит)
         """
         stats = self.scenarios[scenario_key]
         stats["count"] += 1
@@ -71,7 +70,7 @@ class ScenarioTracker:
             self._recluster_if_needed()
             self.export_statistics()
 
-    def get_scenario_weight(self, scenario_key: Tuple[int, ...]) -> float:
+    def get_scenario_weight(self, scenario_key: Tuple[int, int, int, int]) -> float:
         """
         Возвращает вес сценария для корректировки вероятности в inference.
         Вес = winrate × log(count + 1)
@@ -148,7 +147,7 @@ class ScenarioTracker:
         df.write_csv(path)
         logger.info(f"Экспортировано {len(data)} сценариев → {path}")
         
-        # Принудительная перекластеризация после экспорта (если нужно)
+        # Принудительная перекластеризация после экспорта
         self.need_recluster = True
 
     def get_top_scenarios(self, top_n: int = 20) -> pl.DataFrame:
@@ -179,5 +178,5 @@ if __name__ == "__main__":
     tracker.update_scenario(key, is_win=True)
     tracker.update_scenario(key, is_win=False)
     
-    print(tracker.get_scenario_weight(key))
+    print("Вес сценария:", tracker.get_scenario_weight(key))
     tracker.export_statistics("test_scenario_stats.csv")

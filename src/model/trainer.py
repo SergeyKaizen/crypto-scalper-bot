@@ -1,17 +1,22 @@
 # src/model/trainer.py
 """
-Тренировщик гибридной модели Conv1D + GRU для внутридневного скальпинга на фьючерсах Binance.
+Тренировщик гибридной модели Conv1D + GRU.
 
-Ключевые особенности реализации:
-- Данные подаются как последовательности свечей (time-series sequences) на 4 окнах и всех TF
-- Вход: 16 признаков (12 базовых + 4 бинарных условия: candle, volume, cv, q)
-- Label: 1 если после аномалии цена прошла TP раньше SL (смотрим вперёд 200 свечей)
-- Обучение на всех TF одновременно (1m, 3m, 5m, 10m, 15m)
-- Адаптация под железо: tiny (телефон) — маленький hidden, batch_size=8–16, num_workers=0
-- BCEWithLogitsLoss + early stopping + LR scheduler (ReduceLROnPlateau)
-- Mixed precision (AMP) на GPU для ускорения
-- Переобучение каждые 10 000 свечей (вызывается из live_loop)
-- Сохранение лучшей модели + чекпоинты каждые 5 эпох
+Ключевые требования из ТЗ и твоих уточнений:
+- Обучение на максимальном возможном объёме данных для каждого TF отдельно
+  - На сервере — вся доступная история по каждой монете (без лимита)
+  - На Colab — большой объём (автоопределение, но не меньше 100k свечей на TF)
+  - На phone_tiny — ограничение (30k свечей на TF, чтобы не перегружать память)
+- Для каждой аномалии модель видит последовательности на 4 окнах (24, 50, 74, 100) по всем TF
+- Label = 1, если после аномалии цена прошла TP раньше SL (смотрим вперёд 200 свечей)
+- TP/SL рассчитываются по avg_candle_pct за 100 свечей до входа
+- Используется 16 признаков (12 базовых + 4 бинарных условия)
+- Поддержка early stopping, mixed precision (AMP), сохранение лучшей модели
+- Готов к инкрементальному переобучению каждые 10 000 свечей (вызывается из live_loop)
+
+Логика:
+- ScalpSequenceDataset загружает данные из storage по каждому TF отдельно
+- Trainer обучает модель с валидацией и сохранением чекпоинтов
 """
 
 import torch
@@ -37,7 +42,8 @@ logger = get_logger(__name__)
 
 class ScalpSequenceDataset(Dataset):
     """
-    Датасет: каждая строка — момент аномалии + окна до неё + label (TP раньше SL).
+    Датасет для обучения: каждая строка — момент аномалии + окна до неё + label.
+    Загружает максимальный объём данных по каждому TF отдельно в зависимости от hardware.
     """
     def __init__(self, config: dict, symbols: List[str], split: str = "train"):
         self.config = config
@@ -49,26 +55,40 @@ class ScalpSequenceDataset(Dataset):
         self.windows = [24, 50, 74, 100]
         self.lookback_after = 200  # сколько свечей смотреть вперёд для label
         
+        # Максимальный объём данных по каждому TF зависит от hardware
+        self.max_candles_per_tf = self._get_max_candles_per_tf()
+        
         self.samples = self._load_samples(symbols, split)
         logger.info(f"Датасет {split}: загружено {len(self.samples)} примеров")
 
+    def _get_max_candles_per_tf(self) -> int:
+        """Определяет максимальное кол-во свечей на каждый TF в зависимости от железа"""
+        hardware = self.config["hardware"]["mode"]
+        if hardware == "phone_tiny":
+            return 30000   # ограничение для телефона
+        elif hardware == "server":
+            return 0       # 0 = без лимита (вся история)
+        else:  # colab
+            return 100000  # большой объём
+
     def _load_samples(self, symbols: List[str], split: str) -> List[Dict]:
         samples = []
-        max_samples_per_symbol = 5000 if split == "train" else 1000  # лимит для скорости
         
         for symbol in symbols:
             count = 0
             for tf in self.timeframes:
-                df = self.storage.load_candles(symbol, tf, limit=50000)
+                # Загружаем максимум доступных свечей для обучения
+                limit = self.max_candles_per_tf if self.max_candles_per_tf > 0 else None
+                df = self.storage.load_candles(symbol, tf, limit=limit)
                 if df is None or len(df) < max(self.windows) + self.lookback_after:
                     continue
                 
-                # Находим все аномалии на этом TF
+                # Находим аномалии и q_condition
                 anomalies = self.anomaly_detector.detect(df)
                 anomaly_indices = [i for i, res in enumerate(anomalies) if res["anomaly_type"] or res["q_condition"]]
                 
                 for idx in anomaly_indices:
-                    if count >= max_samples_per_symbol:
+                    if count >= 5000:  # дополнительное ограничение на примеры для скорости
                         break
                         
                     windows = self._extract_windows(df, idx, tf)
@@ -82,16 +102,15 @@ class ScalpSequenceDataset(Dataset):
                     samples.append({
                         "symbol": symbol,
                         "tf": tf,
-                        "anomaly_idx": idx,
                         "windows": windows,
                         "label": label
                     })
                     count += 1
                 
-                if count >= max_samples_per_symbol:
+                if count >= 5000:
                     break
         
-        # Простой train/val сплит (80/20 по времени/порядку)
+        # Простой train/val сплит (80/20 по времени)
         split_idx = int(len(samples) * 0.8)
         return samples[:split_idx] if split == "train" else samples[split_idx:]
 
@@ -110,10 +129,7 @@ class ScalpSequenceDataset(Dataset):
         return windows if windows else None
 
     def _compute_label(self, df: pl.DataFrame, anomaly_idx: int) -> Optional[int]:
-        """
-        Label = 1 если цена прошла TP раньше SL в следующие lookback_after свечей.
-        TP/SL рассчитываются по avg_candle_pct за 100 свечей до аномалии.
-        """
+        """Label = 1 если цена прошла TP раньше SL"""
         past = df[max(0, anomaly_idx - 100):anomaly_idx]
         if len(past) < 50:
             return None
@@ -134,7 +150,7 @@ class ScalpSequenceDataset(Dataset):
             if row["low"] <= sl_level:
                 return 0
         
-        return 0  # не достигли ни TP ни SL
+        return 0
 
     def __len__(self):
         return len(self.samples)
@@ -153,18 +169,18 @@ class Trainer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = create_model(config).to(self.device)
         
-        lr = config["train"]["lr"]
+        lr = config["model"]["learning_rate"]
         self.optimizer = optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-5)
         self.criterion = nn.BCEWithLogitsLoss()
         self.scaler = GradScaler(enabled=torch.cuda.is_available())
         
-        self.epochs = config["train"].get("epochs", 30)
-        self.batch_size = config["train"].get("batch_size", 32 if self.device.type == "cuda" else 8)
+        self.epochs = config["model"].get("epochs", 30)
+        self.batch_size = config["model"].get("batch_size", 32 if self.device.type == "cuda" else 8)
         self.save_dir = config["paths"]["checkpoints"]
         os.makedirs(self.save_dir, exist_ok=True)
         
         self.best_val_loss = float("inf")
-        self.patience = 8
+        self.patience = config["model"].get("patience", 8)
         self.patience_counter = 0
         self.current_epoch = 0
 
@@ -180,9 +196,8 @@ class Trainer:
             
             logger.info(f"Epoch {epoch:2d}/{self.epochs} | "
                        f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                       f"Acc: {metrics['accuracy']:.3f} | F1: {metrics['f1']:.3f} | "
-                       f"Prec: {metrics['precision']:.3f} | Rec: {metrics['recall']:.3f}")
-            
+                       f"Acc: {metrics['accuracy']:.3f} | F1: {metrics['f1']:.3f}")
+
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
                 self.patience_counter = 0
@@ -255,7 +270,7 @@ class Trainer:
     def _get_dataloader(self, symbols: List[str], split: str) -> DataLoader:
         dataset = ScalpSequenceDataset(self.config, symbols, split=split)
         shuffle = split == "train"
-        workers = 0 if self.config["hardware_mode"] == "phone_tiny" else 4
+        workers = 0 if self.config["hardware"]["mode"] == "phone_tiny" else 4
         
         return DataLoader(
             dataset,
@@ -266,11 +281,11 @@ class Trainer:
         )
 
     def _get_training_symbols(self) -> List[str]:
-        """Символы для обучения — из whitelist или топ по PR"""
+        """Символы для обучения — из whitelist или все доступные"""
         whitelist = self.storage.get_whitelist()
         if whitelist:
-            return whitelist[:50]  # лимит для скорости обучения
-        return ["BTCUSDT", "ETHUSDT", "SOLUSDT"]  # fallback если whitelist пуст
+            return whitelist
+        return ["BTCUSDT", "ETHUSDT", "SOLUSDT"]  # fallback
 
     def _save_checkpoint(self, filename: str):
         path = os.path.join(self.save_dir, filename)
@@ -283,7 +298,7 @@ class Trainer:
         logger.info(f"Сохранён чекпоинт: {path}")
 
     def retrain_incremental(self):
-        """Переобучение на новых данных (вызывается из live_loop каждые 10k свечей)"""
+        """Инкрементальное переобучение (вызывается из live_loop каждые 10k свечей)"""
         logger.info("Запуск инкрементального переобучения")
         self.train()
 

@@ -6,7 +6,7 @@
 - Торгует ТОЛЬКО монеты из whitelist (обновляется после backtest_all.py)
 - Если монета выпала из whitelist → дожидается закрытия ВСЕХ её позиций → после этого полностью исключает из активной торговли
 - Продолжает расчёт PR фоном (виртуальные сделки) даже для исключённых монет
-- Поддержка 4 условий: candle_anomaly, volume_anomaly, cv_anomaly, q_condition
+- Поддерживает 4 условия: candle_anomaly, volume_anomaly, cv_anomaly, q_condition
 - Отдельные пороги вероятности: min_prob_anomaly и min_prob_quiet (настраиваются в конфиге)
 - Авто-переобучение каждые 10 000 свечей (вызывается из live_loop)
 - Max positions — ручная настройка из конфига
@@ -176,7 +176,7 @@ class LiveLoop:
     async def _retrain_model(self):
         """Переобучение каждые 10 000 свечей"""
         logger.info("Достигнуто 10 000 свечей → запуск переобучения модели")
-        self.trainer.retrain_incremental()
+        self.trainer.train()
         self.new_candles_count = 0
         self.last_retrain_time = time.time()
 

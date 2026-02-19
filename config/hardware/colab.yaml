@@ -26,7 +26,7 @@ quiet_inference_every_by_tf:        # Чаще, чем на телефоне
 
 # PR-фильтр — можно считать чаще
 pr:
-  recalc_interval_minutes: 2        # Пересчёт PR каждые 2 минуты (быстрее адаптация)
+  recalc_interval_minutes: 5        # Пересчёт PR каждые 2 минуты (быстрее адаптация)
   analysis_period_candles: 250      # Оставляем 250 — статистика надёжная
 
 # Данные — Colab тянет большие объёмы

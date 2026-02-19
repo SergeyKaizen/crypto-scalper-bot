@@ -8,13 +8,11 @@
 - Сохраняет в CSV (по умолчанию scenario_stats_YYYYMMDD_HHMMSS.csv)
 - Готов к импорту в Google Sheets (Ctrl+V → Импорт → CSV)
 - Можно указать произвольное имя файла через аргумент --output
-- Логирует количество строк и путь к файлу
+- Выводит топ-10 сценариев в консоль для быстрого просмотра
 
 Запуск:
 python scripts/export_scenarios.py
 python scripts/export_scenarios.py --output my_scenarios_2026.csv
-
-Используется после обучения или в live-режиме (например раз в день/неделю)
 """
 
 import argparse
@@ -50,6 +48,7 @@ def main():
     if not top.is_empty():
         print("\nТоп-10 сценариев по весу:")
         print(top.to_pandas().to_string(index=False))
+
 
 if __name__ == "__main__":
     main()

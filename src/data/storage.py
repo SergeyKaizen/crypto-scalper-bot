@@ -7,12 +7,13 @@
 - На Colab / сервере: DuckDB — очень быстрый, SQL + Polars-native, идеален для больших данных
 - Таблицы:
   - candles (свечи по символам и TF, upsert по primary key)
-  - pr_snapshots (снимки PR после каждой закрытой позиции или полного бэктеста)
+  - pr_snapshots (снимки PR_L, PR_S, PR_LS после бэктеста каждой монеты)
   - whitelist (активные монеты после backtest_all.py, обновляется полностью)
-- Upsert свечей (INSERT OR REPLACE) — избегаем дубликатов при докачке
+- Upsert свечей (INSERT OR REPLACE) — нет дубликатов при докачке
 - Автоматическое создание таблиц при инициализации
 - Методы для работы с whitelist (обновление после бэктеста, получение списка)
 - Сохранение PR-снимков с timestamp для истории
+- Поддержка hardware-режимов (разные лимиты на телефоне)
 """
 
 import os
@@ -30,7 +31,7 @@ logger = get_logger(__name__)
 class Storage:
     def __init__(self, config: dict):
         self.config = config
-        self.hardware = config["hardware_mode"]
+        self.hardware = config["hardware"]["mode"]
 
         # Пути к БД
         base_dir = config.get("paths", {}).get("data_dir", "data")
@@ -69,18 +70,21 @@ class Storage:
                 CREATE TABLE IF NOT EXISTS pr_snapshots (
                     symbol VARCHAR,
                     timestamp BIGINT,
-                    pr DOUBLE,
-                    trades_count INTEGER,
-                    winrate DOUBLE,
-                    profit_factor DOUBLE,
-                    max_drawdown DOUBLE,
+                    pr_l DOUBLE,
+                    pr_s DOUBLE,
+                    pr_ls DOUBLE,
+                    long_tp_count INTEGER,
+                    long_sl_count INTEGER,
+                    short_tp_count INTEGER,
+                    short_sl_count INTEGER,
+                    total_trades INTEGER,
                     PRIMARY KEY (symbol, timestamp)
                 )
             """)
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS whitelist (
                     symbol VARCHAR PRIMARY KEY,
-                    pr DOUBLE,
+                    pr_ls DOUBLE,
                     last_updated BIGINT
                 )
             """)
@@ -104,18 +108,21 @@ class Storage:
                 CREATE TABLE IF NOT EXISTS pr_snapshots (
                     symbol TEXT,
                     timestamp INTEGER,
-                    pr REAL,
-                    trades_count INTEGER,
-                    winrate REAL,
-                    profit_factor REAL,
-                    max_drawdown REAL,
+                    pr_l REAL,
+                    pr_s REAL,
+                    pr_ls REAL,
+                    long_tp_count INTEGER,
+                    long_sl_count INTEGER,
+                    short_tp_count INTEGER,
+                    short_sl_count INTEGER,
+                    total_trades INTEGER,
                     PRIMARY KEY (symbol, timestamp)
                 )
             """)
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS whitelist (
                     symbol TEXT PRIMARY KEY,
-                    pr REAL,
+                    pr_ls REAL,
                     last_updated INTEGER
                 )
             """)
@@ -145,9 +152,10 @@ class Storage:
 
         logger.debug(f"Сохранено {len(df)} свечей {symbol} {tf}")
 
-    def load_candles(self, symbol: str, tf: str, limit: int = 1000, min_timestamp: Optional[int] = None) -> Optional[pl.DataFrame]:
+    def load_candles(self, symbol: str, tf: str, limit: int = 250, min_timestamp: Optional[int] = None) -> Optional[pl.DataFrame]:
         """
         Загружает последние свечи (или с min_timestamp).
+        По умолчанию limit=250 — для бэктеста по последним 250 свечам на каждом TF.
         """
         query = f"""
             SELECT * FROM candles
@@ -171,17 +179,20 @@ class Storage:
 
     def save_pr_snapshot(self, symbol: str, pr_data: Dict):
         """
-        Сохраняет снимок PR после закрытия позиции или полного бэктеста.
+        Сохраняет снимок PR_L/PR_S/PR_LS после бэктеста монеты.
         """
         now = int(time.time())
         row = {
             "symbol": symbol,
             "timestamp": now,
-            "pr": pr_data.get("profit_factor", 0.0),
-            "trades_count": pr_data.get("trades_count", 0),
-            "winrate": pr_data.get("winrate", 0.0),
-            "profit_factor": pr_data.get("profit_factor", 0.0),
-            "max_drawdown": pr_data.get("max_drawdown", 0.0)
+            "pr_l": pr_data.get("pr_l", 0.0),
+            "pr_s": pr_data.get("pr_s", 0.0),
+            "pr_ls": pr_data.get("pr_ls", 0.0),
+            "long_tp_count": pr_data.get("long_tp_count", 0),
+            "long_sl_count": pr_data.get("long_sl_count", 0),
+            "short_tp_count": pr_data.get("short_tp_count", 0),
+            "short_sl_count": pr_data.get("short_sl_count", 0),
+            "total_trades": pr_data.get("total_trades", 0)
         }
 
         df = pl.DataFrame([row])
@@ -195,12 +206,12 @@ class Storage:
         else:
             df.to_pandas().to_sql("pr_snapshots", self.conn, if_exists="append", index=False)
 
-        logger.debug(f"Сохранён PR-снимок {symbol}: PR={row['pr']:.2f}")
+        logger.debug(f"Сохранён PR-снимок {symbol}: PR_LS={row['pr_ls']:.4f}")
 
     def update_whitelist(self, symbols_data: List[Dict]):
         """
         Обновляет таблицу whitelist после backtest_all.py.
-        symbols_data = [{"symbol": str, "pr": float, ...}]
+        symbols_data = [{"symbol": str, "pr_ls": float, ...}]
         """
         if not symbols_data:
             return
@@ -208,7 +219,7 @@ class Storage:
         now = int(time.time())
         df = pl.DataFrame({
             "symbol": [d["symbol"] for d in symbols_data],
-            "pr": [d.get("pr", 0.0) for d in symbols_data],
+            "pr_ls": [d.get("pr_ls", 0.0) for d in symbols_data],
             "last_updated": [now] * len(symbols_data)
         })
 
@@ -262,8 +273,8 @@ if __name__ == "__main__":
 
     # Тест сохранения whitelist
     test_data = [
-        {"symbol": "BTCUSDT", "pr": 1.85},
-        {"symbol": "ETHUSDT", "pr": 1.62}
+        {"symbol": "BTCUSDT", "pr_ls": 1.85},
+        {"symbol": "ETHUSDT", "pr_ls": 1.62}
     ]
     storage.update_whitelist(test_data)
 
