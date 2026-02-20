@@ -1,64 +1,71 @@
 # config/default.yaml
-# Основной конфиг проекта. Все параметры можно переопределять в hardware/ и trading_modes/
 
-project:
-  name: "Crypto Scalper Bot"
-  version: "2026.02"
+# === Основной конфиг проекта ===
+# Все параметры, которые не зависят от hardware или trading mode.
+# Переопределяются в hardware/*.yaml и trading_modes/*.yaml при необходимости.
 
-# ================================================
-# Binance API (никогда не коммить реальные ключи!)
-# ================================================
+# Binance API (заполнить реальными ключами)
 binance:
-  api_key: "cgSJAGxnvWEPUtKtQjlA96VYioMtuQ24yRspq8eLqqLkqJGefsBxFKA50BOhaFEx"          # ← заполни позже
-  secret_key: "C5QbvObXUazTQWdCa1J9MAy2BLO83ALOU9S8QPpHvWv8FwBthXXpbBJ98CHmjPSD"       # ← заполни позже
-  testnet: true        # true = тестовый режим (рекомендуется сначала)
+  api_key: "your_api_key_here"
+  api_secret: "your_api_secret_here"
 
-# ================================================
-# Общие настройки торговли
-# ================================================
-trading:
-  initial_balance: 100.0      # стартовый депозит в USDT
-  leverage: 50                 # базовое плечо
-  risk_mode: "balanced"        # low / medium / high / manual / auto
-  manual_risk_pct: 0.5        # риск в % при ручном режиме
-  min_model_confidence: 0.65   # минимальная уверенность модели
-  max_hold_time_minutes: null  # null = выключен (по твоему желанию)
+# Таймфреймы (из ТЗ)
+timeframes:
+  - "1m"
+  - "3m"
+  - "5m"
+  - "10m"
+  - "15m"
 
-# ================================================
-# Фильтр монет (по ТЗ)
-# ================================================
-filter:
-  min_age_months: 12            # минимальный возраст монеты на фьючерсах
-  min_pr: 0.7                  # минимальный Profitable Rating
-  min_deals: 5                # минимальное количество сделок для учёта
+# Окна анализа (из ТЗ)
+windows_sizes:
+  - 24
+  - 50
+  - 74
+  - 100
 
-# ================================================
-# Аномалии и расчёты
-# ================================================
-anomalies:
+# Параметры аномалий
+anomaly:
   lookback: 25
-  min_perc: 0.94
-  max_perc: 0.99
-  flat_mult: 1.18
+  volume_percentile: 0.97          # дефолт перцентиль для объёмной аномалии
+  dominance_threshold_pct: 60.0    # порог доминирования ask/bid для volume anomaly
+  min_volume_threshold: 1.0        # минимальный объём свечи для рассмотрения аномалии
 
-# ================================================
-# Модель и обучение
-# ================================================
+# Параметры модели
 model:
-  main_period: 100
+  input_dim: 28                    # кол-во признаков из feature_engine (все из ТЗ)
   seq_len: 100
-  in_channels: 8               # open,high,low,close,volume + признаки
-  live_retrain_every: 10000    # свечей
+  hidden_size: 128
+  num_gru_layers: 2
+  dropout: 0.2
+  lr: 0.001
+  epochs: 20                       # дефолт, переопределяется в hardware
+  batch_size: 64                   # дефолт
+  val_split: 0.2
+  min_prob_anomaly: 0.60
+  min_prob_q: 0.75
 
-# ================================================
-# Backtest и PR
-# ================================================
+# Параметры бектеста и PR
 backtest:
-  enabled: true
+  min_trades_for_pr: 10
+  min_pr_threshold: 0.0
+  lookback_hours: 720              # 30 дней для анализа PR
 
-# ================================================
-# Хранение данных
-# ================================================
-storage:
-  backend: "duckdb"            # "duckdb" или "sqlite"
-  path: "data/live.duckdb"
+# Параметры торговли (риск, режимы)
+trading:
+  mode: "virtual"                  # real / virtual
+  risk_pct: 1.0                    # риск на сделку в % от депозита
+  avg_candle_size_pct: 0.5         # примерное среднее движение свечи в % (для TP)
+  tp_sl_mode: "classic"            # classic / partial_trailing / chandelier
+  leverage_max: 50
+
+# Пути
+paths:
+  data_dir: "data"
+  logs_dir: "logs"
+  models_dir: "models"
+
+# Другие параметры
+retrain_interval_candles: 10000
+max_history_candles: 100000
+max_scenarios_limit: 10000

@@ -1,71 +1,82 @@
-# src/core/enums.py
 """
-Все перечисления (Enums) проекта.
-Используются для типобезопасности и читаемости кода.
-Вместо строк 'C', 'L', 'classic' — используются константы.
+src/core/enums.py
 
-Пример:
-    if anomaly_type == AnomalyType.MIXED:
-        # ...
-    direction = Direction.BOTH
+=== Основной принцип работы файла ===
+
+Этот файл содержит все перечисления (enums) проекта с использованием Python Enum.
+Он обеспечивает типобезопасность, читаемость и удобство использования констант в коде.
+
+Enums используются везде, где есть фиксированные категории:
+- Типы аномалий (C, V, CV, Q)
+- Направления позиций (Long/Short)
+- Режимы торговли (real/virtual)
+- Типы TP/SL (classic, partial_trailing и т.д. — без dynamic по ТЗ)
+- Таймфреймы (1m, 3m, 5m, 10m, 15m)
+- Hardware типы (phone_tiny, colab, server)
+
+=== Главные enums и за что отвечают ===
+
+- AnomalyType: типы аномалий и quiet режим
+- Direction: Long / Short
+- TradeMode: real / virtual
+- TpSlMode: classic / partial_trailing / chandelier (dynamic удалён по ТЗ)
+- Timeframe: 1m / 3m / 5m / 10m / 15m (с минутами)
+- HardwareType: phone_tiny / colab / server (для выбора БД, epochs и т.д.)
+
+=== Примечания ===
+- Все enums наследуются от str, Enum — можно использовать как строки в БД/моделях.
+- Нет заглушек — все типы из ТЗ и логики проекта.
+- Импортируется как from src.core.enums import AnomalyType, Direction и т.д.
+- Легко расширяем при необходимости (например, новые режимы риска).
 """
 
 from enum import Enum, auto
 
-
-class AnomalyType(Enum):
-    """Типы аномалий / сигналов"""
+class AnomalyType(str, Enum):
+    """Типы аномалий и тихий режим."""
     CANDLE = "C"        # Свечная аномалия
     VOLUME = "V"        # Объёмная аномалия
-    MIXED = "CV"        # Свечная + объёмная
-    QUIET = "Q"         # Тихий режим (паттерн от модели без явной аномалии)
+    CV = "CV"           # Комбинированная свечная + объёмная
+    QUIET = "Q"         # Тихий режим (нет аномалий, вход по паттернам)
 
+class Direction(str, Enum):
+    """Направление позиции."""
+    LONG = "L"
+    SHORT = "S"
 
-class Direction(Enum):
-    """Направление позиции / сигнала"""
-    LONG = "L"          # Только лонг
-    SHORT = "S"         # Только шорт
-    BOTH = "LS"         # Прибыльно и в лонг, и в шорт (PR_LS максимальный)
+class TradeMode(str, Enum):
+    """Режим торговли."""
+    REAL = "real"       # Реальная торговля
+    VIRTUAL = "virtual" # Виртуальная симуляция
 
+class TpSlMode(str, Enum):
+    """Режимы расчёта TP/SL (dynamic удалён по ТЗ)."""
+    CLASSIC = "classic"             # Фиксированный TP/SL по среднему размеру / HH/LL
+    PARTIAL_TRAILING = "partial_trailing"  # Частичный трейлинг с порциями
+    CHANDELIER = "chandelier"       # Chandelier exit (ATR-based, если используется)
 
-class TpMode(Enum):
-    """Режим Take Profit"""
-    AVERAGE_CANDLE = auto()     # Средний размер свечи (фиксированный)
-    DYNAMIC_LEVEL = auto()      # Следующий уровень VAH/VAL или channel
+class Timeframe(str, Enum):
+    """Таймфреймы из ТЗ."""
+    M1 = "1m"
+    M3 = "3m"
+    M5 = "5m"
+    M10 = "10m"
+    M15 = "15m"
 
+    @property
+    def minutes(self) -> int:
+        """Возвращает длительность TF в минутах."""
+        return int(self.value[:-1])
 
-class SlMode(Enum):
-    """Режим Stop Loss"""
-    CLASSIC = auto()            # Ближайший HH/LL ±0.05%, лимит 2×средний размер
-    ATR_CHANDELIER = auto()     # ATR × multiplier + chandelier exit
+class HardwareType(str, Enum):
+    """Типы железа для адаптации параметров (БД, epochs, workers)."""
+    PHONE_TINY = "phone_tiny"   # Redmi Note 12 Pro — лёгкая БД, малые epochs
+    COLAB = "colab"             # Google Colab — средние параметры
+    SERVER = "server"           # Полный сервер — максимум
 
-
-class TrailingType(Enum):
-    """Тип trailing stop"""
-    CLASSIC = auto()            # Активация % + шаг % перестановки SL
-    DISTANCE = auto()           # SL всегда на % от high/low после активации
-
-
-class RiskBase(Enum):
-    """База для расчёта риска на сделку"""
-    INITIAL = auto()            # От начального депозита (фиксировано)
-    CURRENT = auto()            # От текущего баланса (растёт/падает)
-
-
-class PrMode(Enum):
-    """Режим расчёта Profitable Rating"""
-    CLASSIC = auto()            # Простой: (TP_count × TP_size) - (SL_count × SL_size)
-    NORMALIZED = auto()         # × log10(кол-во +5) / 2.0 (штраф за малое кол-во)
-
-
-class TradingMode(Enum):
-    """Режим торговли (real / virtual)"""
-    REAL = auto()
-    VIRTUAL = auto()
-
-
-class HardwareProfile(Enum):
-    """Профили железа"""
-    PHONE_TINY = auto()
-    COLAB = auto()
-    SERVER = auto()
+class PositionStatus(str, Enum):
+    """Статусы позиции в live/virtual."""
+    OPEN = "open"
+    CLOSED_TP = "closed_tp"
+    CLOSED_SL = "closed_sl"
+    CLOSED_MANUAL = "closed_manual"

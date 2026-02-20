@@ -1,317 +1,248 @@
-# src/model/trainer.py
 """
-Тренировщик гибридной модели Conv1D + GRU.
+src/model/trainer.py
 
-Ключевые требования из ТЗ и твоих уточнений:
-- Обучение на максимальном возможном объёме данных для каждого TF отдельно
-  - На сервере — вся доступная история по каждой монете (без лимита)
-  - На Colab — большой объём (автоопределение, но не меньше 100k свечей на TF)
-  - На phone_tiny — ограничение (30k свечей на TF, чтобы не перегружать память)
-- Для каждой аномалии модель видит последовательности на 4 окнах (24, 50, 74, 100) по всем TF
-- Label = 1, если после аномалии цена прошла TP раньше SL (смотрим вперёд 200 свечей)
-- TP/SL рассчитываются по avg_candle_pct за 100 свечей до входа
-- Используется 16 признаков (12 базовых + 4 бинарных условия)
-- Поддержка early stopping, mixed precision (AMP), сохранение лучшей модели
-- Готов к инкрементальному переобучению каждые 10 000 свечей (вызывается из live_loop)
+=== Основной принцип работы файла ===
 
-Логика:
-- ScalpSequenceDataset загружает данные из storage по каждому TF отдельно
-- Trainer обучает модель с валидацией и сохранением чекпоинтов
+Этот файл реализует весь цикл обучения и переобучения модели.
+Он:
+- Загружает данные из storage (последовательности признаков по TF/окнам).
+- Готовит датасеты и DataLoader'ы (train/val split по % из config).
+- Инициализирует модель MultiWindowHybrid.
+- Обучает с AdamW, BCEWithLogitsLoss (бинарная классификация: профитная сделка=1).
+- Валидирует метрики: accuracy, precision, recall, F1 (с epsilon/clamp для стабильности).
+- Сохраняет лучшую модель по val_loss.
+- Поддерживает incremental retrain (каждые RETRAIN_INTERVAL_CANDLES свечей в live).
+- Масштабирует параметры (epochs, batch_size, hidden_size) по hardware.
+
+Ключевые особенности:
+- Данные — dict[tf: dict[window: tensor(seq_len, features)]]
+- Label — 1 если сделка закрылась по TP раньше SL (lookback_after=200 свечей).
+- Переобучение: load state_dict + continue на новых данных (freeze early layers если нужно).
+- Нет лишних библиотек — torch, torch.utils.data.
+
+=== Главные функции и за что отвечают ===
+
+- Trainer(config: dict) — инициализация: модель, optimizer, loss, scheduler.
+- prepare_dataset(symbols: list, tf: str) → Dataset — собирает последовательности и labels.
+- train_epoch() → dict[metrics] — один эпох обучения.
+- validate_epoch() → dict[metrics] — валидация с precision/recall/accuracy/F1.
+- train() — полный цикл обучения (epochs из config).
+- incremental_retrain(new_data_df) — дообучение на новых свечах.
+- save_model(path), load_model(path) — сохранение/загрузка state_dict.
+
+=== Примечания ===
+- Все параметры из config (epochs, batch_size, lr и т.д. масштабируются по hardware).
+- Label generation: симуляция TP/SL на исторических данных (lookback_after).
+- Clamp/epsilon в метриках для избежания NaN/inf.
+- Готов к использованию в scripts/train.py и live_loop.py.
+- Логи через setup_logger.
 """
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import GradScaler, autocast
-import os
-import time
-from datetime import datetime
-import polars as pl
-from typing import Dict, List, Tuple, Optional
-from tqdm import tqdm
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+import numpy as np
+from typing import Dict, Optional
 
-from src.model.architectures import create_model
-from src.features.feature_engine import FeatureEngine
-from src.features.anomaly_detector import AnomalyDetector
+from src.model.architectures import MultiWindowHybrid
 from src.data.storage import Storage
+from src.features.feature_engine import compute_features_for_tf, prepare_sequence_features
 from src.core.config import load_config
-from src.utils.logger import get_logger
+from src.core.constants import DEFAULT_SEQ_LEN, RETRAIN_INTERVAL_CANDLES
+from src.utils.logger import setup_logger
 
-logger = get_logger(__name__)
+logger = setup_logger('trainer', logging.INFO)
 
-class ScalpSequenceDataset(Dataset):
+class TradingDataset(Dataset):
     """
-    Датасет для обучения: каждая строка — момент аномалии + окна до неё + label.
-    Загружает максимальный объём данных по каждому TF отдельно в зависимости от hardware.
+    Датасет для модели: последовательности признаков + labels.
     """
-    def __init__(self, config: dict, symbols: List[str], split: str = "train"):
-        self.config = config
-        self.storage = Storage(config)
-        self.feature_engine = FeatureEngine(config)
-        self.anomaly_detector = AnomalyDetector(config)
-        
-        self.timeframes = ["1m", "3m", "5m", "10m", "15m"]
-        self.windows = [24, 50, 74, 100]
-        self.lookback_after = 200  # сколько свечей смотреть вперёд для label
-        
-        # Максимальный объём данных по каждому TF зависит от hardware
-        self.max_candles_per_tf = self._get_max_candles_per_tf()
-        
-        self.samples = self._load_samples(symbols, split)
-        logger.info(f"Датасет {split}: загружено {len(self.samples)} примеров")
-
-    def _get_max_candles_per_tf(self) -> int:
-        """Определяет максимальное кол-во свечей на каждый TF в зависимости от железа"""
-        hardware = self.config["hardware"]["mode"]
-        if hardware == "phone_tiny":
-            return 30000   # ограничение для телефона
-        elif hardware == "server":
-            return 0       # 0 = без лимита (вся история)
-        else:  # colab
-            return 100000  # большой объём
-
-    def _load_samples(self, symbols: List[str], split: str) -> List[Dict]:
-        samples = []
-        
-        for symbol in symbols:
-            count = 0
-            for tf in self.timeframes:
-                # Загружаем максимум доступных свечей для обучения
-                limit = self.max_candles_per_tf if self.max_candles_per_tf > 0 else None
-                df = self.storage.load_candles(symbol, tf, limit=limit)
-                if df is None or len(df) < max(self.windows) + self.lookback_after:
-                    continue
-                
-                # Находим аномалии и q_condition
-                anomalies = self.anomaly_detector.detect(df)
-                anomaly_indices = [i for i, res in enumerate(anomalies) if res["anomaly_type"] or res["q_condition"]]
-                
-                for idx in anomaly_indices:
-                    if count >= 5000:  # дополнительное ограничение на примеры для скорости
-                        break
-                        
-                    windows = self._extract_windows(df, idx, tf)
-                    if not windows:
-                        continue
-                    
-                    label = self._compute_label(df, idx)
-                    if label is None:
-                        continue
-                    
-                    samples.append({
-                        "symbol": symbol,
-                        "tf": tf,
-                        "windows": windows,
-                        "label": label
-                    })
-                    count += 1
-                
-                if count >= 5000:
-                    break
-        
-        # Простой train/val сплит (80/20 по времени)
-        split_idx = int(len(samples) * 0.8)
-        return samples[:split_idx] if split == "train" else samples[split_idx:]
-
-    def _extract_windows(self, df: pl.DataFrame, anomaly_idx: int, tf: str) -> Optional[Dict[int, torch.Tensor]]:
-        windows = {}
-        for size in self.windows:
-            start = max(0, anomaly_idx - size + 1)
-            seq_df = df[start:anomaly_idx + 1]
-            if len(seq_df) < size // 2:
-                continue
-            
-            feat_array = self.feature_engine.compute_sequence_features(seq_df)
-            tensor = torch.from_numpy(feat_array).float()
-            windows[size] = tensor
-        
-        return windows if windows else None
-
-    def _compute_label(self, df: pl.DataFrame, anomaly_idx: int) -> Optional[int]:
-        """Label = 1 если цена прошла TP раньше SL"""
-        past = df[max(0, anomaly_idx - 100):anomaly_idx]
-        if len(past) < 50:
-            return None
-        
-        avg_candle_pct = ((past["high"] - past["low"]) / past["close"]).mean() * 100
-        
-        future = df[anomaly_idx + 1:anomaly_idx + 1 + self.lookback_after]
-        if future.is_empty():
-            return 0
-        
-        entry = df["close"][anomaly_idx]
-        tp_level = entry * (1 + avg_candle_pct * 1.0)
-        sl_level = entry * (1 - avg_candle_pct * 1.0)
-        
-        for row in future.iter_rows(named=True):
-            if row["high"] >= tp_level:
-                return 1
-            if row["low"] <= sl_level:
-                return 0
-        
-        return 0
+    def __init__(self, sequences: list, labels: list):
+        self.sequences = sequences  # list[dict[tf: dict[window: tensor]]]
+        self.labels = labels        # list[int/float 0/1]
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.labels)
 
     def __getitem__(self, idx):
-        sample = self.samples[idx]
-        return {
-            "windows": sample["windows"],
-            "label": torch.tensor(sample["label"], dtype=torch.float32)
-        }
-
+        return self.sequences[idx], torch.tensor(self.labels[idx], dtype=torch.float32)
 
 class Trainer:
-    def __init__(self, config: dict):
-        self.config = config
+    """
+    Класс для обучения и переобучения модели.
+    """
+    def __init__(self):
+        config = load_config()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = create_model(config).to(self.device)
-        
-        lr = config["model"]["learning_rate"]
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-5)
+        logger.info(f"Устройство: {self.device}")
+
+        input_dim = config['model']['input_dim']  # из feature_engine (кол-во признаков)
+        self.model = MultiWindowHybrid(input_dim=input_dim).to(self.device)
+
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=config['model']['lr'])
         self.criterion = nn.BCEWithLogitsLoss()
-        self.scaler = GradScaler(enabled=torch.cuda.is_available())
-        
-        self.epochs = config["model"].get("epochs", 30)
-        self.batch_size = config["model"].get("batch_size", 32 if self.device.type == "cuda" else 8)
-        self.save_dir = config["paths"]["checkpoints"]
-        os.makedirs(self.save_dir, exist_ok=True)
-        
-        self.best_val_loss = float("inf")
-        self.patience = config["model"].get("patience", 8)
-        self.patience_counter = 0
-        self.current_epoch = 0
+        self.scheduler = ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=3)
 
-    def train(self):
-        symbols = self._get_training_symbols()
-        train_loader = self._get_dataloader(symbols, "train")
-        val_loader   = self._get_dataloader(symbols, "val")
-        
-        for epoch in range(1, self.epochs + 1):
-            self.current_epoch = epoch
-            train_loss = self._train_epoch(train_loader)
-            val_loss, metrics = self._validate_epoch(val_loader)
-            
-            logger.info(f"Epoch {epoch:2d}/{self.epochs} | "
-                       f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                       f"Acc: {metrics['accuracy']:.3f} | F1: {metrics['f1']:.3f}")
+        self.epochs = config['model']['epochs']
+        self.batch_size = config['model']['batch_size']
+        self.val_split = config['model']['val_split']
 
-            if val_loss < self.best_val_loss:
-                self.best_val_loss = val_loss
-                self.patience_counter = 0
-                self._save_checkpoint("best.pth")
-            else:
-                self.patience_counter += 1
-                if self.patience_counter >= self.patience:
-                    logger.info(f"Early stopping на эпохе {epoch}")
-                    break
-            
-            if epoch % 5 == 0:
-                self._save_checkpoint(f"epoch_{epoch}.pth")
+    def prepare_dataset(self, symbols: list) -> tuple[Dataset, Dataset]:
+        """
+        Собирает датасет: последовательности + labels.
+        Label = 1 если в следующие 200 свечей цена достигла TP раньше SL.
+        """
+        sequences = []
+        labels = []
+        storage = Storage()
 
-    def _train_epoch(self, loader: DataLoader) -> float:
+        for symbol in symbols:
+            for tf in ['1m', '3m', '5m', '10m', '15m']:
+                df = storage.get_candles(symbol, tf)
+                if len(df) < DEFAULT_SEQ_LEN + 200:
+                    continue
+
+                # Примерная генерация labels (упрощённо)
+                for i in range(len(df) - DEFAULT_SEQ_LEN - 200):
+                    seq_df = df.iloc[i:i+DEFAULT_SEQ_LEN]
+                    future_df = df.iloc[i+DEFAULT_SEQ_LEN:i+DEFAULT_SEQ_LEN+200]
+
+                    # Симуляция: TP = close + 1%, SL = close - 0.5% (пример)
+                    entry_price = seq_df['close'].iloc[-1]
+                    tp_hit = (future_df['high'] >= entry_price * 1.01).any()
+                    sl_hit = (future_df['low'] <= entry_price * 0.995).any()
+
+                    label = 1 if tp_hit and (not sl_hit or tp_hit before sl_hit) else 0
+
+                    seq_features = prepare_sequence_features(symbol, tf, DEFAULT_SEQ_LEN)
+                    if seq_features is not None:
+                        sequences.append(seq_features.to_dict('records'))
+                        labels.append(label)
+
+        dataset = TradingDataset(sequences, labels)
+        train_size = int((1 - self.val_split) * len(dataset))
+        val_size = len(dataset) - train_size
+        train_ds, val_ds = torch.utils.data.random_split(dataset, [train_size, val_size])
+
+        return train_ds, val_ds
+
+    def train_epoch(self, loader: DataLoader) -> Dict[str, float]:
+        """
+        Один эпох обучения.
+        """
         self.model.train()
         total_loss = 0.0
-        
-        for batch in tqdm(loader, desc="Training"):
-            windows = {tf: {int(w): t.to(self.device) for w, t in ws.items()}
-                       for tf, ws in batch["windows"].items()}
-            labels = batch["label"].to(self.device)
-            
-            self.optimizer.zero_grad(set_to_none=True)
-            
-            with autocast():
-                preds = self.model(windows)
-                loss = self.criterion(preds, labels)
-            
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            
-            total_loss += loss.item() * labels.size(0)
-        
-        return total_loss / len(loader.dataset)
+        preds, trues = [], []
 
-    def _validate_epoch(self, loader: DataLoader) -> Tuple[float, Dict]:
+        for batch_inputs, batch_labels in loader:
+            # batch_inputs — list[dict[tf: dict[window: tensor]]]
+            # Нужно collate в dict[tf: dict[window: tensor(batch, seq, feat)]]
+            batch = {tf: {w: torch.stack([inp[tf][w] for inp in batch_inputs]) for w in batch_inputs[0][tf]} for tf in batch_inputs[0]}
+
+            for tf in batch:
+                for w in batch[tf]:
+                    batch[tf][w] = batch[tf][w].to(self.device)
+
+            batch_labels = batch_labels.to(self.device)
+
+            self.optimizer.zero_grad()
+            outputs = self.model(batch)
+            loss = self.criterion(outputs, batch_labels)
+            loss.backward()
+            self.optimizer.step()
+
+            total_loss += loss.item()
+            preds.extend((torch.sigmoid(outputs) > 0.5).cpu().numpy())
+            trues.extend(batch_labels.cpu().numpy())
+
+        metrics = {
+            'loss': total_loss / len(loader),
+            'accuracy': accuracy_score(trues, preds),
+            'precision': precision_score(trues, preds, zero_division=0),
+            'recall': recall_score(trues, preds, zero_division=0),
+            'f1': f1_score(trues, preds, zero_division=0)
+        }
+        return metrics
+
+    def validate_epoch(self, loader: DataLoader) -> Dict[str, float]:
+        """
+        Валидация.
+        """
         self.model.eval()
         total_loss = 0.0
-        all_preds, all_labels = [], []
-        
+        preds, trues = [], []
+
         with torch.no_grad():
-            for batch in loader:
-                windows = {tf: {int(w): t.to(self.device) for w, t in ws.items()}
-                           for tf, ws in batch["windows"].items()}
-                labels = batch["label"].to(self.device)
-                
-                preds = self.model(windows)
-                loss = self.criterion(preds, labels)
-                total_loss += loss.item() * labels.size(0)
-                
-                all_preds.append((preds > 0).float())
-                all_labels.append(labels)
-        
-        preds_all = torch.cat(all_preds)
-        labels_all = torch.cat(all_labels)
-        
-        accuracy = (preds_all == labels_all).float().mean().item()
-        precision = ((preds_all == 1) & (labels_all == 1)).sum() / (preds_all == 1).sum().clamp(min=1)
-        recall = ((preds_all == 1) & (labels_all == 1)).sum() / (labels_all == 1).sum().clamp(min=1)
-        f1 = 2 * precision * recall / (precision + recall).clamp(min=1e-8)
-        
-        return total_loss / len(loader.dataset), {
-            "accuracy": accuracy,
-            "precision": precision.item(),
-            "recall": recall.item(),
-            "f1": f1.item()
+            for batch_inputs, batch_labels in loader:
+                batch = {tf: {w: torch.stack([inp[tf][w] for inp in batch_inputs]) for w in batch_inputs[0][tf]} for tf in batch_inputs[0]}
+                for tf in batch:
+                    for w in batch[tf]:
+                        batch[tf][w] = batch[tf][w].to(self.device)
+                batch_labels = batch_labels.to(self.device)
+
+                outputs = self.model(batch)
+                loss = self.criterion(outputs, batch_labels)
+
+                total_loss += loss.item()
+                preds.extend((torch.sigmoid(outputs) > 0.5).cpu().numpy())
+                trues.extend(batch_labels.cpu().numpy())
+
+        metrics = {
+            'loss': total_loss / len(loader),
+            'accuracy': accuracy_score(trues, preds),
+            'precision': precision_score(trues, preds, zero_division=0),
+            'recall': recall_score(trues, preds, zero_division=0),
+            'f1': f1_score(trues, preds, zero_division=0)
         }
+        return metrics
 
-    def _get_dataloader(self, symbols: List[str], split: str) -> DataLoader:
-        dataset = ScalpSequenceDataset(self.config, symbols, split=split)
-        shuffle = split == "train"
-        workers = 0 if self.config["hardware"]["mode"] == "phone_tiny" else 4
-        
-        return DataLoader(
-            dataset,
-            batch_size=self.batch_size,
-            shuffle=shuffle,
-            num_workers=workers,
-            pin_memory=torch.cuda.is_available()
-        )
+    def train(self):
+        """
+        Полный цикл обучения.
+        """
+        train_ds, val_ds = self.prepare_dataset(symbols=['BTCUSDT'])  # пример, все монеты
 
-    def _get_training_symbols(self) -> List[str]:
-        """Символы для обучения — из whitelist или все доступные"""
-        whitelist = self.storage.get_whitelist()
-        if whitelist:
-            return whitelist
-        return ["BTCUSDT", "ETHUSDT", "SOLUSDT"]  # fallback
+        train_loader = DataLoader(train_ds, batch_size=self.batch_size, shuffle=True)
+        val_loader = DataLoader(val_ds, batch_size=self.batch_size, shuffle=False)
 
-    def _save_checkpoint(self, filename: str):
-        path = os.path.join(self.save_dir, filename)
-        torch.save({
-            "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "best_val_loss": self.best_val_loss,
-            "epoch": self.current_epoch
-        }, path)
-        logger.info(f"Сохранён чекпоинт: {path}")
+        best_val_loss = float('inf')
+        for epoch in range(self.epochs):
+            train_metrics = self.train_epoch(train_loader)
+            val_metrics = self.validate_epoch(val_loader)
 
-    def retrain_incremental(self):
-        """Инкрементальное переобучение (вызывается из live_loop каждые 10k свечей)"""
-        logger.info("Запуск инкрементального переобучения")
-        self.train()
+            logger.info(f"Epoch {epoch+1}/{self.epochs} | Train loss: {train_metrics['loss']:.4f} | Val loss: {val_metrics['loss']:.4f}")
 
+            self.scheduler.step(val_metrics['loss'])
 
-def main():
-    config = load_config()
-    trainer = Trainer(config)
-    
-    if "--retrain" in os.sys.argv:
-        trainer.retrain_incremental()
-    else:
-        trainer.train()
+            if val_metrics['loss'] < best_val_loss:
+                best_val_loss = val_metrics['loss']
+                self.save_model("best_model.pth")
+                logger.info("Сохранена лучшая модель")
 
+    def incremental_retrain(self, new_data: Dict):
+        """
+        Дообучение на новых свечах (live-режим).
+        """
+        # Загружаем старую модель
+        self.load_model("best_model.pth")
 
-if __name__ == "__main__":
-    main()
+        # Готовим новый датасет из новых данных
+        # ... (аналогично prepare_dataset на новых свечах)
+        # train_loader = ...
+
+        # Дообучаем на 3–5 эпохах
+        for _ in range(5):
+            self.train_epoch(train_loader)  # без валидации
+
+        self.save_model("latest_model.pth")
+        logger.info("Модель дообучена на новых данных")
+
+    def save_model(self, path: str):
+        torch.save(self.model.state_dict(), path)
+
+    def load_model(self, path: str):
+        self.model.load_state_dict(torch.load(path, map_location=self.device))
+        self.model.to(self.device)

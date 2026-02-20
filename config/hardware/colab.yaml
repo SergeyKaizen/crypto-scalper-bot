@@ -1,50 +1,32 @@
 # config/hardware/colab.yaml
-# Профиль для Google Colab (или любой облачной среды с GPU/TPU)
-# Переопределяет default.yaml — используем почти максимальные возможности
-# Colab: GPU/TPU, 12–25 ГБ RAM, стабильное питание, но сессия до 12–24 часов
+# Настройки для Google Colab (бесплатный/платный GPU/TPU)
+# Цель — баланс скорости и качества, использование GPU/TPU для ускорения.
 
-# Основные лимиты железа
-max_coins: 40                       # До 40 монет комфортно (зависит от GPU/памяти)
-max_tf: 5                           # Все 5 TF (1m, 3m, 5m, 10m, 15m)
-max_windows: 4                      # Все 4 окна (24, 50, 74, 100)
-seq_len: 100                        # Полная длина последовательности — Colab тянет
+hardware:
+  type: "colab"
 
-# Производительность
-low_power_mode: false               # Выключен — используем полную мощность
-use_tiny_model: false               # Полная модель (не tiny)
-quantization: null                  # Не нужна — GPU и так быстро
-inference_device: "cuda"            # cuda (GPU) / cpu (если T4 нет)
+database:
+  type: "duckdb"                          # DuckDB — быстро на больших данных, in-memory ок
 
-# Таймеры и частота (Colab не боится нагрузки)
-quiet_mode: true                    # Можно включать — нагрузка не проблема
-quiet_inference_every_by_tf:        # Чаще, чем на телефоне
-  1m: 5                             # Каждые 5 минут на 1m
-  3m: 4
-  5m: 3
-  10m: 2
-  15m: 2
-
-# PR-фильтр — можно считать чаще
-pr:
-  recalc_interval_minutes: 5        # Пересчёт PR каждые 2 минуты (быстрее адаптация)
-  analysis_period_candles: 250      # Оставляем 250 — статистика надёжная
-
-# Данные — Colab тянет большие объёмы
-data:
-  max_history_candles: 2000000      # До 2 млн свечей (≈3–4 года на 1m)
-  resample_higher_tf: true          # Можно resample 1m → higher TF (если Binance не даёт)
-
-# Модель и обучение
 model:
-  hidden_size: 128                  # Больше, чем default (64) — Colab тянет
-  conv_filters: 64                  # Больше фильтров Conv1D
-  epochs: 100                       # Полное обучение/переобучение
-  batch_size: 64                    # Больше батч — быстрее на GPU
+  epochs: 15                              # Больше эпох — лучше сходимость
+  batch_size: 128                         # Большой батч — ускорение на GPU
+  hidden_size: 256                        # Больше параметров — выше качество
+  num_gru_layers: 2                       # Два слоя GRU — лучше захват паттернов
 
-# Дополнительные возможности Colab
-colab:
-  use_gpu: true                     # Использовать GPU (T4/P100/A100)
-  use_tpu: false                    # TPU — опционально (редко нужно)
-  save_checkpoint_every: 10         # Сохранять модель каждые 10 эпох
-  mount_drive: true                 # Монтировать Google Drive для сохранения моделей/логов
-  drive_path: "/content/drive/MyDrive/crypto_scalper_bot/"  # Путь для сохранения
+backtest:
+  max_workers: 12                         # Больше потоков — быстрее скачка и симуляция
+
+trading:
+  risk_pct: 1.0                           # Средний риск — стандарт
+
+limits:
+  max_candles_per_tf: 200000              # Больше истории — лучше обучение
+  max_scenarios_limit: 20000              # Больше сценариев — точнее статистика
+  retrain_interval_candles: 10000         # Стандартный интервал
+
+# Влияние изменений:
+# epochs: 10 → быстрее, но хуже качество; 30 → точнее, но дольше обучение
+# batch_size: 64 → экономнее VRAM; 256 → быстрее, но может OOM на бесплатном Colab
+# hidden_size: 128 → легче модель; 512 → лучше качество, но выше VRAM
+# max_candles_per_tf: 100000 → экономия; 500000 → больше данных, лучше модель

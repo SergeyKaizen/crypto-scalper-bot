@@ -1,182 +1,144 @@
-# src/model/scenario_tracker.py
 """
-Отслеживание бинарных сценариев и их весов (по ТЗ).
+src/model/scenario_tracker.py
 
-Что делает:
-- Каждый сценарий — это комбинация 4 бинарных условий (candle_anomaly, volume_anomaly, cv_anomaly, q_condition)
-- Всего 16 возможных сценариев (2^4)
-- Для каждого сценария ведётся статистика:
-  - count — сколько раз сценарий встретился
-  - wins — сколько раз сценарий принёс профит (сделка закрыта по TP)
-- Вес сценария = winrate × log(count + 1) — используется для корректировки вероятности в inference
-- Кластеризация сценариев HDBSCAN (после накопления ≥50 сценариев)
-- Автоматический экспорт статистики в CSV (раз в 500 обновлений + по команде export_scenarios.py)
-- Готов к импорту в Google Sheets (Ctrl+V → Импорт)
+=== Основной принцип работы файла ===
 
-Логика:
-- update_scenario() — вызывается после закрытия сделки
-- get_scenario_weight() — корректирует вероятность в inference
-- export_statistics() — выгрузка в CSV
-- _recluster_if_needed() — HDBSCAN кластеризация (периодически)
+Этот файл реализует отслеживание и анализ всех бинарных сценариев (комбинаций состояний признаков) после каждой закрытой сделки.
+
+Ключевые задачи:
+- После закрытия позиции (TP/SL) обновляет статистику сценария (winrate, count, weight).
+- Weight = winrate * log(count + 1) — учитывает и вероятность успеха, и надёжность (мало сделок — низкий вес).
+- Хранит все сценарии (full stats, без обрезки топ-N).
+- Кластеризация — HDBSCAN (density-based, лучше K-Means для sparse бинарных данных по здравой логике).
+- Экспорт полной статистики в CSV (все сценарии, sorted by weight descending).
+- Поддержка принудительной выгрузки через scripts/export_scenarios.py --force.
+
+Сценарий — строка бинарных состояний (например, "delta_bid_inc=1,dist_delta_pos=0,C=1,Q=0").
+Хранится в dict или pd.DataFrame в памяти, сохраняется в storage при retrain/shutdown.
+
+=== Главные функции и за что отвечают ===
+
+- ScenarioTracker() — инициализация, загрузка из storage если есть.
+- update_scenario(scenario_key: str, is_win: bool) — обновляет статистику после сделки.
+- get_scenarios_stats(min_count: int = 1) → pd.DataFrame — возвращает все сценарии (full).
+- cluster_scenarios() → добавляет HDBSCAN labels к df.
+- export_to_csv(path: str) — экспорт full stats в CSV.
+- save_state() / load_state() — сохранение/загрузка в storage (для retrain).
+
+=== Примечания ===
+- HDBSCAN выбран по логике (лучше для редких высокоприбыльных outliers).
+- min_cluster_size=3–5 (в config).
+- Weight формула по ТЗ: winrate * log(count + 1).
+- Full stats — все сценарии, без топ-N.
+- Готов к интеграции в entry_manager (после close) и export_scenarios.py.
+- Логи через setup_logger.
 """
 
+import pandas as pd
 import numpy as np
-import polars as pl
-from collections import defaultdict
-from typing import Tuple, Dict
-import hdbscan
+from sklearn.preprocessing import LabelEncoder
+from hdbscan import HDBSCAN
 import os
-from datetime import datetime
+import pickle
 
-from src.utils.logger import get_logger
+from src.core.config import load_config
+from src.data.storage import Storage
+from src.utils.logger import setup_logger
 
-logger = get_logger(__name__)
+logger = setup_logger('scenario_tracker', logging.INFO)
 
 class ScenarioTracker:
-    def __init__(self, config: dict):
-        self.config = config
-        
-        # Хранилище сценариев: ключ (tuple из 4 битов) → статистика
-        self.scenarios: Dict[Tuple[int, int, int, int], Dict[str, Any]] = defaultdict(lambda: {
-            "count": 0,
-            "wins": 0,
-            "cluster_id": -1  # -1 = не кластеризован или шум
-        })
-        
-        # HDBSCAN для кластеризации бинарных векторов
-        self.clusterer = hdbscan.HDBSCAN(
-            min_cluster_size=5,
-            min_samples=3,
-            metric='hamming'  # расстояние Хэмминга для бинарных векторов
-        )
-        self.need_recluster = True  # флаг: нужно ли перекластеризовать
-        
-        self.export_dir = config.get("paths", {}).get("export_dir", "exports")
-        os.makedirs(self.export_dir, exist_ok=True)
+    """
+    Отслеживание бинарных сценариев и их статистики.
+    """
+    def __init__(self):
+        self.config = load_config()
+        self.storage = Storage()
+        self.scenarios = {}  # key: str сценария → {'win': int, 'loss': int, 'count': int, 'weight': float}
+        self.load_state()
 
-    def update_scenario(self, scenario_key: Tuple[int, int, int, int], is_win: bool):
+    def update_scenario(self, scenario_key: str, is_win: bool):
         """
-        Обновляет статистику сценария после закрытия сделки.
-        scenario_key — tuple из 4 битов (candle, volume, cv, q)
-        is_win — True если сделка закрыта по TP (профит)
+        Обновляет статистику сценария после закрытия позиции.
+        scenario_key — строка вида "delta_bid_inc=1,dist_delta_pos=0,C=1,Q=0"
+        is_win — True если закрытие по TP, False по SL.
         """
-        stats = self.scenarios[scenario_key]
-        stats["count"] += 1
+        if scenario_key not in self.scenarios:
+            self.scenarios[scenario_key] = {'win': 0, 'loss': 0, 'count': 0}
+
+        entry = self.scenarios[scenario_key]
         if is_win:
-            stats["wins"] += 1
-        
-        # После каждых 500 обновлений — перекластеризация и экспорт
-        if stats["count"] % 500 == 0:
-            self._recluster_if_needed()
-            self.export_statistics()
+            entry['win'] += 1
+        else:
+            entry['loss'] += 1
+        entry['count'] += 1
 
-    def get_scenario_weight(self, scenario_key: Tuple[int, int, int, int]) -> float:
-        """
-        Возвращает вес сценария для корректировки вероятности в inference.
-        Вес = winrate × log(count + 1)
-        Диапазон ограничен 0.5–2.0 для стабильности.
-        """
-        stats = self.scenarios.get(scenario_key, {"count": 0, "wins": 0})
-        count = stats["count"]
-        wins = stats["wins"]
-        
-        if count == 0:
-            return 1.0  # нейтральный вес для нового сценария
-        
-        winrate = wins / count
-        weight = winrate * np.log1p(count)
-        return max(0.5, min(2.0, weight))
+        winrate = entry['win'] / entry['count'] if entry['count'] > 0 else 0.0
+        entry['weight'] = winrate * np.log(entry['count'] + 1)  # формула по ТЗ
 
-    def _recluster_if_needed(self):
-        """
-        Перекластеризация сценариев с помощью HDBSCAN.
-        Выполняется периодически или при большом приросте данных.
-        """
-        if not self.need_recluster or len(self.scenarios) < 50:
-            return
-        
-        logger.info(f"Перекластеризация сценариев (HDBSCAN) — {len(self.scenarios)} сценариев")
-        
-        keys = list(self.scenarios.keys())
-        vectors = np.array(keys)  # tuple → np.array (бинарные векторы)
-        
-        if len(vectors) < 10:
-            return
-        
-        labels = self.clusterer.fit_predict(vectors)
-        
-        for i, key in enumerate(keys):
-            self.scenarios[key]["cluster_id"] = int(labels[i])
-        
-        self.need_recluster = False
-        logger.info(f"HDBSCAN завершён: {len(set(labels)) - 1} кластеров (без шума)")
+        logger.debug(f"Обновлён сценарий '{scenario_key}': winrate={winrate:.2f}, weight={entry['weight']:.4f}, count={entry['count']}")
 
-    def export_statistics(self, filename: str = None):
+        # Автосохранение каждые 100 обновлений
+        if entry['count'] % 100 == 0:
+            self.save_state()
+
+    def get_scenarios_stats(self, min_count: int = 1) -> pd.DataFrame:
         """
-        Экспорт статистики всех сценариев в CSV.
-        Колонки: scenario_key, count, wins, winrate, weight, cluster_id
-        Готов к импорту в Google Sheets.
+        Возвращает DataFrame со всеми сценариями (full stats).
+        Фильтр min_count для исключения шума (опционально).
         """
-        if filename is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"scenario_stats_{timestamp}.csv"
-        
         data = []
         for key, stats in self.scenarios.items():
-            count = stats["count"]
-            wins = stats["wins"]
-            winrate = wins / count if count > 0 else 0.0
-            weight = winrate * np.log1p(count)
-            cluster = stats.get("cluster_id", -1)
-            
+            if stats['count'] < min_count:
+                continue
+            winrate = stats['win'] / stats['count'] if stats['count'] > 0 else 0.0
             data.append({
-                "scenario_key": str(key),  # tuple → строка
-                "count": count,
-                "wins": wins,
-                "winrate": round(winrate, 4),
-                "weight": round(weight, 4),
-                "cluster_id": cluster
+                'scenario_key': key,
+                'win': stats['win'],
+                'loss': stats['loss'],
+                'count': stats['count'],
+                'winrate': winrate,
+                'weight': stats['weight']
             })
-        
-        if not data:
-            logger.warning("Нет сценариев для экспорта")
-            return
-        
-        df = pl.DataFrame(data).sort("weight", descending=True)
-        path = os.path.join(self.export_dir, filename)
-        df.write_csv(path)
-        logger.info(f"Экспортировано {len(data)} сценариев → {path}")
-        
-        # Принудительная перекластеризация после экспорта
-        self.need_recluster = True
 
-    def get_top_scenarios(self, top_n: int = 20) -> pl.DataFrame:
-        """Топ-N сценариев по весу (для логов или мониторинга)"""
-        data = []
-        for key, stats in self.scenarios.items():
-            count = stats["count"]
-            wins = stats["wins"]
-            winrate = wins / count if count > 0 else 0.0
-            weight = winrate * np.log1p(count)
-            data.append({
-                "scenario_key": str(key),
-                "weight": round(weight, 4),
-                "winrate": round(winrate, 4),
-                "count": count,
-                "cluster_id": stats.get("cluster_id", -1)
-            })
-        df = pl.DataFrame(data).sort("weight", descending=True).head(top_n)
+        df = pd.DataFrame(data)
+        df = df.sort_values('weight', ascending=False).reset_index(drop=True)
+
+        # Кластеризация HDBSCAN
+        if len(df) >= 3:  # минимум для кластеризации
+            features = df[['winrate', 'count', 'weight']].values
+            clusterer = HDBSCAN(min_cluster_size=self.config.get('hdbscan', {}).get('min_cluster_size', 5))
+            labels = clusterer.fit_predict(features)
+            df['cluster_label'] = labels
+
+        logger.info(f"Статистика сценариев: {len(df)} записей (после фильтра min_count={min_count})")
         return df
 
+    def export_to_csv(self, path: str = "scenarios_stats.csv"):
+        """
+        Экспорт полной статистики в CSV.
+        """
+        df = self.get_scenarios_stats(min_count=1)  # все
+        df.to_csv(path, index=False)
+        logger.info(f"Экспортировано {len(df)} сценариев в {path}")
 
-if __name__ == "__main__":
-    config = load_config()
-    tracker = ScenarioTracker(config)
-    
-    # Тест обновления
-    key = (1, 0, 1, 0)  # candle=yes, volume=no, cv=yes, q=no
-    tracker.update_scenario(key, is_win=True)
-    tracker.update_scenario(key, is_win=False)
-    
-    print("Вес сценария:", tracker.get_scenario_weight(key))
-    tracker.export_statistics("test_scenario_stats.csv")
+    def save_state(self):
+        """
+        Сохраняет состояние tracker в storage или файл (pickle).
+        """
+        path = os.path.join(self.config['paths']['data_dir'], 'scenario_tracker.pkl')
+        with open(path, 'wb') as f:
+            pickle.dump(self.scenarios, f)
+        logger.debug("Состояние ScenarioTracker сохранено")
+
+    def load_state(self):
+        """
+        Загружает состояние из файла, если существует.
+        """
+        path = os.path.join(self.config['paths']['data_dir'], 'scenario_tracker.pkl')
+        if os.path.exists(path):
+            with open(path, 'rb') as f:
+                self.scenarios = pickle.load(f)
+            logger.info(f"Загружено {len(self.scenarios)} сценариев из {path}")
+        else:
+            logger.debug("Состояние ScenarioTracker не найдено — старт с нуля")

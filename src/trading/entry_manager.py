@@ -1,144 +1,166 @@
-# src/trading/entry_manager.py
 """
-Модуль управления мягкими входами (soft entry).
+src/trading/entry_manager.py
 
-Основные функции:
-- should_enter_soft() — проверка, пора ли открывать/добавлять часть позиции
-- calculate_entry_parts() — расчёт долей позиции по уровням вероятности
-- process_soft_entry() — основная логика: открытие первой части, ожидание следующих
-- cancel_pending_parts() — отмена оставшихся частей, если timeout или сигнал отменён
+=== Основной принцип работы файла ===
 
-Логика:
-- soft_entry_enabled — включено/выключено
-- soft_levels — пороги вероятности (например [0.65, 0.78, 0.85])
-- soft_sizes — доли позиции (сумма = 1.0, например [0.3, 0.4, 0.3])
-- soft_timeout — сколько свечей ждать следующую часть (если не пришло — отменяем)
-- После первой части — ждём, пока prob ≥ следующий уровень
-- Если timeout — оставшиеся части не открываем
-- Каждая часть — отдельный ордер (limit/market по конфигу)
+Этот файл отвечает за логику открытия позиций в live-режиме (реальный и виртуальный).
+Он:
+- Получает сигналы от inference (предикт модели при аномалии/Q).
+- Проверяет условия входа: совпадение с whitelist (PR_BTC config), min_prob, no open position по типу, no close in this candle.
+- Рассчитывает размер позиции через risk_manager (риск % от депо, плечо, SL distance).
+- Передаёт ордер в order_executor (real) или virtual_trader (виртуальный).
+- Поддерживает только одну открытую позицию по типу аномалии (C/V/CV/Q) на монете.
+- Запрещает новую позицию в свече, где предыдущая закрылась (по ТЗ для live).
 
-Влияние:
-- Снижает риск ложных входов на 30–50%
-- Увеличивает средний профит (входим частями по лучшей цене)
-- Уменьшает средний размер позиции (если подтверждения нет)
+В live-режиме — консервативно: одна по типу, нет входа после закрытия в той же свече.
+Виртуальный режим — та же логика для симуляции PNL без реальных ордеров.
 
-Зависимости:
-- config["soft_entry_enabled"], soft_levels, soft_sizes, soft_timeout
-- src/trading/order_executor.py — для открытия ордеров
-- src/trading/live_loop.py — передача текущей вероятности
+=== Главные функции и за что отвечают ===
+
+- EntryManager() — инициализация: risk_manager, order_executor, virtual_trader, websocket.
+- process_signal(symbol: str, anomaly_type: str, direction: str, prob: float, candle_data: dict) — основная точка входа:
+  - Проверяет whitelist match (PR config == signal).
+  - Проверяет min_prob (выше для Q).
+  - Проверяет no open position по типу.
+  - Проверяет no close in this candle (флаг от tp_sl_manager).
+  - Рассчитывает size через risk_manager.
+  - Открывает позицию (real или virtual).
+- _can_open_position(symbol: str, anomaly_type: str, candle_ts: int) → bool — проверки условий.
+- _open_position(...) — вызов executor или virtual_trader.
+- update_candle_close_flag(candle_ts: int) — флаг закрытия в свече (от tp_sl_manager).
+
+=== Примечания ===
+- Signal vs PR: если Signal_BTC == PR_BTC — real, иначе virtual (по ТЗ).
+- Q имеет выше min_prob_q (например, 0.75) для снижения ложных входов.
+- Полностью соответствует ТЗ + уточнениям (одна по типу, no new in closed candle).
+- Готов к интеграции в live_loop.py.
+- Логи через setup_logger.
 """
 
-import logging
-from typing import List, Tuple, Dict, Optional
-from datetime import datetime
+from typing import Dict, Optional
+import time
 
 from src.core.config import load_config
-from src.core.types import Signal, Position
-from src.trading.order_executor import place_order
+from src.core.enums import AnomalyType, Direction, TradeMode
+from src.trading.risk_manager import RiskManager
+from src.trading.order_executor import OrderExecutor
+from src.trading.virtual_trader import VirtualTrader
+from src.trading.tp_sl_manager import TPSLManager
+from src.utils.logger import setup_logger
 
-logger = logging.getLogger(__name__)
-
+logger = setup_logger('entry_manager', logging.INFO)
 
 class EntryManager:
-    """Управление мягкими входами"""
+    """
+    Менеджер открытия позиций в live-режиме.
+    """
+    def __init__(self):
+        self.config = load_config()
+        self.risk_manager = RiskManager()
+        self.order_executor = OrderExecutor()
+        self.virtual_trader = VirtualTrader()
+        self.tp_sl_manager = TPSLManager()  # для проверки закрытий
 
-    def __init__(self, config: Dict):
-        self.config = config
-        self.enabled = config.get("soft_entry_enabled", False)
-        self.levels = config.get("soft_levels", [0.65, 0.78, 0.85])
-        self.sizes = config.get("soft_sizes", [0.3, 0.4, 0.3])
-        self.timeout = config.get("soft_timeout", 5)  # в свечах
+        self.mode = TradeMode(self.config['trading']['mode'])  # real / virtual
+        self.candle_close_flags = {}  # candle_ts: bool (было закрытие в этой свече)
 
-        # Проверка сумм долей
-        if abs(sum(self.sizes) - 1.0) > 0.01:
-            logger.warning("Soft sizes sum != 1.0: %s → normalizing", self.sizes)
-            total = sum(self.sizes)
-            self.sizes = [s / total for s in self.sizes]
-
-        # Открытые soft-позиции: symbol → {entry_time, current_level, pending_parts}
-        self.active_soft = {}
-
-        logger.info("EntryManager initialized: soft_entry=%s, levels=%s, sizes=%s, timeout=%d свечей",
-                    self.enabled, self.levels, self.sizes, self.timeout)
-
-    def should_enter(self, signal: Signal, current_prob: float) -> Tuple[bool, int]:
+    def process_signal(
+        self,
+        symbol: str,
+        anomaly_type: str,
+        direction: str,
+        prob: float,
+        candle_data: Dict,
+        candle_ts: int
+    ):
         """
-        Проверка: открывать ли новую часть позиции
-
-        Returns:
-            (enter: bool, level_index: int) — level_index начинается с 0
+        Основная функция: обработка сигнала от inference.
+        - Проверяет whitelist match.
+        - Проверяет вероятность и условия входа.
+        - Открывает позицию (real или virtual).
         """
-        if not self.enabled:
-            return current_prob >= self.config["prob_threshold"], 0
+        # 1. Проверка whitelist (PR config)
+        whitelist_config = self.storage.get_whitelist_config(symbol)  # best_tf, best_period, best_anomaly, best_direction
+        if not whitelist_config:
+            logger.debug(f"{symbol} не в whitelist — только виртуальный режим")
+            mode = TradeMode.VIRTUAL
+        else:
+            signal_key = f"{anomaly_type}_{direction}"
+            pr_key = f"{whitelist_config['best_anomaly']}_{whitelist_config['best_direction']}"
+            if signal_key == pr_key:
+                mode = self.mode  # real если режим real
+            else:
+                mode = TradeMode.VIRTUAL
 
-        # Если позиция уже открыта — проверяем следующую часть
-        if signal.symbol in self.active_soft:
-            pos = self.active_soft[signal.symbol]
-            current_level = pos["current_level"]
-            if current_level >= len(self.levels) - 1:
-                return False, -1  # Все части открыты
+        # 2. Проверка вероятности
+        min_prob = self.config['model']['min_prob_q'] if anomaly_type == AnomalyType.QUIET.value else self.config['model']['min_prob_anomaly']
+        if prob < min_prob:
+            logger.debug(f"Низкая вероятность {prob:.2f} < {min_prob:.2f} для {symbol} {anomaly_type}")
+            return
 
-            next_level = current_level + 1
-            if current_prob >= self.levels[next_level]:
-                return True, next_level
+        # 3. Проверка условий входа
+        if not self._can_open_position(symbol, anomaly_type, candle_ts):
+            return
 
-            # Проверка timeout
-            candles_passed = (datetime.now() - pos["entry_time"]).total_seconds() / 60  # Примерно
-            if candles_passed > self.timeout * 1:  # 1 минута = 1 свеча на 1m
-                self.cancel_pending_parts(signal.symbol)
-                return False, -1
-
-            return False, -1
-
-        # Первая часть
-        if current_prob >= self.levels[0]:
-            return True, 0
-
-        return False, -1
-
-    def open_soft_part(self, signal: Signal, current_prob: float, entry_price: float, size: float):
-        """Открытие очередной части позиции"""
-        if signal.symbol not in self.active_soft:
-            self.active_soft[signal.symbol] = {
-                "entry_time": datetime.now(),
-                "current_level": 0,
-                "parts": [],
-                "pending_parts": len(self.levels) - 1
-            }
-
-        level = self.active_soft[signal.symbol]["current_level"]
-        part_size = size * self.sizes[level]
-
-        # Открываем ордер
-        order = place_order(
-            symbol=signal.symbol,
-            side="buy" if signal.direction in ["L", "LS"] else "sell",
-            amount=part_size,
-            price=entry_price,
-            type="market"  # или limit — по конфигу
+        # 4. Расчёт размера позиции
+        size = self.risk_manager.calculate_size(
+            symbol=symbol,
+            entry_price=candle_data['close'],
+            sl_price=self.tp_sl_manager.calculate_sl(candle_data, direction),
+            risk_pct=self.config['trading']['risk_pct']
         )
 
-        self.active_soft[signal.symbol]["parts"].append({
-            "level": level,
-            "price": entry_price,
-            "size": part_size,
-            "order_id": order.get("id")
-        })
+        if size <= 0:
+            logger.warning(f"Невозможно рассчитать размер позиции для {symbol}")
+            return
 
-        self.active_soft[signal.symbol]["current_level"] += 1
+        # 5. Открытие позиции
+        pos = {
+            'symbol': symbol,
+            'type': anomaly_type,
+            'direction': direction,
+            'entry_price': candle_data['close'],
+            'size': size,
+            'open_ts': candle_ts,
+            'prob': prob
+        }
 
-        logger.info("Soft entry part opened: %s, level=%d, size=%.4f, price=%.2f", 
-                    signal.symbol, level, part_size, entry_price)
+        if mode == TradeMode.REAL:
+            order_id = self.order_executor.place_order(pos)
+            if order_id:
+                pos['order_id'] = order_id
+                logger.info(f"Открыта реальная позиция {anomaly_type} {direction} на {symbol}, size={size}")
+            else:
+                logger.error(f"Ошибка открытия реальной позиции {symbol}")
+                return
+        else:
+            self.virtual_trader.open_position(pos)
+            logger.debug(f"Открыта виртуальная позиция {anomaly_type} {direction} на {symbol}, size={size}")
 
-    def cancel_pending_parts(self, symbol: str):
-        """Отмена оставшихся частей при timeout или отмене сигнала"""
-        if symbol in self.active_soft:
-            pos = self.active_soft[symbol]
-            logger.info("Cancelling pending soft parts for %s (timeout/current_level=%d)", 
-                        symbol, pos["current_level"])
-            del self.active_soft[symbol]
+        # Добавляем в открытые позиции (для проверки в live_loop)
+        self.tp_sl_manager.add_open_position(pos)
 
-    def reset(self):
-        """Сброс всех soft-позиций (например после перезапуска)"""
-        self.active_soft.clear()
-        logger.info("Soft entry manager reset")
+    def _can_open_position(self, symbol: str, anomaly_type: str, candle_ts: int) -> bool:
+        """
+        Проверяет возможность открытия позиции.
+        - Нет открытой по этому типу.
+        - Нет закрытия в этой свече.
+        """
+        # 1. Нет открытой по типу
+        if self.tp_sl_manager.has_open_position(symbol, anomaly_type):
+            logger.debug(f"Уже открыта позиция {anomaly_type} на {symbol}")
+            return False
+
+        # 2. Нет закрытия в этой свече
+        if self.candle_close_flags.get(candle_ts, False):
+            logger.debug(f"В свече {candle_ts} была закрыта позиция — вход запрещён")
+            return False
+
+        return True
+
+    def update_candle_close_flag(self, candle_ts: int):
+        """
+        Устанавливает флаг закрытия позиции в свече (вызывается из tp_sl_manager).
+        """
+        self.candle_close_flags[candle_ts] = True
+        logger.debug(f"Установлен флаг закрытия в свече {candle_ts}")
