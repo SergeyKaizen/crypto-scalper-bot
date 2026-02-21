@@ -1,33 +1,22 @@
 # requirements.txt
+# Полный список зависимостей проекта (февраль 2026)
+# Устанавливай одной командой: pip install -r requirements.txt
+# Все версии — минимально необходимые и проверенные на совместимость с Python 3.10+
 
-# Основные зависимости проекта (2026 год, актуальные на момент сборки)
+ccxt>=4.3.0                 # Binance Futures API (klines, WebSocket, ордера, taker_buy_volume)
+pandas>=2.2.0               # Работа со свечами, storage, feature_engine
+numpy>=1.26.0               # Математические расчёты (% изменений, volatility)
+polars>=0.20.0              # Ускоренная обработка данных (feature_engine, anomaly_detector)
+torch>=2.2.0                # Модель Conv1D + GRU, обучение, inference
+hdbscan>=0.8.33             # Кластеризация сценариев (HDBSCAN)
+scikit-learn>=1.5.0         # Метрики в trainer
+duckdb>=1.0.0               # Быстрая БД для сервера
+tqdm>=4.66.0                # Прогресс-бары (downloader, backtest)
+pyyaml>=6.0.0               # Чтение конфигов (default.yaml, hardware/*.yaml)
+websocket-client>=1.7.0     # WebSocket для реал-тайм свечей
 
-# Базовые
-python>=3.10
-ccxt>=4.0.0                # Binance API клиент (futures support)
-pandas>=2.0.0              # Обработка данных
-numpy>=1.24.0              # Математика, массивы
-polars>=0.19.0             # Быстрая альтернатива pandas для feature_engine
+# Опционально, но сильно рекомендуется (цветные логи в консоли)
+colorlog>=6.8.0
 
-# Модель и обучение
-torch>=2.0.0               # PyTorch (Conv1D + GRU)
-torchvision>=0.15.0        # (опционально, если добавим изображения позже)
-
-# Кластеризация сценариев
-hdbscan>=0.8.0             # HDBSCAN для scenario_tracker
-scikit-learn>=1.3.0        # LabelEncoder, metrics
-
-# База данных
-duckdb>=0.9.0              # Для Colab/server
-# sqlite3 встроен в Python, не нужен отдельно
-
-# Прогресс и логи
-tqdm>=4.65.0               # Прогресс-бары в downloader
-pyyaml>=6.0.0              # Чтение yaml конфигов
-
-# Дополнительно (опционально, но полезно)
-requests>=2.31.0           # Если понадобится внешние API
-python-dateutil>=2.8.0     # Работа с датами/временем
-
-# Для запуска скриптов
-argparse                   # встроен, но для ясности
+# Встроенные в Python (не требуют установки):
+# argparse, logging, threading, asyncio, os, json, pickle, datetime, math

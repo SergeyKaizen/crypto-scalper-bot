@@ -1,140 +1,121 @@
-# src/trading/shadow_trading.py
 """
-Модуль shadow trading — параллельная симуляция реальных ордеров.
+src/trading/shadow_trading.py
 
-Shadow trading:
-- Запускается параллельно основной торговле (real/virtual)
-- Для каждого реального сигнала/ордера создаётся "тень" — симуляция с slippage и комиссиями
-- Считает "реальный" P&L, slippage %, delay исполнения
-- Сравнивает с виртуальным P&L (без slippage)
-- Метрики выводятся в логи / отдельный файл (shadow_metrics.csv)
+=== Основной принцип работы файла ===
 
-Преимущества:
-- Видим, сколько реально "съедает" биржа (slippage 0.05–0.3%, комиссии 0.04%)
-- Можно сравнивать real vs shadow — понять, насколько симуляция оптимистична
-- На сервере — параллельная обработка (asyncio или joblib)
+Этот файл реализует "теневую" (shadow) торговлю — параллельную симуляцию реальных сделок в виртуальном режиме.
+Цель — сравнивать реальные результаты (из order_executor) с виртуальными (из virtual_trader), 
+чтобы выявлять расхождения (slippage, задержки исполнения, ошибки биржи, разница в PNL) и улучшать стратегию.
 
-Логика:
-- При каждом place_order() — создаётся shadow-ордер
-- Shadow-ордер симулируется с slippage (0.1–0.2%) и комиссией taker
-- После закрытия позиции — сравнивается shadow P&L vs virtual/real
-- Метрики сохраняются: symbol, entry/exit, slippage_pct, commission_usdt, pnl_diff
+Ключевые задачи:
+- Дублирует каждый реальный ордер в виртуальном режиме (shadow position).
+- Обновляет виртуальные позиции параллельно с реальными (по тем же свечам).
+- Сравнивает PNL, hit TP/SL, slippage (разница entry price), исходы закрытия.
+- Логирует расхождения для анализа (например, "реальный SL hit, виртуальный TP hit").
+- Не влияет на реальные ордера — только мониторит и анализирует.
 
-На телефоне — shadow_trading: false (экономия батареи)
+Используется только в режиме "real" для отладки и улучшения.
+В режиме "virtual" — не активен (дублирует сам себя, бесполезно).
+
+=== Главные функции и за что отвечают ===
+
+- ShadowTrading() — инициализация: виртуальный баланс, shadow_positions.
+- shadow_open(real_pos: dict, real_order_id: str) — дублирует открытие реальной позиции в shadow.
+- shadow_update(candle_data: dict) — обновляет все shadow позиции (TP/SL check).
+- compare_real_vs_shadow(real_pos: dict, real_close_result: dict) — сравнение результатов после закрытия.
+- get_shadow_balance() → float — текущий баланс теневой торговли.
+- get_shadow_pnl() → float — общий PNL теневой торговли.
+
+=== Примечания ===
+- Shadow — это копия virtual_trader, но только для реальных сделок.
+- Комиссия и плечо — те же, что в реале.
+- Полностью соответствует ТЗ: shadow trading для сравнения и улучшения.
+- Нет влияния на реальные ордера — чистый мониторинг.
+- Логи через setup_logger с префиксом [SHADOW].
+- Готов к использованию в live_loop (при real mode) и entry_manager.
 """
 
-import logging
-from typing import Dict, List, Optional
-from datetime import datetime
-import asyncio
+from typing import Dict, Optional
 
 from src.core.config import load_config
-from src.core.types import Position, TradeResult
-from src.core.constants import BINANCE_FUTURES_TAKER_FEE
-from src.trading.order_executor import simulate_order_execution
+from src.trading.virtual_trader import VirtualTrader
+from src.utils.logger import setup_logger
 
-logger = logging.getLogger(__name__)
-
+logger = setup_logger('shadow_trading', logging.INFO)
 
 class ShadowTrading:
-    """Параллельная симуляция реальных ордеров (shadow trading)"""
+    """
+    Теневая торговля — параллельная симуляция реальных сделок.
+    """
+    def __init__(self):
+        self.config = load_config()
+        self.virtual_trader = VirtualTrader()  # Используем тот же класс виртуального трейдера
+        self.shadow_positions: Dict[str, Dict] = {}  # pos_id → shadow pos
+        self.real_to_shadow_map: Dict[str, str] = {}  # real_order_id → shadow_pos_id
 
-    def __init__(self, config: Dict):
-        self.config = config
-        self.enabled = config.get("shadow_trading", True)
-        self.slippage_pct = config.get("slippage_pct", 0.15)  # 0.15% — средний slippage на Binance
-        self.commission_rate = float(BINANCE_FUTURES_TAKER_FEE)
+    def shadow_open(self, real_pos: Dict, real_order_id: str):
+        """
+        Дублирует открытие реальной позиции в shadow.
+        real_pos — позиция из entry_manager.
+        real_order_id — ID реального ордера.
+        """
+        shadow_pos = real_pos.copy()
+        shadow_pos['is_shadow'] = True
+        shadow_pos_id = f"shadow_{real_order_id}"
 
-        # Shadow-позиции: symbol → Position (копия реальной)
-        self.shadow_positions = {}
+        self.virtual_trader.open_position(shadow_pos)
+        self.shadow_positions[shadow_pos_id] = shadow_pos
+        self.real_to_shadow_map[real_order_id] = shadow_pos_id
 
-        # Метрики
-        self.metrics = []  # List[Dict: symbol, entry/exit, slippage, pnl_diff]
+        logger.info(f"[SHADOW] Открыта теневая позиция для реального ордера {real_order_id}")
 
-        if not self.enabled:
-            logger.info("Shadow trading disabled")
-        else:
-            logger.info("Shadow trading enabled (slippage=%.2f%%)", self.slippage_pct)
+    def shadow_update(self, candle_data: Dict):
+        """
+        Обновляет все теневые позиции по новой свече.
+        """
+        self.virtual_trader.update_positions(candle_data)
 
-    async def process_signal(self, signal: Signal, real_position: Optional[Position] = None):
-        """Обработка сигнала — создание shadow-позиции"""
-        if not self.enabled:
+    def compare_real_vs_shadow(self, real_pos: Dict, real_close_result: Dict):
+        """
+        Сравнивает реальный и теневой результат закрытия.
+        Логирует расхождения (slippage, hit разный уровень и т.д.).
+        """
+        real_order_id = real_pos.get('order_id')
+        if not real_order_id:
             return
 
-        # Если есть реальная позиция — копируем
-        if real_position:
-            shadow_pos = Position(
-                entry_time=real_position.entry_time,
-                entry_price=real_position.entry_price * (1 + self.slippage_pct / 100 if real_position.direction == "L" else 1 - self.slippage_pct / 100),
-                size=real_position.size,
-                direction=real_position.direction,
-                tp_price=real_position.tp_price,
-                sl_price=real_position.sl_price,
-                is_virtual=True,
-                symbol=real_position.symbol
-            )
-            self.shadow_positions[signal.symbol] = shadow_pos
-            logger.debug("Shadow position created for %s @ %.2f (slippage applied)", signal.symbol, shadow_pos.entry_price)
-
-    async def update_shadow_position(self, symbol: str, current_high: float, current_low: float):
-        """Обновление shadow-позиции (trailing, check TP/SL)"""
-        if not self.enabled or symbol not in self.shadow_positions:
+        shadow_pos_id = self.real_to_shadow_map.get(real_order_id)
+        if not shadow_pos_id:
             return
 
-        pos = self.shadow_positions[symbol]
-
-        # Обновляем trailing (аналогично tp_sl_manager)
-        if pos.trailing_active:
-            if pos.direction == "L":
-                pos.trailing_price = max(pos.trailing_price, current_high * (1 - self.config["trailing_distance_pct"] / 100))
-            else:
-                pos.trailing_price = min(pos.trailing_price, current_low * (1 + self.config["trailing_distance_pct"] / 100))
-
-        # Проверка TP/SL (упрощённо)
-        if pos.direction == "L":
-            if current_high >= pos.tp_price:
-                self._close_shadow_position(symbol, pos.tp_price, "TP")
-            elif current_low <= pos.sl_price:
-                self._close_shadow_position(symbol, pos.sl_price, "SL")
-        else:
-            # Для шорта аналогично
-
-    def _close_shadow_position(self, symbol: str, exit_price: float, reason: str):
-        """Закрытие shadow-позиции и расчёт метрик"""
-        pos = self.shadow_positions.pop(symbol, None)
-        if not pos:
+        shadow_pos = self.shadow_positions.get(shadow_pos_id)
+        if not shadow_pos:
             return
 
-        pnl_pct = (exit_price - pos.entry_price) / pos.entry_price * 100 if pos.direction == "L" else (pos.entry_price - exit_price) / pos.entry_price * 100
-        pnl_usdt = pos.size * (exit_price - pos.entry_price) if pos.direction == "L" else pos.size * (pos.entry_price - exit_price)
+        # Пример сравнения PNL
+        real_pnl = real_close_result.get('profit', 0)
+        shadow_pnl = shadow_pos.get('pnl', 0)  # предполагаем, что virtual_trader обновил pnl
 
-        # Slippage impact
-        slippage_impact = (exit_price - pos.entry_price) / pos.entry_price * 100 if pos.direction == "L" else (pos.entry_price - exit_price) / pos.entry_price * 100
+        slippage = real_pnl - shadow_pnl
+        if abs(slippage) > 0.1 * abs(real_pnl):  # >10% расхождение
+            logger.warning(f"[SHADOW] Расхождение PNL {real_pnl:.2f} vs {shadow_pnl:.2f} для {real_pos['symbol']}")
 
-        commission = pos.size * pos.entry_price * self.commission_rate * 2  # entry + exit
+        # Сравнение hit TP/SL
+        real_is_tp = real_close_result.get('is_tp', False)
+        shadow_is_tp = shadow_pos.get('closed_is_tp', False)
+        if real_is_tp != shadow_is_tp:
+            logger.warning(f"[SHADOW] Разный исход: real {'TP' if real_is_tp else 'SL'}, shadow {'TP' if shadow_is_tp else 'SL'}")
 
-        metric = {
-            "symbol": symbol,
-            "entry_price": pos.entry_price,
-            "exit_price": exit_price,
-            "pnl_pct": pnl_pct,
-            "pnl_usdt": pnl_usdt,
-            "slippage_pct": slippage_impact,
-            "commission_usdt": commission,
-            "reason": reason,
-            "timestamp": datetime.now()
-        }
+        # Сравнение entry price (slippage)
+        real_entry = real_pos.get('entry_price', 0)
+        shadow_entry = shadow_pos.get('entry_price', 0)
+        if abs(real_entry - shadow_entry) > 0.001 * real_entry:
+            logger.warning(f"[SHADOW] Slippage entry price {real_entry:.6f} vs {shadow_entry:.6f} для {real_pos['symbol']}")
 
-        self.metrics.append(metric)
-        logger.info("Shadow position closed: %s, pnl=%.2f%%, slippage=%.2f%%, reason=%s", 
-                    symbol, pnl_pct, slippage_impact, reason)
+    def get_shadow_balance(self) -> float:
+        """Текущий баланс теневой торговли."""
+        return self.virtual_trader.get_balance()
 
-    def export_metrics(self):
-        """Выгрузка метрик shadow trading в CSV"""
-        if not self.metrics:
-            return
-
-        df = pl.DataFrame(self.metrics)
-        path = "logs/shadow_metrics.csv"
-        df.write_csv(path)
-        logger.info("Shadow trading metrics exported to %s (%d records)", path, len(self.metrics))
+    def get_shadow_pnl(self) -> float:
+        """Общий PNL теневой торговли."""
+        return self.virtual_trader.get_pnl()

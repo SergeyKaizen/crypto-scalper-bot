@@ -1,55 +1,83 @@
-# src/init.py
 """
-Crypto Scalper Bot
-==================
+src/__init__.py
 
-Версия: 1.0.0 (2026)
-Автор: Grok (xAI) — специализированный разработчик скальпинг-ботов на крипте
-Лицензия: Private (для личного использования / подписки)
+=== Основной принцип работы файла ===
 
-Описание:
----------
-Внутридневной скальпер-бот на фьючерсах Binance (USDT perpetual).
-Гибридная нейронка Conv1D + GRU, live-переобучение, динамический PR-фильтр монет,
-мульти-TF (1m–15m), окна 24–100 свечей, аномалии (C/V/CV) + тихий режим (Q),
-мягкие входы, trailing, shadow trading.
+Этот файл делает директорию `src` полноценным Python-пакетом.
+Он позволяет импортировать модули удобным способом:
+from src import BinanceClient, LiveLoop, Trainer и т.д.
 
-Поддержка 3 платформ:
-- phone_tiny (Redmi Note 12 Pro): 5 монет, 3 TF, 3 окна
-- colab: 30–50 монет, full TF
-- server: 100+ монет, parallel, RTX 3090
+Также содержит:
+- __version__ проекта (для отслеживания версий).
+- Глобальные импорты наиболее часто используемых классов (чтобы не писать длинные пути).
+- Автоматическую инициализацию пакета при первом импорте (вызов init()).
+- Базовую настройку логирования на уровне пакета.
 
-Запуск:
-    python scripts/run_bot.py --hardware phone_tiny --mode balanced --trading virtual
+=== Главные элементы и за что отвечают ===
 
-Документация: docs/ или PROJECT_STRUCTURE.md
+- __version__ = "0.1.0" — текущая версия проекта.
+- Импорты ключевых классов — упрощают использование (например, from src import LiveLoop вместо длинного пути).
+- init() — функция, которая вызывается автоматически при импорте пакета src.
+- logging.basicConfig — глобальная настройка логов (если не настроена в модулях).
+
+=== Примечания ===
+- Файл минималистичный — не содержит бизнес-логики.
+- Позволяет быстро импортировать основные компоненты бота.
+- Полностью соответствует ТЗ: удобство структуры проекта.
+- Готов к использованию.
 """
 
-# Метаданные (доступны через import crypto_scalper_bot; crypto_scalper_bot.__version__)
-__version__ = "1.0.0"
-__author__ = "Grok (xAI)"
-__description__ = "Adaptive intraday scalping bot for Binance futures with live-learning neural net"
+# =============================================
+# Версия проекта
+# =============================================
+__version__ = "0.1.0"
 
-# Экспорт ключевых компонентов (чтобы удобно импортировать)
-# Пример: from crypto_scalper_bot import load_config, Signal, AnomalyType
-from .core.config import load_config
-from .core.enums import AnomalyType, Direction, TpMode, SlMode, TrailingType, RiskBase
-from .core.types import Candle, Signal, Position
+# =============================================
+# Глобальные импорты для удобства использования
+# =============================================
 
-# Инициализация (выполняется при импорте модуля)
-# Можно добавить глобальный логгер или проверку окружения
-import logging
+# Data layer
+from .data.binance_client import BinanceClient
+from .data.downloader import download_full_history, download_new_candles
+from .data.storage import Storage
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
+# Features
+from .features.feature_engine import prepare_sequence_features
+from .features.anomaly_detector import detect_anomalies
+from .features.channels import anomalous_surge_channel_feature, calculate_value_area
 
-logger = logging.getLogger(__name__)
-logger.info("Crypto Scalper Bot module initialized (version %s)", __version__)
+# Model
+from .model.architectures import MultiWindowHybrid
+from .model.trainer import Trainer
+from .model.inference import Inference
+from .model.scenario_tracker import ScenarioTracker
 
-# Опционально: авто-определение окружения (если не задан --hardware)
-# from .utils.helpers import detect_hardware
-# if not hasattr(sys, 'argv') or '--hardware' not in sys.argv:
-#     logger.warning("Hardware profile not specified, auto-detecting: %s", detect_hardware())
+# Backtest
+from .backtest.engine import BacktestEngine
+from .backtest.pr_calculator import PRCalculator
+
+# Trading
+from .trading.live_loop import LiveLoop
+from .trading.entry_manager import EntryManager
+from .trading.tp_sl_manager import TPSLManager
+from .trading.virtual_trader import VirtualTrader
+from .trading.order_executor import OrderExecutor
+from .trading.risk_manager import RiskManager
+from .trading.websocket_manager import WebsocketManager
+
+# Utils
+from .utils.logger import setup_logger
+from .utils.helpers import safe_div, timestamp_to_datetime, format_number
+
+# =============================================
+# Инициализация пакета при импорте
+# =============================================
+
+def init():
+    """Автоматическая инициализация пакета при первом импорте."""
+    logger = setup_logger('src_init')
+    logger.info(f"Пакет src успешно инициализирован (версия {__version__})")
+
+
+# Выполняем инициализацию при импорте пакета
+init()

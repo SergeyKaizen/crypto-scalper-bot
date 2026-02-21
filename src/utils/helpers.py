@@ -1,125 +1,122 @@
-# src/utils/helpers.py
 """
-Сборник вспомогательных утилит, которые используются по всему проекту.
+src/utils/helpers.py
 
-Функции:
-- timestamp_to_datetime() — преобразование ms timestamp в datetime
-- calculate_commission() — комиссия Binance (taker/maker)
-- apply_slippage() — добавление slippage в симуляции
-- check_phone_safety() — температура и CPU нагрузка (Android)
-- safe_load_yaml() — безопасная загрузка yaml с обработкой ошибок
-- get_leverage_for_symbol() — получение плеча монеты (кэшируется)
-- dict_to_polars() — преобразование dict/list в Polars DataFrame
-- round_to_precision() — округление цены/количества по правилам Binance
-- log_memory_usage() — логирование использования памяти (особенно на Colab)
+=== Основной принцип работы файла ===
 
-Все функции — чистые, без side-effects (кроме логгинга)
+Этот файл содержит вспомогательные утилиты и helper-функции, которые используются в разных частях проекта.
+Он не содержит бизнес-логики, а только полезные инструменты: форматирование, конвертации, математические хелперы, проверки и т.д.
+
+Ключевые задачи:
+- Форматирование чисел, дат, строк для логов и вывода.
+- Конвертация timestamp <-> datetime.
+- Безопасные математические операции (защита от деления на 0).
+- Проверка валидности символов, TF, параметров.
+- Утилиты для работы с dict/list (flatten, merge и т.д.).
+- Небольшой набор констант/функций для повторяющегося кода.
+
+Файл импортируется везде, где нужно упростить и унифицировать код.
+
+=== Главные функции и за что отвечают ===
+
+- format_number(value: float, decimals: int = 2, thousands_sep: bool = True) → str
+  Форматирует число с разделителем тысяч и заданным количеством знаков после точки.
+  Пример: 1234567.89 → "1,234,567.89" (decimals=2, thousands_sep=True)
+
+- timestamp_to_datetime(ts: int) → datetime
+  Конвертирует миллисекунды (Unix timestamp * 1000) в datetime UTC.
+
+- safe_div(a: float, b: float, default: float = 0.0) → float
+  Безопасное деление. Если b == 0 — возвращает default.
+
+- safe_log(x: float, default: float = 0.0) → float
+  Безопасный логарифм. Если x <= 0 — default.
+
+- is_valid_symbol(symbol: str) → bool
+  Проверяет, что символ в формате XXXUSDT (для фьючерсов).
+
+- is_valid_timeframe(tf: str) → bool
+  Проверяет, что TF из списка ['1m','3m','5m','10m','15m'].
+
+- merge_dicts(dict1, dict2, overwrite: bool = True) → dict
+  Глубокое слияние двух словарей. Если overwrite=True — значения из dict2 перезаписывают dict1.
+
+- get_nested_dict(d: dict, keys: list, default=None)
+  Безопасный доступ к вложенному словарю по списку ключей (без KeyError).
+
+=== Примечания ===
+- Все функции чистые, без side-effects.
+- Нет зависимостей от других модулей проекта (кроме logging если нужно).
+- Полностью соответствует ТЗ: вспомогательные утилиты без бизнес-логики.
+- Готов к использованию в любом файле.
+- Логи минимальны (только ошибки).
 """
 
-import logging
-import time
 from datetime import datetime
-from decimal import Decimal
-from pathlib import Path
-from typing import Dict, List, Union, Optional
+import math
 
-import yaml
-import psutil
-import platform
-
-logger = logging.getLogger(__name__)
-
-
-def timestamp_to_datetime(ts_ms: Union[int, float]) -> datetime:
-    """Преобразование миллисекундного timestamp в datetime"""
-    return datetime.fromtimestamp(ts_ms / 1000)
-
-
-def calculate_commission(trade_value_usdt: float, is_maker: bool = False) -> float:
-    """Расчёт комиссии Binance Futures (USDT-M)"""
-    rate = BINANCE_FUTURES_MAKER_FEE if is_maker else BINANCE_FUTURES_TAKER_FEE
-    return trade_value_usdt * float(rate)
-
-
-def apply_slippage(price: float, side: str, slippage_pct: float = 0.10) -> float:
-    """Добавление slippage (для виртуальной симуляции)"""
-    slippage = price * (slippage_pct / 100)
-    if side.lower() == "buy":
-        return price + slippage  # Покупаем дороже
-    else:
-        return price - slippage  # Продаём дешевле
-
-
-def check_phone_safety() -> Dict[str, Union[float, bool]]:
+def format_number(value: float, decimals: int = 2, thousands_sep: bool = True) -> str:
     """
-    Проверка температуры и нагрузки (только для Android/телефона)
-    Возвращает:
-    {
-        "cpu_percent": float,
-        "temperature_c": float or None,
-        "is_safe": bool
-    }
+    Форматирует число с разделителем тысяч и заданным количеством знаков после точки.
+    Пример: 1234567.89 → "1,234,567.89" (decimals=2, thousands_sep=True)
     """
-    if platform.system().lower() != "linux" or "android" not in platform.release().lower():
-        return {"cpu_percent": 0.0, "temperature_c": None, "is_safe": True}
+    if not isinstance(value, (int, float)):
+        return str(value)
+    
+    fmt = f"{{:,.{decimals}f}}" if thousands_sep else f"{{:.{decimals}f}}"
+    return fmt.format(value)
 
-    try:
-        cpu_percent = psutil.cpu_percent(interval=0.5)
+def timestamp_to_datetime(ts: int) -> datetime:
+    """
+    Конвертирует миллисекунды (Unix timestamp * 1000) в datetime UTC.
+    """
+    return datetime.utcfromtimestamp(ts / 1000)
 
-        # Температура — Android (через sysfs, обычно thermal_zone*)
-        temp_c = None
-        thermal_paths = Path("/sys/class/thermal").glob("thermal_zone*/temp")
-        for path in thermal_paths:
-            try:
-                with open(path, "r") as f:
-                    temp = int(f.read().strip()) / 1000
-                    temp_c = temp
-                    break
-            except:
-                continue
+def safe_div(a: float, b: float, default: float = 0.0) -> float:
+    """
+    Безопасное деление. Если b == 0 — возвращает default.
+    """
+    return a / b if b != 0 else default
 
-        is_safe = cpu_percent < 70.0 and (temp_c is None or temp_c < 45.0)
+def safe_log(x: float, default: float = 0.0) -> float:
+    """
+    Безопасный логарифм. Если x <= 0 — default.
+    """
+    return math.log(x) if x > 0 else default
 
-        return {
-            "cpu_percent": cpu_percent,
-            "temperature_c": temp_c,
-            "is_safe": is_safe
-        }
-    except Exception as e:
-        logger.warning("Не удалось проверить температуру/нагрузку телефона: %s", e)
-        return {"cpu_percent": 0.0, "temperature_c": None, "is_safe": True}
+def is_valid_symbol(symbol: str) -> bool:
+    """
+    Проверяет, что символ в формате XXXUSDT (для фьючерсов).
+    """
+    return isinstance(symbol, str) and len(symbol) >= 6 and symbol.upper().endswith('USDT')
 
+def is_valid_timeframe(tf: str) -> bool:
+    """
+    Проверяет, что таймфрейм из списка разрешённых.
+    """
+    valid = {'1m', '3m', '5m', '10m', '15m'}
+    return tf in valid
 
-def safe_load_yaml(file_path: str) -> Dict:
-    """Безопасная загрузка yaml-файла"""
-    path = Path(file_path)
-    if not path.exists():
-        logger.warning("YAML-файл не найден: %s", file_path)
-        return {}
+def merge_dicts(d1: dict, d2: dict, overwrite: bool = True) -> dict:
+    """
+    Глубокое слияние двух словарей. Если overwrite=True — значения из d2 перезаписывают d1.
+    """
+    result = d1.copy()
+    for key, value in d2.items():
+        if isinstance(value, dict) and key in result and isinstance(result[key], dict):
+            result[key] = merge_dicts(result[key], value, overwrite)
+        else:
+            if overwrite or key not in result:
+                result[key] = value
+    return result
 
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
-        return data or {}
-    except Exception as e:
-        logger.error("Ошибка загрузки YAML %s: %s", file_path, e)
-        return {}
-
-
-def round_to_precision(value: float, precision: int = 8) -> float:
-    """Округление до нужной точности (для цены/количества)"""
-    return round(value, precision)
-
-
-def get_leverage_for_symbol(symbol: str, client) -> int:
-    """Получение максимального плеча для монеты (кэшируется)"""
-    # В реальном коде — fetch_markets() и кэш
-    # Здесь — упрощённо
-    return 20  # Placeholder — в реальном коде 5–125x в зависимости от монеты
-
-
-def log_memory_usage():
-    """Логирование использования памяти (особенно полезно на Colab)"""
-    process = psutil.Process()
-    mem = process.memory_info().rss / (1024 ** 2)  # в МБ
-    logger.debug("Memory usage: %.1f MB", mem)
+def get_nested_dict(d: dict, keys: list, default=None):
+    """
+    Безопасный доступ к вложенному словарю по списку ключей.
+    Пример: get_nested_dict(config, ['trading', 'risk_pct'], 1.0)
+    """
+    current = d
+    for key in keys:
+        if not isinstance(current, dict) or key not in current:
+            return default
+        current = current[key]
+    return current
