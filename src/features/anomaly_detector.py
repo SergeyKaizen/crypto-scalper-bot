@@ -3,165 +3,173 @@ src/features/anomaly_detector.py
 
 === Основной принцип работы файла ===
 
-Этот файл реализует детекцию всех типов аномалий строго по ТЗ:
-- Свечная аномалия (C): размер последней свечи > (средний размер + среднее отклонение) за lookback=25 свечей.
-- Объёмная аномалия (V): объём > percentile threshold (95–99%) + фильтр по dominance (taker_buy) и положению относительно VAH/VAL.
-- Комбинированная (CV): одновременно C и V true.
-- Quiet (Q): отсутствие любой аномалии (C=V=CV=0) — для входа по паттернам без всплесков.
+Детекция аномалий по ТЗ:
+- C — свечная (размер свечи > средний + отклонение, но < 2× среднего)
+- V — объёмная (объём > средний × 1.5)
+- CV — оба условия
+- Q — отсутствие аномалий (quiet)
 
-Дополнительно:
-- Для volume и CV: свеча должна быть вне VA (над VAH или под VAL) или пересекать границу (по ТЗ).
-- Порог dominance_pct (например, >70% buy/sell) — настраивается в config.
-- Все расчёты векторизованы (polars/pandas), возвращают dict с bool и strength (для фильтрации слабых сигналов).
+Ключевые особенности (после всех уточнений):
+- Нет жёсткого требования пересечения VA / delta VA (модель сама учится)
+- Мульти-TF consensus: аномалия на младшем TF подтверждается минимум на min_tf_consensus старших TF
+- Quiet streak count — количество последовательных Q (сбрасывается при любой аномалии)
+- delta VA используется только как optional фича для усиления (не блокирует сигнал)
 
-Результаты подаются в feature_engine (для binary признаков) и entry_manager (для открытия позиций).
+Возвращает dict[tf][window] → {'type', 'confirmed', 'consensus_count', 'quiet_streak', ...}
 
-=== Главные функции и за что отвечают ===
+=== Главные функции ===
 
-- detect_anomalies(df: pd.DataFrame, tf_minutes: int, current_window: int) → dict
-  Основная функция: детектит C, V, CV, Q для последней свечи.
-  df — последние свечи (минимум lookback + 1).
-  current_window — размер текущего окна (для VA period).
-
-- _detect_candle_anomaly(df: pd.DataFrame) → (bool, float)
-  Свечная аномалия по ТЗ: mean_size + mean_abs_deviation.
-
-- _detect_volume_anomaly(df: pd.DataFrame, tf_minutes: int) → (bool, float)
-  Объёмная: percentile + dominance_pct + фильтр VAH/VAL.
-
-- _detect_cv_anomaly(candle_anom: bool, volume_anom: bool) → bool
-  Комбинированная: candle и volume одновременно true.
-
-- _is_outside_va(close: float, vah: float, val: float) → bool
-  Проверка: close > vah или close < val.
+- detect_anomalies(features_by_tf: dict, current_tf: str) → dict
+- _detect_single_tf(features, timeframe)
+- _get_consensus_score(anomaly_type, tf_anomalies, current_tf)
+- _check_candle_anomaly, _check_volume_anomaly
+- _check_delta_va_confirm (опционально)
 
 === Примечания ===
-- Lookback=25 для аномалий (по ТЗ).
-- VA period = current_window (24/50/74/100).
-- Thresholds в config (percentile_level, dominance_threshold_pct).
-- Нет заглушек — все аномалии реализованы.
-- Логи только критичные ошибки.
+- Consensus только для младших TF (1m, 3m, 5m) — старшие (10m, 15m) подтверждают сами себя
+- Quiet streak пока глобальный — в live_loop лучше сделать dict[symbol][tf]
+- Config: va_confirm_enabled (по умолчанию false), min_tf_consensus (по умолчанию 2)
 """
 
-import polars as pl
-import pandas as pd
 import numpy as np
-from typing import Tuple, Dict
-
-from src.features.channels import calculate_value_area
 from src.core.config import load_config
-from src.utils.logger import setup_logger
 
-logger = setup_logger('anomaly_detector', logging.INFO)
+# Глобальный quiet streak (в реальности per-symbol/per-tf в live_loop)
+quiet_streak = 0
 
-LOOKBACK = 25  # из ТЗ для аномалий
-MIN_PERC = 0.94
-MAX_PERC = 0.99
+TF_ORDER = ['1m', '3m', '5m', '10m', '15m']  # от младшего к старшему
 
-def detect_anomalies(df: pd.DataFrame, tf_minutes: int, current_window: int) -> Dict[str, bool]:
+def detect_anomalies(features_by_tf: dict, current_tf: str) -> dict:
     """
-    Детектит все аномалии для последней свечи.
-    df — DataFrame с колонками open, high, low, close, volume, bid, ask.
-    tf_minutes — длительность TF в минутах (1,3,5,10,15).
-    current_window — размер текущего окна для VA period.
-    Возвращает {'candle': bool, 'volume': bool, 'cv': bool, 'q': bool}
-    """
-    if len(df) < LOOKBACK + 1:
-        logger.warning("Недостаточно данных для детекции аномалий")
-        return {'candle': False, 'volume': False, 'cv': False, 'q': False}
-
-    df_pl = pl.from_pandas(df)
-
-    candle_anom, candle_strength = _detect_candle_anomaly(df_pl)
-    volume_anom, volume_strength = _detect_volume_anomaly(df_pl, tf_minutes, current_window)
-
-    cv_anom = candle_anom and volume_anom
-
-    q = not (candle_anom or volume_anom or cv_anom)
-
-    return {
-        'candle': candle_anom,
-        'volume': volume_anom,
-        'cv': cv_anom,
-        'q': q
-    }
-
-def _detect_candle_anomaly(df: pl.DataFrame) -> Tuple[bool, float]:
-    """
-    Свечная аномалия строго по ТЗ.
-    - candle_size_pct = (high - low) / high * 100
-    - mean_size = средний размер за LOOKBACK прошлых свечей
-    - deviation_i = |size_i - mean_size|
-    - mean_deviation = среднее отклонение
-    - threshold = mean_size + mean_deviation
-    - Аномалия = size_last > threshold
-    """
-    past = df.slice(-LOOKBACK - 1, LOOKBACK)  # прошлые LOOKBACK без текущей
-    current = df[-1]
-
-    sizes_pct = ((past['high'] - past['low']) / past['high'].clip_min(1e-8)) * 100
-    mean_size = sizes_pct.mean()
-    deviations = (sizes_pct - mean_size).abs()
-    mean_deviation = deviations.mean()
-
-    threshold = mean_size + mean_deviation
-    current_size_pct = ((current['high'] - current['low']) / current['high'].clip_min(1e-8)) * 100
-
-    is_anomaly = current_size_pct > threshold
-    strength = current_size_pct / threshold if threshold > 0 else 0.0
-
-    return bool(is_anomaly), float(strength)
-
-def _detect_volume_anomaly(df: pl.DataFrame, tf_minutes: int, window_size: int) -> Tuple[bool, float]:
-    """
-    Объёмная аномалия по ТЗ с фильтром VAH/VAL.
-    - Прошлые LOOKBACK свечей: percentile threshold (95–99%).
-    - Нормализация по range (как в примере).
-    - Dominance: ask/bid dominance_pct = (ask - bid) / volume * 100
-    - Аномалия только если свеча вне VA (close > vah or close < val).
+    Главная функция: детекция по всем TF + consensus + quiet streak
     """
     config = load_config()
-    percentile_level = config.get('anomaly', {}).get('volume_percentile', 0.97)
-    dominance_threshold = config.get('anomaly', {}).get('dominance_threshold_pct', 60.0)
+    min_consensus = config.get('min_tf_consensus', 2)
+    va_confirm_enabled = config.get('va_confirm_enabled', False)
 
-    past = df.slice(-LOOKBACK - 1, LOOKBACK)
-    current = df[-1]
+    # Детекция по каждому TF отдельно
+    tf_anomalies = {}
+    for tf in TF_ORDER:
+        if tf in features_by_tf:
+            tf_anomalies[tf] = _detect_single_tf(features_by_tf[tf], tf)
 
-    vols = past['volume']
-    if len(vols) == 0:
-        return False, 0.0
+    # Результат только для текущего TF
+    result = {}
+    current_anomalies = tf_anomalies.get(current_tf, {})
 
-    # Percentile threshold
-    sorted_vols = vols.sort()
-    idx = int(percentile_level * (len(sorted_vols) - 1))
-    perc_threshold = sorted_vols[idx]
+    for window, single_anom in current_anomalies.items():
+        anomaly_type = single_anom['type']
 
-    # Нормализация по ширине текущей свечи (как в примере)
-    ranges = past['high'] - past['low']
-    avg_range = ranges.mean()
-    current_range = current['high'] - current['low']
-    current_range_pct = current_range / current['close'].clip_min(1e-8)
-    norm_factor = avg_range / current_range_pct if current_range_pct > 0 else 1.0
+        # Quiet streak update
+        global quiet_streak
+        if anomaly_type == 'Q':
+            quiet_streak += 1
+        else:
+            quiet_streak = 0
 
-    adjusted_threshold = perc_threshold * max(1.0, norm_factor * 0.8)
+        # Consensus
+        consensus_count = _get_consensus_score(anomaly_type, tf_anomalies, current_tf)
 
-    high_volume = current['volume'] > adjusted_threshold
+        confirmed = (anomaly_type != 'Q') and (consensus_count >= min_consensus)
 
-    # Dominance check
-    dominance_pct = (current['ask'] - current['bid']) / current['volume'].clip_min(1e-8) * 100
-    dominance_ok = abs(dominance_pct) > dominance_threshold
+        # Опциональное VA/delta VA усиление (не блокирующее)
+        va_confirm = True
+        if va_confirm_enabled:
+            va_confirm = _check_delta_va_confirm(single_anom['details'], single_anom.get('half_changes', {}))
 
-    # VA filter
-    va = calculate_value_area(df.to_pandas().tail(window_size), period=window_size)
-    vah = va.get('vah', current['close'])
-    val = va.get('val', current['close'])
-    outside_va = (current['close'] > vah) or (current['close'] < val)
+        result[window] = {
+            'type': anomaly_type,
+            'confirmed': confirmed and va_confirm,
+            'consensus_count': consensus_count,
+            'quiet_streak': quiet_streak,
+            'delta_confirm': va_confirm,
+            'details': single_anom.get('details', {})
+        }
 
-    is_anomaly = high_volume and dominance_ok and outside_va
-    strength = current['volume'] / adjusted_threshold if adjusted_threshold > 0 else 0.0
+    return {current_tf: result}
 
-    return bool(is_anomaly), float(strength)
 
-def _is_outside_va(close: float, vah: float, val: float) -> bool:
-    """Проверка нахождения цены вне Value Area."""
-    return close > vah or close < val
+def _detect_single_tf(features: dict, timeframe: str) -> dict:
+    """Детекция аномалий на одном TF по всем окнам"""
+    anomalies = {}
+    for window, w_feats in features.items():
+        half_feats = w_feats.get('half_changes', {})
+
+        candle_ok = _check_candle_anomaly(w_feats, half_feats)
+        volume_ok = _check_volume_anomaly(w_feats, half_feats)
+
+        if candle_ok and volume_ok:
+            anomaly_type = 'CV'
+        elif candle_ok:
+            anomaly_type = 'C'
+        elif volume_ok:
+            anomaly_type = 'V'
+        else:
+            anomaly_type = 'Q'
+
+        anomalies[window] = {
+            'type': anomaly_type,
+            'details': {
+                'volatility_anom': w_feats.get('volatility_increased', 0),
+                'delta_positive': w_feats.get('delta_positive', 0),
+                'delta_increased': w_feats.get('delta_increased', 0),
+            },
+            'half_changes': half_feats
+        }
+
+    return anomalies
+
+
+def _check_candle_anomaly(w_feats: dict, half_feats: dict) -> bool:
+    """Свечная аномалия по ТЗ (без жёсткого VA)"""
+    volatility_mean = w_feats.get('volatility_mean', 0)
+    candle_size_pct = (w_feats['high'].iloc[-1] - w_feats['low'].iloc[-1]) / w_feats['close'].iloc[-1] * 100
+
+    is_anom_size = candle_size_pct > volatility_mean * 1.0
+
+    # Игнор сверхбольших свечей (по ТЗ)
+    if candle_size_pct > volatility_mean * 2.0:
+        return False
+
+    return is_anom_size
+
+
+def _check_volume_anomaly(w_feats: dict, half_feats: dict) -> bool:
+    """Объёмная аномалия по ТЗ"""
+    volume_mean = w_feats.get('volume_mean', 0)
+    last_volume = w_feats['volume'].iloc[-1]
+
+    return last_volume > volume_mean * 1.5
+
+
+def _get_consensus_score(anomaly_type: str, tf_anomalies: dict, current_tf: str) -> int:
+    """
+    Подсчёт подтверждений на старших TF
+    """
+    if anomaly_type == 'Q':
+        return 0
+
+    current_idx = TF_ORDER.index(current_tf)
+    consensus = 1  # сам себя
+
+    for i in range(current_idx + 1, len(TF_ORDER)):
+        other_tf = TF_ORDER[i]
+        if other_tf not in tf_anomalies:
+            continue
+
+        for other_anom in tf_anomalies[other_tf].values():
+            if other_anom['type'] == anomaly_type:
+                consensus += 1
+                break  # достаточно одной аномалии на TF
+
+    return consensus
+
+
+def _check_delta_va_confirm(w_feats: dict, half_feats: dict) -> bool:
+    """Опциональное усиление delta VA (не блокирующее)"""
+    delta_positive = w_feats.get('delta_positive', 0) == 1
+    delta_increased = w_feats.get('delta_increased', 0) == 1
+    vah_crossed = half_feats.get('current_crossed_delta_vah', 0) == 1
+    val_crossed = half_feats.get('current_crossed_delta_val', 0) == 1
+
+    return (delta_positive or delta_increased) and (vah_crossed or val_crossed)

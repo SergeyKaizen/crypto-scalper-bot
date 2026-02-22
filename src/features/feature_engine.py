@@ -3,225 +3,176 @@ src/features/feature_engine.py
 
 === Основной принцип работы файла ===
 
-Этот файл — центральный модуль feature engineering.
-Он берёт сырые свечи из storage (open, high, low, close, volume, bid, ask) и вычисляет 
-все признаки, требуемые ТЗ, строго без лишних индикаторов (RSI, MACD и т.п. полностью удалены).
+Этот файл отвечает за полный расчёт всех признаков (features) для подачи в модель.
+Он работает на последовательностях свечей (time series sequences) для каждого таймфрейма и каждого окна (24, 50, 74, 100 свечей).
 
-Признаки делятся на:
-1. Базовые по половинам и окнам (24, 50, 74, 100 свечей):
-   - Bid, Ask, Delta (mean по половине, delta % между половинами)
-   - Price change внутри половины и delta между ними
-   - Volatility (средний размер свечи в % + delta между половинами)
-   - Dist от средней цены (dist1_pct, dist2_pct, dist_delta_pct, mean_delta_pct)
-   - Price channel (позиция в канале, breakout upper/lower)
-   - VAH/VAL/POC (позиция цены относительно VA, delta между половинами)
+Основные задачи:
+- Вычисление базовых признаков: volume, bid, ask, delta, price change, volatility, средние цены половин
+- Расчёт ценового канала (anomalous_surge_channel_feature)
+- Расчёт Value Area (VA) и delta Value Area (POC, VAH, VAL) для каждого окна
+- Генерация сравнений между половинами окна (left vs right)
+- Генерация новых delta-признаков: binary (delta_positive, delta_increased), количественных (delta_change_pct, norm_dist_to_delta_vah и др.)
+- Формирование последовательности фич (shape: [seq_len, n_features]) для Conv1D+GRU
 
-2. Binary состояния для half_comparator: increased/decreased, above/below, crossed и т.д.
-
-3. Вычисление по всем таймфреймам и окнам — возвращает dict[tf][window] = features_df
-
-Всё векторизовано через polars для скорости (особенно на сервере), но работает и на pandas (для телефона).
-Нет заглушек — все признаки реализованы полностью по ТЗ.
+Признаки используются в inference, trainer и scenario_tracker.
+Все расчёты производятся для последних N свечей (seq_len=100 по умолчанию).
 
 === Главные функции и за что отвечают ===
 
-- compute_features_for_tf(tf: str, df: pd.DataFrame) → dict[window_size: pd.DataFrame]
-  Основная функция: для одного TF берёт свечи, делит на окна (24/50/74/100), 
-  вычисляет все признаки по половинам каждого окна.
+1. compute_features(df: pd.DataFrame, windows: list[int] = [24,50,74,100], seq_len: int = 100)
+   → Основная функция: возвращает dict[tf][window] → pd.DataFrame или np.array последовательностей фич
 
-- _compute_half_features(half_df: pd.DataFrame) → dict
-  Вычисляет признаки для одной половины: mean_bid, mean_ask, delta, price_change_pct, volatility_mean, mean_price, dist_pct и т.д.
+2. _compute_half_comparison(features_left, features_right)
+   → Сравнение левой и правой половины окна (включая delta)
 
-- _compute_channel_features(df: pd.DataFrame, period: int) → pd.Series
-  Rolling max/min на mid, position in channel, breakout signals.
-
-- _compute_va_features(df: pd.DataFrame, period: int) → dict
-  Вызывает channels.calculate_value_area, вычисляет position (close относительно VAL/VAH), binary above_vah/below_val.
-
-- prepare_sequence_features(symbol: str, tf: str, window_size: int) → pd.DataFrame
-  Готовит последовательность для модели: признаки + binary состояния + аномалии (C/V/CV/Q).
+3. _add_delta_features(va_dict, current_price, half_delta_change)
+   → Генерация дополнительных delta-признаков
 
 === Примечания ===
-- Все признаки scale-invariant (% изменения).
-- Binary состояния — 0/1 для подачи в модель (Conv1D+GRU).
-- Период VA = размер окна (24→period=24 и т.д.).
-- Нет внешних индикаторов — строго ТЗ.
-- Логи через setup_logger.
+- Для каждого окна считается VA и delta VA отдельно → позволяет модели видеть multi-scale imbalance
+- Binary признаки (0/1) удобны для сценариев и бинарной статистики
+- Количественные признаки нормализованы (где возможно) для стабильности обучения
+- Если окно слишком маленькое (<30 свечей) — delta VA может быть шумным → можно добавить фильтр в будущем
 """
 
-import polars as pl
-import pandas as pd
 import numpy as np
-from typing import Dict, Optional
+import pandas as pd
 
-from src.data.storage import Storage
-from src.features.channels import calculate_value_area, anomalous_surge_channel_feature
-from src.utils.logger import setup_logger
+from src.features.channels import anomalous_surge_channel_feature, calculate_volume_profile_va
+from src.core.config import load_config
 
-logger = setup_logger('feature_engine', logging.INFO)
-
-WINDOW_SIZES = [24, 50, 74, 100]  # из ТЗ
-
-def compute_features_for_tf(tf: str, df_raw: pd.DataFrame) -> Dict[int, pd.DataFrame]:
+def compute_features(
+    df: pd.DataFrame,
+    windows: list[int] = [24, 50, 74, 100],
+    seq_len: int = 100
+) -> dict:
     """
-    Основная функция: вычисляет все признаки для одного TF.
-    df_raw — DataFrame из storage с колонками open, high, low, close, volume, bid, ask.
-    Возвращает dict[window_size: features_df] — признаки по каждому окну.
+    Основная функция расчёта всех признаков для одного таймфрейма.
+
+    Параметры:
+    ----------
+    df : pd.DataFrame
+        Свечи с колонками: open, high, low, close, volume, bid, ask
+    windows : list[int]
+        Окна для multi-window анализа
+    seq_len : int
+        Длина последовательности для модели (обычно 100)
+
+    Возвращает:
+    ----------
+    dict[window_size] → pd.DataFrame или np.array последовательностей фич
     """
-    # Конвертируем в polars для скорости
-    df = pl.from_pandas(df_raw.reset_index()).with_columns(
-        pl.col("timestamp").cast(pl.Datetime)
-    ).sort("timestamp")
+    config = load_config()
+    features_by_window = {}
 
-    result = {}
+    # Базовая защита
+    if len(df) < seq_len:
+        return {}
 
-    for window in WINDOW_SIZES:
-        if len(df) < window:
-            logger.warning(f"Недостаточно данных для окна {window} ({len(df)} свечей)")
+    recent = df.tail(seq_len).copy()
+
+    # 1. Базовые признаки (по всей последовательности)
+    recent['mid_price'] = (recent['open'] + recent['close']) / 2
+    recent['range_pct'] = (recent['high'] - recent['low']) / recent['close'] * 100
+    recent['delta'] = recent['ask'] - recent['bid']
+    recent['delta_pct'] = recent['delta'] / recent['volume'].replace(0, np.nan) * 100
+
+    # 2. Ценовой канал (на весь seq_len или отдельно по окнам — здесь на весь)
+    recent = anomalous_surge_channel_feature(recent, period=seq_len)
+
+    # 3. Для каждого окна — полный расчёт VA и delta VA
+    for w in windows:
+        if len(recent) < w:
             continue
 
-        # Разделяем на sliding windows (каждое окно — последние N свечей)
-        # Для простоты берём последние полные окна
-        features_list = []
-        for i in range(window - 1, len(df)):
-            window_df = df.slice(i - window + 1, window)
+        window_df = recent.tail(w).copy()
 
-            half_len = window // 2
-            left_half = window_df.slice(0, half_len)
-            right_half = window_df.slice(half_len, half_len)
+        # Делим окно на две половины
+        half = w // 2
+        left = window_df.iloc[:half]
+        right = window_df.iloc[half:]
 
-            half_features = _compute_half_features(left_half, right_half)
+        # --- Стандартный VA ---
+        va_std = calculate_volume_profile_va(
+            window_df,
+            window=w,
+            va_percentage=config.get('va_percentage', 0.70),
+            price_bin_step_pct=config.get('price_bin_step_pct', 0.002),
+            use_delta=False
+        )
 
-            # Channel и VA для всего окна
-            channel_feats = _compute_channel_features(window_df.to_pandas(), period=window)
-            va_feats = _compute_va_features(window_df.to_pandas(), period=window)
+        # --- Delta VA ---
+        va_delta = calculate_volume_profile_va(
+            window_df,
+            window=w,
+            va_percentage=config.get('va_percentage', 0.70),
+            price_bin_step_pct=config.get('price_bin_step_pct', 0.002),
+            use_delta=True
+        )
 
-            # Собираем всё в dict
-            row = {
-                'timestamp': window_df['timestamp'][-1],
-                **half_features,
-                **channel_feats,
-                **va_feats
-            }
-            features_list.append(row)
+        # --- Сравнение половин (базовые + delta) ---
+        left_va_delta = calculate_volume_profile_va(left, window=half, use_delta=True)
+        right_va_delta = calculate_volume_profile_va(right, window=half, use_delta=True)
 
-        if features_list:
-            features_df = pd.DataFrame(features_list).set_index('timestamp')
-            result[window] = features_df
+        delta_change_pct = 0.0
+        if not np.isnan(left_va_delta['total_volume']) and left_va_delta['total_volume'] > 0:
+            delta_change_pct = (
+                (right_va_delta['total_volume'] - left_va_delta['total_volume'])
+                / left_va_delta['total_volume'] * 100
+            ) if not np.isnan(right_va_delta['total_volume']) else 0.0
 
-    return result
+        current_price = window_df['close'].iloc[-1]
 
-def _compute_half_features(left: pl.DataFrame, right: pl.DataFrame) -> dict:
+        # --- Базовые признаки для окна ---
+        window_features = {
+            'volume_mean': window_df['volume'].mean(),
+            'delta_mean': window_df['delta'].mean(),
+            'volatility_mean': window_df['range_pct'].mean(),
+            'price_change_pct': (window_df['close'].iloc[-1] - window_df['close'].iloc[0]) / window_df['close'].iloc[0] * 100,
+            # Ценовой канал (последние значения)
+            'asc_position': window_df['asc_position_in_channel'].iloc[-1],
+            # Стандартный VA
+            'poc_dist_norm': (current_price - va_std['poc_price']) / (va_std['vah'] - va_std['val']) if va_std['vah'] != va_std['val'] else 0,
+            'in_va': 1 if va_std['val'] <= current_price <= va_std['vah'] else 0,
+            'above_vah': 1 if current_price > va_std['vah'] else 0,
+            'below_val': 1 if current_price < va_std['val'] else 0,
+            # Delta VA признаки
+            'delta_poc_dist_norm': (current_price - va_delta['poc_price']) / (va_delta['vah'] - va_delta['val']) if va_delta['vah'] != va_delta['val'] else 0,
+            'delta_positive': 1 if va_delta['total_volume'] > 0 else 0,          # общая delta > 0
+            'delta_increased': 1 if delta_change_pct > 0 else 0,                 # выросла во второй половине
+            'delta_change_pct': delta_change_pct,
+            'norm_dist_to_delta_vah': (current_price - va_delta['vah']) / va_delta['vah'] * 100 if va_delta['vah'] != 0 else 0,
+            'norm_dist_to_delta_val': (current_price - va_delta['val']) / va_delta['val'] * 100 if va_delta['val'] != 0 else 0,
+            # Можно добавить ещё: delta_poc_shift, delta_vah_shift и т.д.
+        }
+
+        # Сохраняем для окна
+        features_by_window[w] = window_features
+
+    return features_by_window
+
+
+def prepare_sequence_features(
+    df: pd.DataFrame,
+    seq_len: int = 100,
+    windows: list[int] = [24, 50, 74, 100]
+) -> np.ndarray:
     """
-    Вычисляет признаки для левой и правой половины.
-    Возвращает dict с mean_bid1/2, delta_bid_pct, price_change1/2, volatility_mean1/2 и т.д.
+    Подготавливает последовательность фич для подачи в модель (Conv1D input).
+    Для каждой свечи в seq_len собирает признаки из всех окон.
     """
-    # Средние по половине
-    mean_bid1 = left['bid'].mean()
-    mean_bid2 = right['bid'].mean()
-    mean_ask1 = left['ask'].mean()
-    mean_ask2 = right['ask'].mean()
+    features_list = []
 
-    delta1 = (mean_bid1 - mean_ask1) / (mean_bid1 + mean_ask1 + 1e-8) * 100 if (mean_bid1 + mean_ask1) > 0 else 0
-    delta2 = (mean_bid2 - mean_ask2) / (mean_bid2 + mean_ask2 + 1e-8) * 100 if (mean_bid2 + mean_ask2) > 0 else 0
+    for i in range(len(df) - seq_len + 1):
+        window_df = df.iloc[i:i+seq_len]
+        feats = compute_features(window_df, windows=windows, seq_len=seq_len)
 
-    # Price change внутри половины
-    if len(left) > 0 and len(right) > 0:
-        price_change1 = (left['close'][-1] - left['close'][0]) / left['close'][0] * 100 if left['close'][0] != 0 else 0
-        price_change2 = (right['close'][-1] - right['close'][0]) / right['close'][0] * 100 if right['close'][0] != 0 else 0
-    else:
-        price_change1 = price_change2 = 0
+        # Преобразуем в плоский вектор (можно оптимизировать)
+        flat_feats = []
+        for w in windows:
+            if w in feats:
+                flat_feats.extend(list(feats[w].values()))
 
-    # Volatility
-    left_size_pct = ((left['high'] - left['low']) / left['high'].clip_min(1e-8)) * 100
-    right_size_pct = ((right['high'] - right['low']) / right['high'].clip_min(1e-8)) * 100
-    vol_mean1 = left_size_pct.mean()
-    vol_mean2 = right_size_pct.mean()
+        features_list.append(flat_feats)
 
-    # Средняя цена и dist
-    mean_price1 = left['close'].mean()
-    mean_price2 = right['close'].mean()
-    dist1_pct = (left['close'][-1] - mean_price1) / mean_price1 * 100 if mean_price1 != 0 else 0
-    dist2_pct = (right['close'][-1] - mean_price2) / mean_price2 * 100 if mean_price2 != 0 else 0
-    mean_delta_pct = (mean_price2 - mean_price1) / mean_price1 * 100 if mean_price1 != 0 else 0
-
-    return {
-        'mean_bid1': mean_bid1, 'mean_bid2': mean_bid2,
-        'delta_bid_pct': (mean_bid2 - mean_bid1) / mean_bid1 * 100 if mean_bid1 != 0 else 0,
-        'mean_ask1': mean_ask1, 'mean_ask2': mean_ask2,
-        'delta_ask_pct': (mean_ask2 - mean_ask1) / mean_ask1 * 100 if mean_ask1 != 0 else 0,
-        'delta1': delta1, 'delta2': delta2,
-        'delta_delta_pct': delta2 - delta1,
-        'price_change1': price_change1, 'price_change2': price_change2,
-        'price_delta_pct': price_change2 - price_change1,
-        'volatility_mean1': vol_mean1, 'volatility_mean2': vol_mean2,
-        'volatility_delta_pct': (vol_mean2 - vol_mean1) / vol_mean1 * 100 if vol_mean1 != 0 else 0,
-        'dist1_pct': dist1_pct, 'dist2_pct': dist2_pct,
-        'dist_delta_pct': dist2_pct - dist1_pct,
-        'mean_delta_pct': mean_delta_pct
-    }
-
-def _compute_channel_features(df: pd.DataFrame, period: int) -> dict:
-    """
-    Вычисляет признаки ценового канала (по ТЗ rolling max/min mid).
-    Возвращает dict с position, breakout_upper/lower для последней свечи.
-    """
-    df_channel = anomalous_surge_channel_feature(df, period=period)
-    last_row = df_channel.iloc[-1]
-
-    return {
-        'channel_position': last_row['asc_position_in_channel'],
-        'channel_breakout_upper': 1 if last_row['asc_norm_dist_to_upper'] > 0 else 0,
-        'channel_breakout_lower': 1 if last_row['asc_norm_dist_to_lower'] < 0 else 0
-    }
-
-def _compute_va_features(df: pd.DataFrame, period: int) -> dict:
-    """
-    Вычисляет признаки Value Area (VAH/VAL/POC).
-    Период = размер окна.
-    Возвращает position относительно VA, binary above_vah / below_val.
-    """
-    va = calculate_value_area(df, period=period)
-    if not va or 'vah' not in va or 'val' not in va:
-        return {'va_position': 0.5, 'above_vah': 0, 'below_val': 0}
-
-    close_last = df['close'].iloc[-1]
-    vah = va['vah']
-    val = va['val']
-
-    if vah == val:  # degenerate case
-        va_width = 1e-8
-    else:
-        va_width = vah - val
-
-    position = (close_last - val) / va_width
-    position = np.clip(position, 0, 1)
-
-    return {
-        'va_position': position,
-        'above_vah': 1 if close_last > vah else 0,
-        'below_val': 1 if close_last < val else 0
-    }
-
-def prepare_sequence_features(symbol: str, tf: str, window_size: int = 100) -> Optional[pd.DataFrame]:
-    """
-    Готовит последовательность признаков для модели.
-    Берёт последние window_size свечей, вычисляет признаки.
-    Используется в inference и trainer.
-    """
-    storage = Storage()
-    df = storage.get_candles(symbol, tf, end_ts=None)  # все свечи
-
-    if len(df) < window_size:
-        logger.warning(f"Недостаточно данных для {symbol} {tf} (окно {window_size})")
-        return None
-
-    df_window = df.tail(window_size)
-
-    # Вычисляем признаки для этого окна
-    features = compute_features_for_tf(tf, df_window)
-
-    if window_size not in features:
-        return None
-
-    return features[window_size]
+    return np.array(features_list)

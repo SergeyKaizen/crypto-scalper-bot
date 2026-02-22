@@ -3,149 +3,150 @@ src/model/architectures.py
 
 === Основной принцип работы файла ===
 
-Этот файл содержит архитектуру гибридной модели Conv1D + GRU по ТЗ.
-Модель обрабатывает мульти-TF и мульти-окна последовательности:
-- Отдельные ветки Conv1D + GRU для каждого таймфрейма (1m,3m,5m,10m,15m).
-- Для каждого TF — отдельные входы по окнам (24,50,74,100 свечей).
-- Fusion: concatenation hidden states всех веток → Dense слои → бинарный выход (вероятность профитной сделки).
+Гибридная архитектура Conv1D + Bidirectional GRU для предсказания вероятности профитной сделки.
 
-Ключевые особенности:
-- Input — dict[tf: dict[window: tensor(seq_len, num_features)]]
-- Conv1D для локальных паттернов в последовательности.
-- GRU для долгосрочной памяти и переходов между половинами.
-- Dropout и BatchNorm для регуляризации.
-- Масштабирование по hardware (hidden_size, num_layers из config).
-- Выход — sigmoid (вероятность 0..1).
+Ключевые особенности (по ТЗ + все утверждённые изменения):
+- Multi-TF input: 5 отдельных тензоров (1m,3m,5m,10m,15m)
+- Отдельная Conv1D ветка на каждый TF → concat hidden states → fusion Dense
+- Bidirectional GRU для захвата контекста с обеих сторон последовательности
+- Input shape: (batch, seq_len, n_features) на каждый TF
+- n_features динамический (рассчитывается в trainer/inference)
+- Масштабирование: model_size ('small'/'medium'/'large') под Colab/server
+- Dropout, BatchNorm для снижения оверфита на шумных данных крипты
+- Выход: sigmoid вероятность профита (>0.5 → сигнал на вход)
 
-Модель полностью соответствует ТЗ: гибрид Conv1D+GRU, sequences (не статичные признаки), мульти-TF fusion.
+=== Главные классы ===
 
-=== Главные классы и за что отвечают ===
-
-- WindowBranch(nn.Module): ветка для одного окна (Conv1D → GRU)
-- MultiWindowHybrid(nn.Module): основная модель — dict веток по TF и окнам, fusion
-
-- forward(inputs: dict) → torch.Tensor (вероятность)
-  Обрабатывает dict входов, возвращает вероятность профитной сделки.
+- ConvBranch — Conv1D ветка для одного TF
+- HybridMultiTFConvGRU — основная модель
 
 === Примечания ===
-- Input_dim = количество признаков из feature_engine (все признаки ТЗ).
-- Hidden_size и num_layers масштабируются по hardware (phone_tiny — меньше).
-- Нет лишних слоёв — строго Conv1D + GRU + fusion.
-- Готов к обучению в trainer.py и inference.
-- Логи через setup_logger (если нужно).
+- Bidirectional GRU: hidden_size * 2 на выходе
+- Fusion: concat по всем TF → Linear → GRU
+- Поддержка extra фич (quiet_streak) через n_features
+- На сервере ('large') — больше слоёв/нейронов
 """
 
 import torch
 import torch.nn as nn
-
+import torch.nn.functional as F
 from src.core.config import load_config
-from src.core.enums import Timeframe
-from src.utils.logger import setup_logger
 
-logger = setup_logger('architectures', logging.INFO)
-
-class WindowBranch(nn.Module):
-    """
-    Ветка для одного окна (одного периода свечей).
-    Conv1D → GRU → hidden state.
-    """
-    def __init__(self, input_dim: int, hidden_size: int, num_layers: int = 1, dropout: float = 0.2):
+class ConvBranch(nn.Module):
+    """Conv1D ветка для одного таймфрейма"""
+    def __init__(self, in_channels, hidden_size):
         super().__init__()
-        self.conv = nn.Conv1d(
-            in_channels=input_dim,
-            out_channels=hidden_size,
-            kernel_size=3,
-            padding=1
-        )
-        self.bn = nn.BatchNorm1d(hidden_size)
-        self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(dropout)
+        self.conv1 = nn.Conv1d(in_channels, hidden_size // 2, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(hidden_size // 2, hidden_size, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm1d(hidden_size // 2)
+        self.bn2 = nn.BatchNorm1d(hidden_size)
+        self.pool = nn.AdaptiveAvgPool1d(1)
 
+    def forward(self, x):
+        # x: (batch, seq_len, features) → (batch, features, seq_len)
+        x = x.transpose(1, 2)
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = self.pool(x).squeeze(-1)  # (batch, hidden_size)
+        return x
+
+
+class HybridMultiTFConvGRU(nn.Module):
+    def __init__(self, n_features: int, num_tf: int = 5, seq_len: int = 100,
+                 hidden_size: int = 128, dropout: float = 0.3, model_size: str = 'medium'):
+        super().__init__()
+        self.num_tf = num_tf
+        self.seq_len = seq_len
+        self.n_features = n_features
+
+        # Масштабирование под железо
+        if model_size == 'large':
+            hidden_size *= 2
+            gru_layers = 3
+        elif model_size == 'small':
+            hidden_size //= 2
+            gru_layers = 1
+        else:
+            gru_layers = 2
+
+        # Conv ветки для каждого TF
+        self.conv_branches = nn.ModuleList([
+            ConvBranch(n_features, hidden_size) for _ in range(num_tf)
+        ])
+
+        # Fusion после concat
+        fusion_in = hidden_size * num_tf
+        self.fusion_dense = nn.Linear(fusion_in, hidden_size * 2)
+        self.bn_fusion = nn.BatchNorm1d(hidden_size * 2)
+
+        # Bidirectional GRU
         self.gru = nn.GRU(
-            input_size=hidden_size,
+            input_size=hidden_size * 2,
             hidden_size=hidden_size,
-            num_layers=num_layers,
+            num_layers=gru_layers,
             batch_first=True,
-            dropout=dropout if num_layers > 1 else 0
+            bidirectional=True,
+            dropout=dropout if gru_layers > 1 else 0.0
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (batch, seq_len, features) → (batch, features, seq_len) для Conv1D
-        x = x.permute(0, 2, 1)
-        x = self.conv(x)
-        x = self.bn(x)
-        x = self.relu(x)
-        x = self.dropout(x)
-        x = x.permute(0, 2, 1)  # обратно (batch, seq_len, hidden)
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_size * 2, 1)  # *2 из-за bidirectional
 
-        _, hn = self.gru(x)
-        return hn[-1]  # last hidden state (batch, hidden_size)
-
-class MultiWindowHybrid(nn.Module):
-    """
-    Гибридная модель Conv1D + GRU с мульти-TF и мульти-окнами.
-    Входы: dict[tf_str: dict[window_int: tensor(batch, seq_len, features)]]
-    Выход: вероятность профитной сделки (sigmoid).
-    """
-    def __init__(self, input_dim: int):
-        super().__init__()
-        config = load_config()
-        hidden_size = config['model']['hidden_size']
-        num_layers = config['model']['num_gru_layers']
-        dropout = config['model']['dropout']
-
-        self.branches = nn.ModuleDict()
-        for tf_enum in Timeframe:
-            tf_key = tf_enum.value  # '1m', '3m' и т.д.
-            self.branches[tf_key] = nn.ModuleDict()
-
-            for window in config['windows_sizes']:  # [24,50,74,100]
-                branch = WindowBranch(
-                    input_dim=input_dim,
-                    hidden_size=hidden_size,
-                    num_layers=num_layers,
-                    dropout=dropout
-                )
-                self.branches[tf_key][str(window)] = branch
-
-        # Fusion
-        num_branches = len(Timeframe) * len(config['windows_sizes'])
-        fusion_in = hidden_size * num_branches
-        self.fusion = nn.Sequential(
-            nn.Linear(fusion_in, hidden_size * 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size * 2, hidden_size),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size, 1),
-            nn.Sigmoid()  # вероятность 0..1
-        )
-
-    def forward(self, inputs: Dict[str, Dict[str, torch.Tensor]]) -> torch.Tensor:
+    def forward(self, inputs: list):
         """
-        inputs: {
-            '1m': { '24': tensor(batch, seq_len, features), '50': ..., ... },
-            '3m': { ... },
-            ...
-        }
+        inputs: list of tensors, len=5 (по TF)
+        каждый: (batch, seq_len, n_features)
         """
-        hidden_states = []
+        if len(inputs) != self.num_tf:
+            raise ValueError(f"Ожидается {self.num_tf} входов по TF, получено {len(inputs)}")
 
-        for tf_key in self.branches:
-            if tf_key not in inputs:
-                continue  # TF может отсутствовать в батче
-            for window_str in self.branches[tf_key]:
-                if window_str not in inputs[tf_key]:
-                    continue
-                x = inputs[tf_key][window_str]  # (batch, seq_len, features)
-                h = self.branches[tf_key][window_str](x)  # (batch, hidden_size)
-                hidden_states.append(h)
+        # Обработка каждого TF отдельно
+        branch_outputs = []
+        for i, branch in enumerate(self.conv_branches):
+            branch_outputs.append(branch(inputs[i]))
 
-        if not hidden_states:
-            raise ValueError("Нет входных данных для модели")
+        # Concat по TF
+        fused = torch.cat(branch_outputs, dim=1)  # (batch, hidden_size * num_tf)
 
-        # Concat всех hidden states
-        concat = torch.cat(hidden_states, dim=1)  # (batch, hidden_size * num_branches)
-        out = self.fusion(concat)  # (batch, 1)
-        return out.squeeze(-1)  # (batch,)
+        # Fusion Dense + BN
+        fused = F.relu(self.bn_fusion(self.fusion_dense(fused)))
+
+        # Подготовка для GRU: добавляем dim seq_len=1
+        fused = fused.unsqueeze(1)  # (batch, 1, hidden_size*2)
+
+        # Bidirectional GRU
+        gru_out, _ = self.gru(fused)
+        gru_out = gru_out[:, -1, :]  # last hidden (batch, hidden_size*2)
+
+        out = self.dropout(gru_out)
+        out = torch.sigmoid(self.fc(out))  # вероятность профита [0,1]
+
+        return out
+
+
+def build_model(config):
+    """
+    Фабрика модели под текущий config
+    """
+    n_features = config.get('n_features', 128)  # должно быть рассчитано заранее
+    seq_len = config.get('seq_len', 100)
+    num_tf = len(config['timeframes'])  # 5
+    model_size = config.get('model_size', 'medium')
+    dropout = config.get('dropout', 0.3)
+    hidden_size = config.get('hidden_size', 128)
+
+    model = HybridMultiTFConvGRU(
+        n_features=n_features,
+        num_tf=num_tf,
+        seq_len=seq_len,
+        hidden_size=hidden_size,
+        dropout=dropout,
+        model_size=model_size
+    )
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    model.eval()  # по умолчанию inference mode
+
+    logger.info(f"Модель построена: {model_size}, TF: {num_tf}, features: {n_features}, seq_len: {seq_len}")
+    return model

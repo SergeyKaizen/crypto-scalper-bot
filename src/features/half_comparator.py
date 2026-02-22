@@ -3,162 +3,160 @@ src/features/half_comparator.py
 
 === Основной принцип работы файла ===
 
-Этот файл реализует сравнение двух половин периода (левая/старая vs правая/свежая) для каждого окна и таймфрейма.
-Он берёт признаки из feature_engine и вычисляет:
-- Binary состояния: увеличился/уменьшился (increased/decreased) для каждого признака.
-- Процентные изменения (pct_diff) между половинами.
-- Последовательные паттерны (если нужно — простая разница, без сложных последовательностей пока).
-- Binary флаги аномалий и условий: C, V, CV, Q (Q = отсутствие C/V/CV).
+Файл отвечает за сравнение левой (старой) и правой (новой) половины окна свечей.
+Это ключевая часть ТЗ: модель видит переход между половинами, выявляет изменения признаков.
 
-Все признаки из ТЗ сравниваются именно так, как описано:
-- Для числовых (delta, price_change, volatility, dist, mean_delta и т.д.) — delta = value2 - value1, pct = (value2 - value1)/value1 * 100
-- Binary: 1 если value2 > value1 (increased), 0 иначе (decreased или равно)
-- Для зон (channel, VA): binary crossed_upper/lower, above/below, delta позиции
+Для каждого окна (24/50/74/100) делим данные на две равные части:
+- left: первые half свечей
+- right: вторые half свечей
 
-Результат — dict[feature]: {'binary': 0/1, 'pct_change': float, 'value1': float, 'value2': float}
-Это подаётся в модель как часть последовательности (Conv1D видит изменения между половинами).
+Расчёт:
+- Количественные изменения (pct, absolute) для всех 12 базовых признаков из ТЗ
+- Полное сравнение delta VA (poc_shift, vah/val shifts, width change, expanded)
+- Binary флаги: increased/decreased, positive/negative, crossed_delta_vah и т.д.
+- Всё возвращается в dict для feature_engine
 
 === Главные функции и за что отвечают ===
 
-- compare_halves(features_left: dict, features_right: dict) → dict
-  Основная функция: сравнивает признаки левой и правой половины.
-  Возвращает словарь с binary + pct_change для всех признаков ТЗ.
+1. compare_halves(window_df: pd.DataFrame, window_size: int, va_std: dict, va_delta: dict)
+   → Основная функция: возвращает dict с изменениями между половинами
 
-- _compare_numeric(left_val: float, right_val: float) → dict
-  Вспомогательная: binary (increased=1 если right > left), pct_change = (right - left)/left * 100
+2. _compute_base_changes(left, right)
+   → Сравнение 12 базовых признаков из ТЗ (volume, bid, ask, delta и т.д.)
 
-- _compare_zone_position(pos_left: float, pos_right: float) → dict
-  Для channel/VA position: binary crossed_upper (right > upper threshold), delta_position = pos_right - pos_left
-
-- get_anomaly_flags(anomalies: dict) → dict
-  Binary C/V/CV/Q на основе anomaly_detector результатов.
-  Q = 1 если все аномалии False.
+3. _compute_delta_va_changes(va_left, va_right, current_price)
+   → Сравнение delta VA (poc_shift, vah/val shift, width_change, expanded, crossed)
 
 === Примечания ===
-- Все расчёты по ТЗ — без лишних признаков.
-- Обработка zero-division: +1e-8 в знаменателе.
-- Binary 1/0 — для прямой подачи в модель (Conv1D/GRU).
-- Логи минимальны, только ошибки.
-- Полностью готов к интеграции в inference и trainer.
+- Все % изменения считаются относительно left (старой половины)
+- Защита от деления на 0 (fillna 0 или small epsilon)
+- Binary флаги используются в sequential паттернах и сценариях
+- Количественные изменения clipping'уются в feature_engine
 """
 
-from typing import Dict, Any
 import numpy as np
+import pandas as pd
 
-from src.utils.logger import setup_logger
-
-logger = setup_logger('half_comparator', logging.INFO)
-
-def compare_halves(left_features: Dict[str, Any], right_features: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+def compare_halves(
+    window_df: pd.DataFrame,
+    window_size: int,
+    va_std: dict,
+    va_delta: dict,
+    current_price: float
+) -> dict:
     """
-    Сравнивает признаки левой и правой половины.
-    Возвращает dict[feature_name]: {
-        'binary': 0/1 (increased=1),
-        'pct_change': float (% изменения),
-        'value1': left_value,
-        'value2': right_value
-    }
+    Сравнивает левую и правую половину окна.
+
+    Параметры:
+    ----------
+    window_df : pd.DataFrame
+        Свечи окна (24/50/74/100)
+    window_size : int
+        Размер окна
+    va_std : dict
+        Результат calculate_volume_profile_va(use_delta=False)
+    va_delta : dict
+        Результат calculate_volume_profile_va(use_delta=True)
+    current_price : float
+        Текущая цена закрытия
+
+    Возвращает:
+    ----------
+    dict с количественными и бинарными изменениями
     """
-    comparison = {}
+    half = window_size // 2
+    left = window_df.iloc[:half]
+    right = window_df.iloc[half:]
 
-    # Числовые признаки (из ТЗ)
-    numeric_features = [
-        'mean_bid', 'mean_ask', 'delta', 'price_change', 'volatility_mean',
-        'dist_pct', 'mean_delta_pct', 'delta_delta_pct', 'price_delta_pct',
-        'volatility_delta_pct', 'channel_position', 'va_position'
-    ]
+    changes = {}
 
-    for feat in numeric_features:
-        left_val = left_features.get(feat, 0.0)
-        right_val = right_features.get(feat, 0.0)
+    # 1. Базовые признаки (из ТЗ)
+    changes.update(_compute_base_changes(left, right))
 
-        # Binary: 1 если right > left (increased)
-        binary = 1 if right_val > left_val else 0
+    # 2. Delta VA изменения
+    va_left = calculate_volume_profile_va(left, window=half, use_delta=True)
+    va_right = calculate_volume_profile_va(right, window=half, use_delta=True)
 
-        # Pct change
-        pct_change = (right_val - left_val) / (left_val + 1e-8) * 100 if left_val != 0 else 0.0
+    changes.update(_compute_delta_va_changes(va_left, va_right, current_price, va_delta))
 
-        comparison[feat] = {
-            'binary': binary,
-            'pct_change': pct_change,
-            'value1': left_val,
-            'value2': right_val
-        }
+    return changes
 
-    # Зоны: channel и VA (binary crossed/above/below)
-    for zone_feat in ['channel_breakout_upper', 'channel_breakout_lower', 'above_vah', 'below_val']:
-        left_val = left_features.get(zone_feat, 0)
-        right_val = right_features.get(zone_feat, 0)
 
-        # Binary: 1 если в правой половине true
-        binary = 1 if right_val == 1 else 0
-
-        # Delta — простая разница (0/1)
-        delta = right_val - left_val
-
-        comparison[zone_feat] = {
-            'binary': binary,
-            'delta': delta,
-            'value1': left_val,
-            'value2': right_val
-        }
-
-    return comparison
-
-def get_anomaly_flags(anomaly_results: Dict[str, bool]) -> Dict[str, int]:
+def _compute_base_changes(left: pd.DataFrame, right: pd.DataFrame) -> dict:
     """
-    Вычисляет binary флаги аномалий и Q.
-    anomaly_results: {'candle': bool, 'volume': bool, 'cv': bool}
-    Q = 1 если все False.
+    Сравнение 12 базовых признаков из ТЗ
     """
-    c = 1 if anomaly_results.get('candle', False) else 0
-    v = 1 if anomaly_results.get('volume', False) else 0
-    cv = 1 if anomaly_results.get('cv', False) else 0
+    changes = {}
 
-    q = 1 if (c == 0 and v == 0 and cv == 0) else 0
+    # Volume, Bid, Ask, Delta (средние по половине)
+    for col in ['volume', 'bid', 'ask', 'delta']:
+        left_mean = left[col].mean()
+        right_mean = right[col].mean()
+        if left_mean != 0:
+            pct_change = (right_mean - left_mean) / abs(left_mean) * 100
+        else:
+            pct_change = 0.0
+        changes[f'{col}_change_pct'] = pct_change
+        changes[f'{col}_increased'] = 1 if pct_change > 0 else 0
 
-    return {
-        'C': c,
-        'V': v,
-        'CV': cv,
-        'Q': q
-    }
+    # Средние цены половин относительно общей средней
+    total_mid = (left['close'].mean() + right['close'].mean()) / 2
+    left_mid = left['close'].mean()
+    right_mid = right['close'].mean()
+    changes['left_mid_dist_pct'] = (left_mid - total_mid) / total_mid * 100 if total_mid != 0 else 0
+    changes['right_mid_dist_pct'] = (right_mid - total_mid) / total_mid * 100 if total_mid != 0 else 0
+    changes['mid_dist_delta_pct'] = changes['right_mid_dist_pct'] - changes['left_mid_dist_pct']
 
-def compare_sequence_halves(sequence_df: pd.DataFrame) -> pd.DataFrame:
+    # Price change % в половине
+    left_price_change = (left['close'].iloc[-1] - left['close'].iloc[0]) / left['close'].iloc[0] * 100
+    right_price_change = (right['close'].iloc[-1] - right['close'].iloc[0]) / right['close'].iloc[0] * 100
+    changes['price_change_left_pct'] = left_price_change
+    changes['price_change_right_pct'] = right_price_change
+    changes['price_change_diff_pct'] = right_price_change - left_price_change
+    changes['price_change_increased'] = 1 if changes['price_change_diff_pct'] > 0 else 0
+
+    # Volatility (средний range %)
+    left_vol = ((left['high'] - left['low']) / left['close'] * 100).mean()
+    right_vol = ((right['high'] - right['low']) / right['close'] * 100).mean()
+    changes['volatility_change_pct'] = (right_vol - left_vol) / left_vol * 100 if left_vol != 0 else 0
+    changes['volatility_increased'] = 1 if changes['volatility_change_pct'] > 0 else 0
+
+    return changes
+
+
+def _compute_delta_va_changes(va_left: dict, va_right: dict, current_price: float, va_delta: dict) -> dict:
     """
-    Сравнивает последовательность половин для всей последовательности свечей.
-    Используется для подготовки данных в trainer/inference.
-    sequence_df — из prepare_sequence_features, с колонками признаков.
-    Возвращает df с binary и pct_change столбцами.
+    Сравнение delta VA между половинами
     """
-    comparison_rows = []
+    changes = {}
 
-    # Предполагаем, что sequence_df имеет столбцы *_1 и *_2 для половин
-    # Или используем shift для sliding comparison — здесь упрощённо для последних половин
-    # Полная реализация: для каждой строки сравнивать с предыдущей "половиной" (shift)
+    if np.isnan(va_left['poc_price']) or np.isnan(va_right['poc_price']):
+        return changes
 
-    for i in range(1, len(sequence_df)):
-        left = sequence_df.iloc[i-1].to_dict()
-        right = sequence_df.iloc[i].to_dict()
+    # POC shift
+    poc_shift = va_right['poc_price'] - va_left['poc_price']
+    mid_price = (va_left['poc_price'] + va_right['poc_price']) / 2
+    changes['delta_poc_shift_pct'] = poc_shift / mid_price * 100 if mid_price != 0 else 0
+    changes['delta_poc_shift_positive'] = 1 if changes['delta_poc_shift_pct'] > 0 else 0
 
-        comp = compare_halves(left, right)
-        comp['timestamp'] = sequence_df.index[i]
-        comparison_rows.append(comp)
+    # VAH / VAL shift
+    vah_shift = va_right['vah'] - va_left['vah']
+    val_shift = va_right['val'] - va_left['val']
+    changes['delta_vah_shift_pct'] = vah_shift / va_left['vah'] * 100 if va_left['vah'] != 0 else 0
+    changes['delta_val_shift_pct'] = val_shift / va_left['val'] * 100 if va_left['val'] != 0 else 0
 
-    if comparison_rows:
-        comp_df = pd.DataFrame(comparison_rows).set_index('timestamp')
+    # Width change (расширение/сужение delta VA)
+    left_width = va_left['vah'] - va_left['val']
+    right_width = va_right['vah'] - va_right['val']
+    changes['delta_va_width_change_pct'] = (right_width - left_width) / left_width * 100 if left_width != 0 else 0
+    changes['delta_va_expanded'] = 1 if changes['delta_va_width_change_pct'] > 0 else 0
 
-        # Добавляем anomaly flags (если в sequence_df есть аномалии)
-        if 'candle_anomaly' in sequence_df.columns:
-            anomaly_flags = sequence_df[['candle_anomaly', 'volume_anomaly', 'cv_anomaly']].apply(
-                lambda row: get_anomaly_flags({
-                    'candle': row['candle_anomaly'],
-                    'volume': row['volume_anomaly'],
-                    'cv': row['cv_anomaly']
-                }), axis=1
-            )
-            comp_df = pd.concat([comp_df, anomaly_flags], axis=1)
+    # Пересечения в правой половине
+    changes['current_crossed_delta_vah'] = 1 if current_price > va_right['vah'] else 0
+    changes['current_crossed_delta_val'] = 1 if current_price < va_right['val'] else 0
 
-        return comp_df
+    # Общее расстояние до delta VAH/VAL в правой половине
+    changes['norm_dist_to_delta_vah_right'] = (current_price - va_right['vah']) / va_right['vah'] * 100 if va_right['vah'] != 0 else 0
+    changes['norm_dist_to_delta_val_right'] = (current_price - va_right['val']) / va_right['val'] * 100 if va_right['val'] != 0 else 0
 
-    return pd.DataFrame()
+    return changes

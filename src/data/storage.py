@@ -1,333 +1,318 @@
 """
 src/data/storage.py
 
-=== Основной принцип работы файла ===
+Хранилище всех свечных данных + метаданных монет.
+Используем DuckDB как основное решение (быстрее SQLite на больших объёмах, columnar, легко аналитика).
+Fallback — SQLite, если DuckDB по каким-то причинам недоступен.
 
-Этот файл реализует слой хранения данных — абстракцию над базой данных (SQLite для телефона, DuckDB для Colab/сервера).
-Он обеспечивает:
-- создание и управление таблицами candles (свечи с bid/ask), pr_snapshots (PR статистика), whitelist (торгуемые монеты).
-- CRUD операции: save_candles (append или replace), get_last_timestamp, get_candles_range, remove_delisted.
-- Адаптивный выбор БД по hardware (phone_tiny → SQLite, colab/server → DuckDB для скорости на больших данных).
-- Полную совместимость с pandas (to_sql/from_sql) для удобства feature_engine и backtest.
-- Минимальное использование памяти и скорости на мобильном устройстве.
+Основные таблицы:
+- candles_{timeframe}     — отдельная таблица на каждый таймфрейм (1m, 3m, 5m, 10m, 15m)
+- symbols_meta            — метаданные монет (listed_at, delisted, last_update, etc.)
+- whitelist               — текущий список торгуемых монет + их лучшие настройки (tf, window, anomaly_type, direction)
 
-Ключевые таблицы:
-- candles: timestamp, symbol, timeframe, open, high, low, close, volume, bid, ask (индекс по symbol+timeframe+timestamp).
-- pr_snapshots: timestamp, symbol, anomaly_type, direction, tp_hits, sl_hits, pr_value, config_key и т.д.
-- whitelist: symbol, best_tf, best_period, best_anomaly, best_direction, pr_value.
+Ключевые изменения для delisted:
+- remove_delisted(symbols: list[str]) теперь автоматически:
+  - Удаляет свечи из всех candles_*
+  - Помечает delisted=True в symbols_meta
+  - Удаляет из whitelist
+  - Удаляет связанные модели (файлы models/{symbol}_*.pt, если существуют — по ТЗ модели общие, но на случай per-монета)
 
-Файл полностью готов к использованию, без заглушек.
+Методы:
+- save_candles(symbol, timeframe, df, append=True)
+- get_last_timestamp(symbol, timeframe) → int или None
+- get_candles(symbol, timeframe, start_ts=None, end_ts=None) → pd.DataFrame
+- remove_delisted(symbols_to_remove: list[str])
+- update_symbol_meta(symbol, listed_at=None, delisted=False)
+- get_all_symbols() → list[str]
+- get_whitelisted_symbols() → list[str]
+- add_to_whitelist(symbol, tf, window, anomaly_type, direction, pr_value)
+- remove_from_whitelist(symbols: list[str])
+- clear_whitelist()
 
-=== Главные функции и за что отвечают ===
-
-- __init__() — выбирает тип БД по hardware config (SQLite/DuckDB), создаёт подключение и таблицы если нет.
-
-- create_tables() — создаёт схемы candles, pr_snapshots, whitelist с правильными типами и индексами.
-
-- save_candles(symbol, timeframe, df, append=True) — сохраняет DataFrame свечей:
-  - append=True — добавляет новые (по timestamp).
-  - replace — перезаписывает диапазон (для backfill).
-  - Автоматически добавляет symbol/timeframe если нужно.
-
-- get_last_timestamp(symbol, timeframe) → int или None — возвращает timestamp последней свечи в БД для докачки.
-
-- get_candles(symbol, timeframe, start_ts=None, end_ts=None) → pd.DataFrame — извлекает свечи по диапазону (для feature_engine).
-
-- remove_delisted(delisted_symbols) — удаляет все данные по удалённым монетам (из candles и whitelist).
-
-- save_pr_snapshot(...) — сохраняет snapshot PR после сделки в бектесте.
-
-- get_whitelisted_symbols() → list — список монет из whitelist для live.
-
-- update_whitelist(symbol, config_key, pr_value) — обновляет/добавляет лучшую конфигурацию монеты.
-
-=== Примечания ===
-- Выбор БД: phone_tiny → sqlite3 (лёгкий, файл на устройстве), colab/server → duckdb (быстрее на больших данных, in-memory или файл).
-- Все операции thread-safe (DuckDB по умолчанию, SQLite с check_same_thread=False).
-- Логи через setup_logger.
-- Нет внешних зависимостей сверх pandas и duckdb/sqlite3.
 """
 
 import os
-import sqlite3
-import duckdb
+import logging
+from datetime import datetime
 import pandas as pd
-from typing import Optional, List
+try:
+    import duckdb
+    ENGINE = "duckdb"
+except ImportError:
+    import sqlite3
+    ENGINE = "sqlite"
 
 from src.core.config import load_config
 from src.utils.logger import setup_logger
 
-logger = setup_logger('storage', logging.INFO)
+logger = setup_logger("storage", logging.INFO)
 
 class Storage:
     def __init__(self):
-        """
-        Инициализация хранилища.
-        Выбор типа БД по hardware config.
-        Создаёт подключение и таблицы.
-        """
         config = load_config()
-        hardware = config['hardware']['type']  # 'phone_tiny', 'colab', 'server'
+        self.data_dir = config["paths"]["data_dir"]
+        self.models_dir = config["paths"].get("models_dir", os.path.join(self.data_dir, "models"))  # Директория для моделей
+        os.makedirs(self.data_dir, exist_ok=True)
+        os.makedirs(self.models_dir, exist_ok=True)
 
-        if hardware == 'phone_tiny':
-            self.db_type = 'sqlite'
-            db_path = os.path.join(config['paths']['data_dir'], 'crypto_scalper_phone.db')
-            self.conn = sqlite3.connect(db_path, check_same_thread=False)
-            self.conn.execute("PRAGMA journal_mode=WAL")  # улучшает производительность SQLite
+        if ENGINE == "duckdb":
+            self.db_path = os.path.join(self.data_dir, "candles.duckdb")
+            self.con = duckdb.connect(self.db_path)
+            logger.info("Используется DuckDB как хранилище")
         else:
-            self.db_type = 'duckdb'
-            db_path = os.path.join(config['paths']['data_dir'], 'crypto_scalper.db')
-            self.conn = duckdb.connect(db_path)
+            self.db_path = os.path.join(self.data_dir, "candles.sqlite")
+            self.con = sqlite3.connect(self.db_path)
+            logger.warning("DuckDB не найден → используется SQLite (медленнее на больших данных)")
 
-        self.create_tables()
+        self._create_tables()
 
-    def create_tables(self):
-        """Создаёт необходимые таблицы с правильными схемами и индексами."""
-        if self.db_type == 'sqlite':
-            cursor = self.conn.cursor()
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS candles (
-                    timestamp INTEGER,
-                    symbol TEXT,
-                    timeframe TEXT,
-                    open REAL,
-                    high REAL,
-                    low REAL,
-                    close REAL,
-                    volume REAL,
-                    bid REAL,
-                    ask REAL,
-                    PRIMARY KEY (timestamp, symbol, timeframe)
-                )
-            """)
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_candles_symbol_tf ON candles (symbol, timeframe)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_candles_timestamp ON candles (timestamp)")
+    def _create_tables(self):
+        """Создаёт необходимые таблицы, если их нет"""
+        timeframes = load_config()["timeframes"]  # ['1m', '3m', '5m', '10m', '15m']
 
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS pr_snapshots (
-                    timestamp INTEGER,
-                    symbol TEXT,
-                    anomaly_type TEXT,
-                    direction TEXT,
-                    tp_hits INTEGER DEFAULT 0,
-                    sl_hits INTEGER DEFAULT 0,
-                    pr_value REAL,
-                    config_key TEXT,
-                    PRIMARY KEY (timestamp, symbol, anomaly_type, direction)
-                )
-            """)
-
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS whitelist (
-                    symbol TEXT PRIMARY KEY,
-                    best_tf TEXT,
-                    best_period INTEGER,
-                    best_anomaly TEXT,
-                    best_direction TEXT,
-                    pr_value REAL,
-                    last_updated INTEGER
-                )
-            """)
-
-            self.conn.commit()
-
-        else:  # duckdb
-            self.conn.execute("""
-                CREATE TABLE IF NOT EXISTS candles (
-                    timestamp BIGINT,
-                    symbol VARCHAR,
-                    timeframe VARCHAR,
-                    open DOUBLE,
-                    high DOUBLE,
-                    low DOUBLE,
-                    close DOUBLE,
-                    volume DOUBLE,
-                    bid DOUBLE,
-                    ask DOUBLE
-                )
-            """)
-            self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_candles_pk ON candles (timestamp, symbol, timeframe)")
-            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_candles_symbol_tf ON candles (symbol, timeframe)")
-
-            self.conn.execute("""
-                CREATE TABLE IF NOT EXISTS pr_snapshots (
-                    timestamp BIGINT,
-                    symbol VARCHAR,
-                    anomaly_type VARCHAR,
-                    direction VARCHAR,
-                    tp_hits INTEGER DEFAULT 0,
-                    sl_hits INTEGER DEFAULT 0,
-                    pr_value DOUBLE,
-                    config_key VARCHAR
-                )
-            """)
-
-            self.conn.execute("""
-                CREATE TABLE IF NOT EXISTS whitelist (
-                    symbol VARCHAR PRIMARY KEY,
-                    best_tf VARCHAR,
-                    best_period INTEGER,
-                    best_anomaly VARCHAR,
-                    best_direction VARCHAR,
-                    pr_value DOUBLE,
-                    last_updated BIGINT
-                )
-            """)
-
-        logger.info(f"Хранилище инициализировано: {self.db_type.upper()} ({'SQLite' if self.db_type == 'sqlite' else 'DuckDB'})")
-
-    def save_candles(self, symbol: str, timeframe: str, df: pd.DataFrame, append: bool = True):
-        """
-        Сохраняет DataFrame свечей в БД.
-        - append=True: добавляет новые строки (по timestamp).
-        - append=False: replace (удаляет старые и вставляет новые).
-        Автоматически добавляет symbol и timeframe.
-        """
-        df = df.copy()
-        df['symbol'] = symbol
-        df['timeframe'] = timeframe
-        df['timestamp'] = df.index.astype(int) // 10**6  # ms
-
-        if self.db_type == 'sqlite':
-            if append:
-                df.to_sql('candles', self.conn, if_exists='append', index=False)
-            else:
-                # Удаляем существующий диапазон
-                min_ts = df['timestamp'].min()
-                max_ts = df['timestamp'].max()
-                self.conn.execute(
-                    "DELETE FROM candles WHERE symbol=? AND timeframe=? AND timestamp BETWEEN ? AND ?",
-                    (symbol, timeframe, min_ts, max_ts)
-                )
-                df.to_sql('candles', self.conn, if_exists='append', index=False)
-        else:  # duckdb
-            if append:
-                self.conn.register('df_temp', df)
-                self.conn.execute("""
-                    INSERT INTO candles
-                    SELECT * FROM df_temp
-                    ON CONFLICT DO NOTHING
+        for tf in timeframes:
+            table_name = f"candles_{tf.replace('m', '')}m"
+            if ENGINE == "duckdb":
+                self.con.execute(f"""
+                    CREATE TABLE IF NOT EXISTS {table_name} (
+                        symbol      VARCHAR,
+                        timestamp   TIMESTAMP,
+                        open        DOUBLE,
+                        high        DOUBLE,
+                        low         DOUBLE,
+                        close       DOUBLE,
+                        volume      DOUBLE,
+                        bid         DOUBLE,
+                        ask         DOUBLE,
+                        PRIMARY KEY (symbol, timestamp)
+                    )
                 """)
             else:
-                self.conn.register('df_temp', df)
-                self.conn.execute("""
-                    DELETE FROM candles
-                    WHERE symbol = ? AND timeframe = ?
-                    AND timestamp BETWEEN ? AND ?
-                """, (symbol, timeframe, df['timestamp'].min(), df['timestamp'].max()))
-                self.conn.execute("INSERT INTO candles SELECT * FROM df_temp")
+                # SQLite
+                self.con.execute(f"""
+                    CREATE TABLE IF NOT EXISTS {table_name} (
+                        symbol      TEXT,
+                        timestamp   TEXT,
+                        open        REAL,
+                        high        REAL,
+                        low         REAL,
+                        close       REAL,
+                        volume      REAL,
+                        bid         REAL,
+                        ask         REAL,
+                        PRIMARY KEY (symbol, timestamp)
+                    )
+                """)
 
-        logger.debug(f"Сохранено {len(df)} свечей {symbol} {timeframe}")
-
-    def get_last_timestamp(self, symbol: str, timeframe: str) -> Optional[int]:
-        """Возвращает timestamp последней свечи для символа/TF или None."""
-        if self.db_type == 'sqlite':
-            cursor = self.conn.cursor()
-            cursor.execute(
-                "SELECT MAX(timestamp) FROM candles WHERE symbol=? AND timeframe=?",
-                (symbol, timeframe)
-            )
-            result = cursor.fetchone()[0]
+        # Таблица метаданных символов
+        if ENGINE == "duckdb":
+            self.con.execute("""
+                CREATE TABLE IF NOT EXISTS symbols_meta (
+                    symbol      VARCHAR PRIMARY KEY,
+                    listed_at   TIMESTAMP,
+                    delisted    BOOLEAN DEFAULT FALSE,
+                    last_update TIMESTAMP
+                )
+            """)
+            self.con.execute("""
+                CREATE TABLE IF NOT EXISTS whitelist (
+                    symbol          VARCHAR PRIMARY KEY,
+                    tf              VARCHAR,
+                    window          INTEGER,
+                    anomaly_type    VARCHAR,    -- 'C', 'V', 'CV'
+                    direction       VARCHAR,    -- 'L', 'S', 'LS'
+                    pr_value        DOUBLE,
+                    updated_at      TIMESTAMP
+                )
+            """)
         else:
-            result = self.conn.execute(
-                "SELECT MAX(timestamp) FROM candles WHERE symbol=? AND timeframe=?",
-                (symbol, timeframe)
-            ).fetchone()[0]
+            # SQLite аналоги (без BOOLEAN, используем INTEGER 0/1)
+            self.con.execute("""
+                CREATE TABLE IF NOT EXISTS symbols_meta (
+                    symbol      TEXT PRIMARY KEY,
+                    listed_at   TEXT,
+                    delisted    INTEGER DEFAULT 0,
+                    last_update TEXT
+                )
+            """)
+            self.con.execute("""
+                CREATE TABLE IF NOT EXISTS whitelist (
+                    symbol          TEXT PRIMARY KEY,
+                    tf              TEXT,
+                    window          INTEGER,
+                    anomaly_type    TEXT,
+                    direction       TEXT,
+                    pr_value        REAL,
+                    updated_at      TEXT
+                )
+            """)
 
-        return int(result) if result else None
+        self.con.commit()
 
-    def get_candles(self, symbol: str, timeframe: str, start_ts: Optional[int] = None, end_ts: Optional[int] = None) -> pd.DataFrame:
-        """Извлекает свечи по диапазону timestamp (ms)."""
-        query = "SELECT * FROM candles WHERE symbol=? AND timeframe=?"
-        params = [symbol, timeframe]
-
-        if start_ts:
-            query += " AND timestamp >= ?"
-            params.append(start_ts)
-        if end_ts:
-            query += " AND timestamp <= ?"
-            params.append(end_ts)
-
-        query += " ORDER BY timestamp ASC"
-
-        if self.db_type == 'sqlite':
-            df = pd.read_sql_query(query, self.conn, params=params)
-        else:
-            df = self.conn.execute(query, params).df()
-
-        if not df.empty:
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            df.set_index('timestamp', inplace=True)
-
-        return df
-
-    def remove_delisted(self, delisted_symbols: List[str]):
-        """Удаляет все данные по delisted монетам."""
-        if not delisted_symbols:
+    def save_candles(self, symbol: str, timeframe: str, df: pd.DataFrame, append: bool = True):
+        """Сохраняет или добавляет свечи в соответствующую таблицу"""
+        if df.empty:
             return
 
-        symbols_tuple = tuple(delisted_symbols)
+        table_name = f"candles_{timeframe.replace('m', '')}m"
 
-        if self.db_type == 'sqlite':
-            cursor = self.conn.cursor()
-            cursor.execute("DELETE FROM candles WHERE symbol IN ({})".format(','.join('?' * len(delisted_symbols))), delisted_symbols)
-            cursor.execute("DELETE FROM whitelist WHERE symbol IN ({})".format(','.join('?' * len(delisted_symbols))), delisted_symbols)
-            self.conn.commit()
+        # DuckDB любит uppercase колонки → приводим
+        df.columns = [c.upper() for c in df.columns]
+
+        if ENGINE == "duckdb":
+            if append:
+                self.con.execute(f"""
+                    INSERT OR REPLACE INTO {table_name}
+                    SELECT * FROM df
+                """, {"df": df})
+            else:
+                self.con.execute(f"DELETE FROM {table_name} WHERE symbol = ?", [symbol])
+                self.con.execute(f"INSERT INTO {table_name} SELECT * FROM df", {"df": df})
         else:
-            self.conn.execute("DELETE FROM candles WHERE symbol IN ?", (symbols_tuple,))
-            self.conn.execute("DELETE FROM whitelist WHERE symbol IN ?", (symbols_tuple,))
+            # SQLite — чуть сложнее
+            conn = sqlite3.connect(self.db_path)
+            if not append:
+                conn.execute(f"DELETE FROM {table_name} WHERE symbol = ?", (symbol,))
+            df.to_sql(table_name, conn, if_exists="append", index=False)
+            conn.close()
 
-        logger.info(f"Удалены данные для {len(delisted_symbols)} delisted монет")
+        self.con.commit()
+        logger.debug(f"Сохранено {len(df)} свечей {symbol} {timeframe}")
 
-    def save_pr_snapshot(self, timestamp: int, symbol: str, anomaly_type: str, direction: str, tp_hits: int, sl_hits: int, pr_value: float, config_key: str):
-        """Сохраняет snapshot PR после сделки."""
-        data = {
-            'timestamp': timestamp,
-            'symbol': symbol,
-            'anomaly_type': anomaly_type,
-            'direction': direction,
-            'tp_hits': tp_hits,
-            'sl_hits': sl_hits,
-            'pr_value': pr_value,
-            'config_key': config_key
-        }
-
-        df = pd.DataFrame([data])
-
-        if self.db_type == 'sqlite':
-            df.to_sql('pr_snapshots', self.conn, if_exists='append', index=False)
+    def get_last_timestamp(self, symbol: str, timeframe: str) -> int | None:
+        """Возвращает timestamp последней свечи (в миллисекундах) или None"""
+        table_name = f"candles_{timeframe.replace('m', '')}m"
+        if ENGINE == "duckdb":
+            row = self.con.execute(f"""
+                SELECT MAX(timestamp) FROM {table_name} WHERE symbol = ?
+            """, [symbol]).fetchone()
         else:
-            self.conn.register('pr_temp', df)
-            self.conn.execute("INSERT INTO pr_snapshots SELECT * FROM pr_temp")
+            cur = self.con.cursor()
+            cur.execute(f"SELECT MAX(timestamp) FROM {table_name} WHERE symbol = ?", (symbol,))
+            row = cur.fetchone()
+            cur.close()
 
-    def update_whitelist(self, symbol: str, best_tf: str, best_period: int, best_anomaly: str, best_direction: str, pr_value: float):
-        """Обновляет или добавляет лучшую конфигурацию монеты в whitelist."""
-        timestamp = int(datetime.utcnow().timestamp() * 1000)
+        if row and row[0] is not None:
+            if isinstance(row[0], str):  # SQLite
+                dt = datetime.fromisoformat(row[0])
+            else:
+                dt = row[0]
+            return int(dt.timestamp() * 1000)
+        return None
 
-        if self.db_type == 'sqlite':
-            cursor = self.conn.cursor()
-            cursor.execute("""
-                INSERT OR REPLACE INTO whitelist 
-                (symbol, best_tf, best_period, best_anomaly, best_direction, pr_value, last_updated)
+    def get_all_symbols(self) -> list[str]:
+        """Возвращает список всех уникальных символов в candles_* таблицах"""
+        timeframes = load_config()["timeframes"]
+        symbols = set()
+        for tf in timeframes:
+            table = f"candles_{tf.replace('m', '')}m"
+            if ENGINE == "duckdb":
+                rows = self.con.execute(f"SELECT DISTINCT symbol FROM {table}").fetchall()
+            else:
+                cur = self.con.cursor()
+                cur.execute(f"SELECT DISTINCT symbol FROM {table}")
+                rows = cur.fetchall()
+                cur.close()
+            symbols.update([r[0] for r in rows if r[0]])
+        return list(symbols)
+
+    def remove_delisted(self, symbols: list[str]):
+        """Автоматически удаляет все данные по delisted символам:
+        - Свечи из всех candles_*
+        - Записи из whitelist
+        - Помечает delisted=True в symbols_meta
+        - Удаляет связанные модели файлы (models/{symbol}_*.pt, если существуют)
+        """
+        if not symbols:
+            return
+
+        timeframes = load_config()["timeframes"]
+        for symbol in symbols:
+            # Удаление свечей
+            for tf in timeframes:
+                table = f"candles_{tf.replace('m', '')}m"
+                if ENGINE == "duckdb":
+                    self.con.execute(f"DELETE FROM {table} WHERE symbol = ?", [symbol])
+                else:
+                    self.con.execute(f"DELETE FROM {table} WHERE symbol = ?", (symbol,))
+
+            # Помечаем delisted в meta
+            now = datetime.utcnow()
+            if ENGINE == "duckdb":
+                self.con.execute("""
+                    INSERT OR REPLACE INTO symbols_meta (symbol, delisted, last_update)
+                    VALUES (?, TRUE, ?)
+                """, [symbol, now])
+            else:
+                self.con.execute("""
+                    INSERT OR REPLACE INTO symbols_meta (symbol, delisted, last_update)
+                    VALUES (?, 1, ?)
+                """, (symbol, now.isoformat()))
+
+            # Удаление из whitelist
+            if ENGINE == "duckdb":
+                self.con.execute("DELETE FROM whitelist WHERE symbol = ?", [symbol])
+            else:
+                self.con.execute("DELETE FROM whitelist WHERE symbol = ?", (symbol,))
+
+            # Удаление моделей (файлов, если per-монета; по ТЗ модели общие, но на всякий)
+            for file in os.listdir(self.models_dir):
+                if file.startswith(f"{symbol}_") and file.endswith('.pt'):
+                    os.remove(os.path.join(self.models_dir, file))
+                    logger.info(f"Удалена модель {file} для {symbol}")
+
+        self.con.commit()
+        logger.info(f"Удалены данные по {len(symbols)} delisted монетам (включая модели и whitelist)")
+
+    def update_symbol_meta(self, symbol: str, listed_at: datetime = None, delisted: bool = False):
+        """Обновляет метаданные символа"""
+        now = datetime.utcnow()
+        if ENGINE == "duckdb":
+            self.con.execute("""
+                INSERT OR REPLACE INTO symbols_meta (symbol, listed_at, delisted, last_update)
+                VALUES (?, ?, ?, ?)
+            """, [symbol, listed_at, delisted, now])
+        else:
+            self.con.execute("""
+                INSERT OR REPLACE INTO symbols_meta (symbol, listed_at, delisted, last_update)
+                VALUES (?, ?, ?, ?)
+            """, (symbol, listed_at.isoformat() if listed_at else None, 1 if delisted else 0, now.isoformat()))
+        self.con.commit()
+
+    def get_whitelisted_symbols(self) -> list[str]:
+        """Возвращает список торгуемых монет из whitelist"""
+        if ENGINE == "duckdb":
+            rows = self.con.execute("SELECT symbol FROM whitelist").fetchall()
+        else:
+            cur = self.con.cursor()
+            cur.execute("SELECT symbol FROM whitelist")
+            rows = cur.fetchall()
+            cur.close()
+        return [r[0] for r in rows]
+
+    def add_to_whitelist(self, symbol: str, tf: str, window: int, anomaly_type: str, direction: str, pr_value: float):
+        """Добавляет/обновляет запись в whitelist"""
+        now = datetime.utcnow()
+        if ENGINE == "duckdb":
+            self.con.execute("""
+                INSERT OR REPLACE INTO whitelist (symbol, tf, window, anomaly_type, direction, pr_value, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (symbol, best_tf, best_period, best_anomaly, best_direction, pr_value, timestamp))
-            self.conn.commit()
+            """, [symbol, tf, window, anomaly_type, direction, pr_value, now])
         else:
-            self.conn.execute("""
-                INSERT OR REPLACE INTO whitelist 
+            self.con.execute("""
+                INSERT OR REPLACE INTO whitelist (symbol, tf, window, anomaly_type, direction, pr_value, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (symbol, best_tf, best_period, best_anomaly, best_direction, pr_value, timestamp))
+            """, (symbol, tf, window, anomaly_type, direction, pr_value, now.isoformat()))
+        self.con.commit()
 
-    def get_whitelisted_symbols(self) -> List[str]:
-        """Возвращает список символов из whitelist."""
-        if self.db_type == 'sqlite':
-            df = pd.read_sql_query("SELECT symbol FROM whitelist", self.conn)
+    def clear_whitelist(self):
+        """Очищает whitelist"""
+        if ENGINE == "duckdb":
+            self.con.execute("DELETE FROM whitelist")
         else:
-            df = self.conn.execute("SELECT symbol FROM whitelist").df()
-
-        return df['symbol'].tolist()
+            self.con.execute("DELETE FROM whitelist")
+        self.con.commit()
 
     def close(self):
-        """Закрывает соединение (вызывать при shutdown)."""
-        self.conn.close()
-        logger.info("Соединение с хранилищем закрыто.")
+        if hasattr(self, "con"):
+            self.con.close()

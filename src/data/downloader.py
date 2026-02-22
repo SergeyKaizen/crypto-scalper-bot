@@ -13,6 +13,7 @@ src/data/downloader.py
 - Обеспечить устойчивость: retry на ошибки, rate-limit handling через client, многопоточный режим с ограничением workers.
 - Параллельная скачка по символам (chunks), но последовательная по TF внутри символа.
 - Прогресс-бар (tqdm) для удобства мониторинга.
+- Добавлена поддержка ротации прокси: если в config['proxies'] список dicts, создаётся пул клиентов с разными прокси для распределения нагрузки и обхода лимитов.
 
 Файл полностью готов к использованию в scripts/download_full.py и live_loop.py.
 
@@ -23,11 +24,13 @@ src/data/downloader.py
   - Делит на chunks по max_workers.
   - В каждом worker скачивает все TF для своего набора символов (с since=None, limit=1000 в цикле).
   - Сохраняет в storage.candles.
+  - Использует ротацию клиентов с прокси для многопоточной работы.
 
 - download_new_candles(symbol, timeframe) — докачивает только новые свечи после последней в БД:
   - Получает last_timestamp из storage.
   - fetch_klines с since=last_timestamp + 1ms.
   - Добавляет в БД (append).
+  - Для простоты использует основной клиент; если нужно ротацию — можно добавить по аналогии с full_history.
 
 - _download_symbol_tfs(symbol, timeframes, client) — внутренняя функция для одного символа:
   - Последовательно по TF скачивает историю.
@@ -43,7 +46,7 @@ src/data/downloader.py
 === Примечания ===
 - Многопоточность: max_workers из hardware config (phone=4, colab=8, server=16).
 - Rate-limit безопасность: ccxt встроенный + sleep 0.1–0.3 сек между запросами.
-- Прокси: передаются в client.
+- Прокси: ротация через пул клиентов, если config['proxies'] не пуст.
 - Нет заглушек — всё для реальной работы.
 - Логи через setup_logger.
 """
@@ -95,22 +98,33 @@ def _download_symbol_tfs(symbol: str, timeframes: list, client: BinanceClient, s
 def download_full_history():
     """
     Полная скачка истории для всех монет и TF.
-    Использует многопоточность по символам.
+    Использует многопоточность по символам с ротацией прокси через пул клиентов.
     """
     config = load_config()
-    client = BinanceClient()
+    proxies_list = config.get('proxies', [])  # list of dicts, e.g. [{'http': 'proxy:port', 'https': 'proxy:port'}]
+
+    # Создаём пул клиентов: каждый с своим прокси, если есть; иначе один клиент
+    if proxies_list:
+        clients = [BinanceClient(proxies=p) for p in proxies_list]
+    else:
+        clients = [BinanceClient()]
+
+    # Используем первый клиент для общих вызовов (update_markets_list не зависит от прокси)
+    main_client = clients[0]
     storage = Storage()
 
-    symbols = client.update_markets_list()
+    symbols = main_client.update_markets_list()
     timeframes = config['timeframes']  # ['1m', '3m', '5m', '10m', '15m']
 
     max_workers = config['hardware']['max_workers']  # из phone/colab/server.yaml
 
-    logger.info(f"Скачивание полной истории: {len(symbols)} монет, {len(timeframes)} TF, workers={max_workers}")
+    logger.info(f"Скачивание полной истории: {len(symbols)} монет, {len(timeframes)} TF, workers={max_workers}, proxies={len(clients)}")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = []
-        for symbol in symbols:
+        for i, symbol in enumerate(symbols):
+            # Ротация: выбираем клиент по индексу символа mod len(clients)
+            client = clients[i % len(clients)]
             futures.append(executor.submit(_download_symbol_tfs, symbol, timeframes, client, storage))
 
         # Прогресс-бар по завершению задач
@@ -126,9 +140,10 @@ def download_new_candles(symbol: str, timeframe: str):
     """
     Докачивает только новые свечи после последней в БД.
     Используется в live-режиме после закрытия свечи.
+    Для простоты использует основной клиент; ротацию можно добавить аналогично full_history, если нужно.
     """
     config = load_config()
-    client = BinanceClient()
+    client = BinanceClient()  # Здесь без ротации, чтобы не усложнять single-call; если нужно — добавить pool
     storage = Storage()
 
     try:

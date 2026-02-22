@@ -1,71 +1,65 @@
 # config/default.yaml
+# Дефолтные значения конфигурации всего проекта
+# Переопределяются в bot_config.yaml и trading_modes/*.yaml
 
-# === Основной конфиг проекта ===
-# Все параметры, которые не зависят от hardware или trading mode.
-# Переопределяются в hardware/*.yaml и trading_modes/*.yaml при необходимости.
-
-# Binance API (заполнить реальными ключами)
-binance:
-  api_key: "your_api_key_here"
-  api_secret: "your_api_secret_here"
-
-# Таймфреймы (из ТЗ)
-timeframes:
-  - "1m"
-  - "3m"
-  - "5m"
-  - "10m"
-  - "15m"
-
-# Окна анализа (из ТЗ)
-windows_sizes:
-  - 24
-  - 50
-  - 74
-  - 100
-
-# Параметры аномалий
-anomaly:
-  lookback: 25
-  volume_percentile: 0.97          # дефолт перцентиль для объёмной аномалии
-  dominance_threshold_pct: 60.0    # порог доминирования ask/bid для volume anomaly
-  min_volume_threshold: 1.0        # минимальный объём свечи для рассмотрения аномалии
-
-# Параметры модели
-model:
-  input_dim: 28                    # кол-во признаков из feature_engine (все из ТЗ)
-  seq_len: 100
-  hidden_size: 128
-  num_gru_layers: 2
-  dropout: 0.2
-  lr: 0.001
-  epochs: 20                       # дефолт, переопределяется в hardware
-  batch_size: 64                   # дефолт
-  val_split: 0.2
-  min_prob_anomaly: 0.60
-  min_prob_q: 0.75
-
-# Параметры бектеста и PR
-backtest:
-  min_trades_for_pr: 10
-  min_pr_threshold: 0.0
-  lookback_hours: 720              # 30 дней для анализа PR
-
-# Параметры торговли (риск, режимы)
-trading:
-  mode: "virtual"                  # real / virtual
-  risk_pct: 1.0                    # риск на сделку в % от депозита
-  avg_candle_size_pct: 0.5         # примерное среднее движение свечи в % (для TP)
-  tp_sl_mode: "classic"            # classic / partial_trailing / chandelier
-  leverage_max: 50
-
-# Пути
 paths:
-  data_dir: "data"
-  logs_dir: "logs"
-  models_dir: "models"
+  data_dir: data/
+  models_dir: data/models/
+  logs_dir: logs/
 
-# Другие параметры
-retrain_interval_candles: 10000
-max_history_candles: 100000
-max_scenarios_limit: 10000
+binance:
+  api_key: "YOUR_API_KEY_HERE"
+  api_secret: "YOUR_API_SECRET_HERE"
+
+timeframes:
+  - 1m
+  - 3m
+  - 5m
+  - 10m
+  - 15m
+
+seq_len: 100
+windows: [24, 50, 74, 100]
+
+hardware:
+  max_workers: 16  # для Colab/server, на телефоне было бы 4-8
+  model_size: medium  # small/medium/large
+
+trading:
+  mode: balanced  # aggressive / balanced / conservative / custom
+  min_prob: 0.65
+  risk_pct: 1.0  # % от депозита на сделку
+  dropout: 0.3
+  commission: 0.0004  # 0.04% taker fee на Binance Futures
+
+model:
+  hidden_size: 128
+  dropout: 0.3
+  epochs: 30
+  batch_size: 64
+  learning_rate: 0.0005
+  retrain_interval_days: 7  # каждую неделю per-TF
+  n_features: 128  # placeholder, рассчитывается динамически в trainer
+
+filter:
+  min_age_months: 3
+  min_pr: 5.0  # минимальный Profitable Rating в %
+  min_trades: 20  # минимальное количество сделок за период
+
+va:
+  va_percentage: 0.70
+  price_bin_step_pct: 0.002
+
+consensus:
+  min_tf_consensus: 2
+  va_confirm_enabled: false  # строгое подтверждение VA — отключено по нашему решению
+
+clipping_bounds:
+  delta_change_pct: [-100, 100]
+  volatility_change_pct: [-50, 50]
+  price_change_pct: [-30, 30]
+  delta_shift_pct: [-20, 20]
+
+logging:
+  level: INFO
+  file: logs/bot.log
