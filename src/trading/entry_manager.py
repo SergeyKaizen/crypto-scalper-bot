@@ -2,23 +2,22 @@
 src/trading/entry_manager.py
 
 === Основной принцип работы файла ===
+Менеджер открытия позиций в live-режиме.
 
-Этот файл отвечает за логику открытия позиций в live-режиме (реальный и виртуальный).
-Он:
-- Получает сигналы от inference (предикт модели при аномалии/Q).
-- Проверяет условия входа: совпадение с whitelist (PR_BTC config), min_prob, no open position по типу, no close in this candle.
-- Рассчитывает размер позиции через risk_manager (риск % от депо, плечо, SL distance).
-- Передаёт ордер в order_executor (real) или virtual_trader (виртуальный).
-- Поддерживает только одну открытую позицию по типу аномалии (C/V/CV/Q) на монете.
-- Запрещает новую позицию в свече, где предыдущая закрылась (по ТЗ для live).
+Учитывает все последние изменения:
+- multi-TF consensus (только confirmed аномалии)
+- quiet_streak как дополнительная фича
+- sequential паттерны и delta VA в pred_features
+- повышенный min_prob для Q
+- строгое ограничение: только 1 открытая позиция по одному типу аномалии (C/V/CV/Q) на монете
+- запрет новой позиции в свече, где предыдущая закрылась (по ТЗ для live)
+- глобальный lock: нет новой позиции пока есть любая открытая на монете (новое изменение для live)
 
-В live-режиме — консервативно: одна по типу, нет входа после закрытия в той же свече.
+В live-режиме — консервативно: одна по типу, нет входа после закрытия в той же свeche, нет новой пока открыта текущая.
 Виртуальный режим — та же логика для симуляции PNL без реальных ордеров.
 
-=== Главные функции и за что отвечают ===
-
-- EntryManager() — инициализация: risk_manager, order_executor, virtual_trader, websocket.
-- process_signal(symbol: str, anomaly_type: str, direction: str, prob: float, candle_data: dict) — основная точка входа:
+=== Главные функции ===
+- process_signal(symbol: str, anomaly_type: str, direction: str, prob: float, candle_data: dict, candle_ts: int) — основная точка входа:
   - Проверяет whitelist match (PR config == signal).
   - Проверяет min_prob (выше для Q).
   - Проверяет no open position по типу.
@@ -32,7 +31,7 @@ src/trading/entry_manager.py
 === Примечания ===
 - Signal vs PR: если Signal_BTC == PR_BTC — real, иначе virtual (по ТЗ).
 - Q имеет выше min_prob_q (например, 0.75) для снижения ложных входов.
-- Полностью соответствует ТЗ + уточнениям (одна по типу, no new in closed candle).
+- Полностью соответствует ТЗ + уточнениям (одна по типу, no new in closed candle, global lock).
 - Готов к интеграции в live_loop.py.
 - Логи через setup_logger.
 """
@@ -76,7 +75,7 @@ class EntryManager:
         """
         Основная функция: обработка сигнала от inference.
         - Проверяет whitelist match.
-        - Проверяет вероятность и условия входа.
+        - Проверка вероятности и условий входа.
         - Открывает позицию (real или virtual).
         """
         # 1. Проверка whitelist (PR config)
@@ -111,7 +110,7 @@ class EntryManager:
         )
 
         if size <= 0:
-            logger.warning(f"Невозможно рассчитать размер позиции для {symbol}")
+            logger.warning(f"Некорректный размер позиции для {symbol}")
             return
 
         # 5. Открытие позиции
@@ -142,7 +141,7 @@ class EntryManager:
 
     def _can_open_position(self, symbol: str, anomaly_type: str, candle_ts: int) -> bool:
         """
-        Проверяет возможность открытия позиции.
+        Проверка возможности открытия позиции.
         - Нет открытой по этому типу.
         - Нет закрытия в этой свече.
         """
@@ -160,7 +159,7 @@ class EntryManager:
 
     def update_candle_close_flag(self, candle_ts: int):
         """
-        Устанавливает флаг закрытия позиции в свече (вызывается из tp_sl_manager).
+        Устанавливает флаг закрытия позиции в свeche (вызывается из tp_sl_manager).
         """
         self.candle_close_flags[candle_ts] = True
         logger.debug(f"Установлен флаг закрытия в свече {candle_ts}")

@@ -3,28 +3,26 @@ src/model/architectures.py
 
 === Основной принцип работы файла ===
 
-Гибридная архитектура Conv1D + Bidirectional GRU для предсказания вероятности профитной сделки.
+Гибридная архитектура Conv1D + Bidirectional GRU для предсказания.
 
-Ключевые особенности (по ТЗ + все утверждённые изменения):
+Изменения по последнему ТЗ:
 - Multi-TF input: 5 отдельных тензоров (1m,3m,5m,10m,15m)
-- Отдельная Conv1D ветка на каждый TF → concat hidden states → fusion Dense
-- Bidirectional GRU для захвата контекста с обеих сторон последовательности
 - Input shape: (batch, seq_len, n_features) на каждый TF
-- n_features динамический (рассчитывается в trainer/inference)
-- Масштабирование: model_size ('small'/'medium'/'large') под Colab/server
-- Dropout, BatchNorm для снижения оверфита на шумных данных крипты
-- Выход: sigmoid вероятность профита (>0.5 → сигнал на вход)
+- Предсказание: не только да/нет (binary prob), но и ожидаемый профит (tp_distance / sl_distance если TP раньше SL, иначе -1)
+- Multi-task: BCE для binary + MSE для regression
+- Bidirectional GRU включён по умолчанию
+- Масштабирование под железо (model_size)
 
 === Главные классы ===
 
 - ConvBranch — Conv1D ветка для одного TF
-- HybridMultiTFConvGRU — основная модель
+- HybridMultiTFConvGRU — основная модель (multi-task output)
 
 === Примечания ===
-- Bidirectional GRU: hidden_size * 2 на выходе
-- Fusion: concat по всем TF → Linear → GRU
-- Поддержка extra фич (quiet_streak) через n_features
-- На сервере ('large') — больше слоёв/нейронов
+- Input: list of 5 tensors (по TF)
+- Output: [prob, expected_profit_ratio] (prob > min_prob → сигнал, ratio >1 → TP раньше SL)
+- n_features динамический (из config)
+- Готов к trainer/inference/live_loop
 """
 
 import torch
@@ -43,7 +41,6 @@ class ConvBranch(nn.Module):
         self.pool = nn.AdaptiveAvgPool1d(1)
 
     def forward(self, x):
-        # x: (batch, seq_len, features) → (batch, features, seq_len)
         x = x.transpose(1, 2)
         x = F.relu(self.bn1(self.conv1(x)))
         x = F.relu(self.bn2(self.conv2(x)))
@@ -90,47 +87,46 @@ class HybridMultiTFConvGRU(nn.Module):
         )
 
         self.dropout = nn.Dropout(dropout)
-        self.fc = nn.Linear(hidden_size * 2, 1)  # *2 из-за bidirectional
+
+        # Multi-task output: prob (sigmoid) + expected_profit_ratio (linear)
+        self.fc_binary = nn.Linear(hidden_size * 2, 1)   # для да/нет
+        self.fc_regression = nn.Linear(hidden_size * 2, 1)  # для ожидаемого профита
 
     def forward(self, inputs: list):
         """
-        inputs: list of tensors, len=5 (по TF)
-        каждый: (batch, seq_len, n_features)
+        inputs: list of 5 tensors (по TF), каждый (batch, seq_len, n_features)
         """
         if len(inputs) != self.num_tf:
             raise ValueError(f"Ожидается {self.num_tf} входов по TF, получено {len(inputs)}")
 
-        # Обработка каждого TF отдельно
         branch_outputs = []
         for i, branch in enumerate(self.conv_branches):
             branch_outputs.append(branch(inputs[i]))
 
-        # Concat по TF
         fused = torch.cat(branch_outputs, dim=1)  # (batch, hidden_size * num_tf)
 
-        # Fusion Dense + BN
         fused = F.relu(self.bn_fusion(self.fusion_dense(fused)))
 
-        # Подготовка для GRU: добавляем dim seq_len=1
         fused = fused.unsqueeze(1)  # (batch, 1, hidden_size*2)
 
-        # Bidirectional GRU
         gru_out, _ = self.gru(fused)
         gru_out = gru_out[:, -1, :]  # last hidden (batch, hidden_size*2)
 
         out = self.dropout(gru_out)
-        out = torch.sigmoid(self.fc(out))  # вероятность профита [0,1]
 
-        return out
+        prob = torch.sigmoid(self.fc_binary(out))             # да/нет (0-1)
+        expected_profit = self.fc_regression(out)             # ожидаемый профит (linear)
+
+        return prob, expected_profit
 
 
 def build_model(config):
     """
     Фабрика модели под текущий config
     """
-    n_features = config.get('n_features', 128)  # должно быть рассчитано заранее
+    n_features = config.get('n_features', 128)
     seq_len = config.get('seq_len', 100)
-    num_tf = len(config['timeframes'])  # 5
+    num_tf = len(config['timeframes'])
     model_size = config.get('model_size', 'medium')
     dropout = config.get('dropout', 0.3)
     hidden_size = config.get('hidden_size', 128)
@@ -146,7 +142,7 @@ def build_model(config):
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
-    model.eval()  # по умолчанию inference mode
+    model.eval()  # inference mode
 
     logger.info(f"Модель построена: {model_size}, TF: {num_tf}, features: {n_features}, seq_len: {seq_len}")
     return model

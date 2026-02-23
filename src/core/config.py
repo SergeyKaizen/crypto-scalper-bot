@@ -1,111 +1,73 @@
-"""
-src/core/config.py
+# config/default.yaml
+# Финальная дефолтная конфигурация проекта (февраль 2026)
+# Все параметры можно переопределять в bot_config.yaml или trading_modes/*.yaml
 
-=== Основной принцип работы файла ===
+paths:
+  data_dir: "data/"
+  models_dir: "data/models/"
+  logs_dir: "logs/"
+  export_dir: "data/exports/"          # для scenario_stats.csv и кластеров
 
-Центральный файл конфигурации всего проекта.
-Загружает дефолтные значения из default.yaml, переопределяет из bot_config.yaml,
-trading_modes/*.yaml и hardware/*.yaml в зависимости от окружения.
+binance:
+  api_key: "YOUR_API_KEY_HERE"
+  api_secret: "YOUR_API_SECRET_HERE"
 
-Все параметры доступны через load_config() — единая точка входа.
+# Таймфреймы и окна
+timeframes: ["1m", "3m", "5m", "10m", "15m"]
+seq_len: 100
+windows: [24, 50, 74, 100]
 
-=== Структура конфига (все ключевые разделы) ===
+# Hardware (Colab → Server)
+hardware:
+  max_workers: 16
+  model_size: "medium"                 # small / medium / large (large на сервере)
 
-- paths: директории данных/моделей
-- binance: API ключи
-- timeframes: ['1m', '3m', '5m', '10m', '15m']
-- seq_len: 100
-- windows: [24, 50, 74, 100]
-- hardware: max_workers, model_size ('medium'/'large')
-- trading: mode ('real'/'virtual'), min_prob, risk_pct, dropout и т.д.
-- model: hidden_size, retrain_interval_days: 7, n_features (рассчитывается)
-- filter: min_age_months, min_pr, min_trades
-- va: va_percentage: 0.70, price_bin_step_pct: 0.002
-- consensus: min_tf_consensus: 2, va_confirm_enabled: false
-- clipping_bounds: dict с порогами для % изменений
-- logging: level и т.д.
+# Торговые параметры
+trading:
+  mode: "balanced"                     # aggressive / balanced / conservative / custom
+  min_prob: 0.65                       # минимальная вероятность для обычных аномалий
+  min_prob_q: 0.75                     # повышенный порог для Quiet (Q)
+  risk_pct: 1.0                        # % от депозита на сделку
+  commission: 0.0004                   # taker fee Binance Futures
+  dropout: 0.3
 
-=== Примечания ===
-- load_config() кэширует конфиг после первого вызова
-- Поддержка override_path для тестов
-- Все новые параметры из обсуждений добавлены
-"""
+# Модель
+model:
+  hidden_size: 128
+  dropout: 0.3
+  epochs: 30
+  batch_size: 64
+  learning_rate: 0.0005
+  retrain_interval_days: 7             # каждую неделю per-TF (последнее изменение)
+  n_features: 128                      # placeholder — рассчитывается динамически в trainer
+  bidirectional: true                  # Bidirectional GRU
 
-import os
-import yaml
-from functools import lru_cache
-from pathlib import Path
+# Фильтры монет и бэктест
+filter:
+  min_age_months: 3
+  min_pr: 5.0
+  min_trades: 20
 
-BASE_DIR = Path(__file__).parent.parent.parent
-DEFAULT_CONFIG_PATH = BASE_DIR / 'config' / 'default.yaml'
+# Value Area и Delta VA
+va:
+  va_percentage: 0.70
+  price_bin_step_pct: 0.002
 
-@lru_cache(maxsize=1)
-def load_config(override_path=None):
-    """
-    Загрузка и слияние конфигурации.
-    Приоритет: override_path > bot_config.yaml > trading_modes/*.yaml > hardware/*.yaml > default.yaml
-    """
-    config = {}
+# Мульти-TF consensus
+consensus:
+  min_tf_consensus: 2
+  va_confirm_enabled: false            # строгое подтверждение VA отключено (модель сама учится)
 
-    # 1. Default
-    if DEFAULT_CONFIG_PATH.exists():
-        with open(DEFAULT_CONFIG_PATH, 'r', encoding='utf-8') as f:
-            config.update(yaml.safe_load(f) or {})
+# Clipping для количественных фич (защита от выбросов)
+clipping_bounds:
+  delta_change_pct: [-100, 100]
+  volatility_change_pct: [-50, 50]
+  price_change_pct: [-30, 30]
+  delta_shift_pct: [-20, 20]
+  volume_change_pct: [-200, 200]
 
-    # 2. Hardware (Colab/server)
-    hardware_file = override_path or (BASE_DIR / 'config' / 'hardware' / 'colab.yaml')  # по умолчанию Colab
-    if hardware_file.exists():
-        with open(hardware_file, 'r', encoding='utf-8') as f:
-            config['hardware'] = yaml.safe_load(f)
-
-    # 3. Trading mode (balanced/aggressive/custom и т.д.)
-    mode = config.get('trading', {}).get('mode', 'balanced')
-    mode_file = BASE_DIR / 'config' / 'trading_modes' / f'{mode}.yaml'
-    if mode_file.exists():
-        with open(mode_file, 'r', encoding='utf-8') as f:
-            mode_cfg = yaml.safe_load(f)
-            if 'trading' not in config:
-                config['trading'] = {}
-            config['trading'].update(mode_cfg)
-
-    # 4. Bot config (переопределение всего)
-    bot_config_path = BASE_DIR / 'config' / 'bot_config.yaml'
-    if bot_config_path.exists():
-        with open(bot_config_path, 'r', encoding='utf-8') as f:
-            bot_cfg = yaml.safe_load(f)
-            deep_update(config, bot_cfg)
-
-    # 5. Override path (для тестов или CLI)
-    if override_path and Path(override_path).exists():
-        with open(override_path, 'r', encoding='utf-8') as f:
-            override_cfg = yaml.safe_load(f)
-            deep_update(config, override_cfg)
-
-    # 6. Динамические/расчётные параметры
-    config['n_features'] = calculate_n_features(config)  # placeholder — реализуем ниже
-    config['retrain_interval_days'] = config.get('retrain_interval_days', 7)
-    config['min_tf_consensus'] = config.get('min_tf_consensus', 2)
-    config['va_confirm_enabled'] = config.get('va_confirm_enabled', False)
-
-    return config
-
-
-def deep_update(target: dict, source: dict):
-    """Глубокое слияние словарей"""
-    for key, value in source.items():
-        if isinstance(value, dict) and key in target and isinstance(target[key], dict):
-            deep_update(target[key], value)
-        else:
-            target[key] = value
-
-
-def calculate_n_features(config):
-    """
-    Динамический подсчёт количества фич (пример)
-    В реальности — смотреть на compute_features и считать колонки
-    """
-    # Базовые 12 + half comparison (~10) + delta VA (~10) + sequential (~25) + quiet_streak (1)
-    return 12 + 10 + 10 + 25 + 1  # ~58
-    # Лучше реализовать как:
-    # dummy_feats = compute_features(pd.DataFrame())
-    # return sum(len(f) for f in dummy_feats.values()) + 1  # + quiet_streak
+# Логирование
+logging:
+  level: "INFO"
+  file: "logs/bot.log"
+  max_size_mb: 100
