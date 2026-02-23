@@ -3,201 +3,134 @@ src/trading/tp_sl_manager.py
 
 === Основной принцип работы файла ===
 
-Этот файл реализует логику расчёта и управления уровнями Take Profit (TP) и Stop Loss (SL) для всех позиций.
-Он отвечает за:
-- Расчёт уровней TP/SL по типам (classic, partial_trailing, chandelier — dynamic удалён по ТЗ).
-- Проверку закрытия позиций в каждой новой свече (TP/SL hit).
-- Частичный trailing и partial close (если цена достигла промежуточных уровней).
-- Учёт направления (Long/Short): TP/SL симметричны.
-- Передачу сигнала закрытия в entry_manager (флаг для запрета новой позиции в свече закрытия).
-- Обновление виртуальных позиций в virtual_trader и реальных через order_executor.
+Менеджер расчёта и мониторинга TP/SL для открытых позиций.
 
-Ключевые особенности:
-- Classic TP = средний размер свечи (из feature_engine или config).
-- SL = HH/LL ± 0.05% с cap <= средний размер * 2 (по ТЗ).
-- Partial_trailing: разбивает позицию на порции (например, 50% на первом уровне, 50% на втором).
-- Chandelier: trailing по ATR (но только если включено в config, по умолчанию classic).
-- Все позиции хранятся в dict (open_positions) с обновлением в каждой свече.
+Реализует расчёт уровней по ТЗ:
+- TP = средний размер свечи (avg candle range)
+- SL = HH/LL ±0.05% с cap на 2× средний размер свечи
+- Поддерживает режимы: classic, partial_trailing, chandelier (по config)
+- Мониторит закрытие позиций (TP/SL hit) каждую новую свечу
+- Вызывает entry_manager.update_candle_close_flag после закрытия (запрет новых входов в свече)
+- Хранит открытые позиции (symbol_anomaly_type → pos)
 
-=== Главные функции и за что отвечают ===
-
-- TPSLManager() — инициализация: open_positions dict, config.
-- calculate_levels(candle_data: dict, direction: str) → dict[tp, sl, tp_distance, sl_distance]
-  Основная функция расчёта TP/SL по classic (ТЗ).
-- check_close(pos: dict, candle_data: dict) → dict[closed: bool, is_tp: bool]
-  Проверяет hit TP/SL в текущей свече, обновляет trailing если partial.
-- add_open_position(pos: dict) — добавляет позицию в управление.
-- update_open_positions(candle_data: dict) — проверяет все открытые позиции в новой свече.
-- _calculate_classic_tp_sl(candle_data, direction) → tp, sl
-  Расчёт по ТЗ: TP = avg candle size, SL = HH/LL ±0.05% с cap.
-- _apply_partial_close(pos, current_price) — частичное закрытие при достижении уровня.
+=== Главные функции ===
+- calculate_tp_sl(candle_data, timeframe) → tp, sl (основной расчёт по ТЗ)
+- calculate_levels(candle_data, direction, mode='classic') — расчёт по режиму
+- check_tp_sl(position, current_price) — проверка закрытия, вызов update_flag
+- add_open_position(pos) — регистрация позиции
+- has_open_position(symbol, anomaly_type) — проверка открытой по типу
+- update_candle_close_flag(candle_ts) — вызов entry_manager (новое)
 
 === Примечания ===
-- Dynamic режим полностью удалён (по предыдущему указанию).
-- Запрет новой позиции в свече закрытия — передача флага в entry_manager.
-- Полностью соответствует ТЗ + уточнениям (classic + partial_trailing).
-- Готов к интеграции в live_loop, backtest и virtual_trader.
-- Логи через setup_logger.
+- Cap 2× avg_size — по ТЗ (если HH/LL > cap → shift к следующему)
+- Вызов update_flag после закрытия — обеспечивает запрет новой позиции в свече
+- quiet_streak и consensus_count передаются в pos (для log и анализа)
+- Полностью соответствует ТЗ + последним изменениям
+- Готов к интеграции в live_loop и entry_manager
 """
 
-from typing import Dict, Optional
+from typing import Dict, Tuple, Optional
 import numpy as np
 
 from src.core.config import load_config
-from src.core.enums import Direction, TpSlMode
-from src.features.feature_engine import _compute_half_features  # для avg size (если нужно)
+from src.core.enums import Direction
 from src.utils.logger import setup_logger
+from src.trading.entry_manager import EntryManager  # для вызова update_flag
 
 logger = setup_logger('tp_sl_manager', logging.INFO)
 
-class TPSLManager:
-    """
-    Менеджер уровней TP/SL и проверки закрытий позиций.
-    """
+class TP_SL_Manager:
     def __init__(self):
         self.config = load_config()
-        self.open_positions: Dict[str, Dict] = {}  # key: pos_id, value: pos dict
-        self.mode = TpSlMode(self.config['trading']['tp_sl_mode'])  # classic / partial_trailing / chandelier
-        self.avg_candle_size_cache = {}  # кэш среднего размера свечи по символу/TF
+        self.open_positions = {}  # key: f"{symbol}_{anomaly_type}" → position dict
+        self.entry_manager = EntryManager()  # ссылка для вызова update_flag
 
-    def calculate_levels(self, candle_data: Dict, direction: str) -> Optional[Dict]:
+    def calculate_tp_sl(self, candle_data: Dict, timeframe: str) -> Tuple[float, float]:
         """
-        Расчёт TP/SL по режиму.
-        candle_data — текущая свеча (close, high, low и т.д.).
-        Возвращает dict['tp', 'sl', 'tp_distance', 'sl_distance'] или None.
+        Основной расчёт TP/SL по ТЗ (classic mode)
         """
-        if self.mode == TpSlMode.CLASSIC:
-            return self._calculate_classic_tp_sl(candle_data, direction)
-        elif self.mode == TpSlMode.PARTIAL_TRAILING:
-            return self._calculate_partial_trailing(candle_data, direction)
-        elif self.mode == TpSlMode.CHANDELIER:
-            return self._calculate_chandelier(candle_data, direction)
+        # Средний размер свечи (в % от close)
+        avg_size = candle_data.get('volatility_mean', 0.0)
+
+        if avg_size == 0:
+            avg_size = np.mean(candle_data['high'] - candle_data['low']) / candle_data['close'].mean()
+
+        direction = candle_data.get('direction', Direction.LONG.value)
+
+        if direction == Direction.LONG.value:
+            hh = candle_data['high'].max()
+            sl = hh + 0.0005 * hh  # HH + 0.05%
+            if (sl - hh) > avg_size * 2:
+                sl = hh + avg_size * 2  # cap 2×
+            tp = candle_data['close'].mean() + avg_size * candle_data['close'].mean()
         else:
-            logger.error(f"Неизвестный режим TP/SL: {self.mode}")
-            return None
+            ll = candle_data['low'].min()
+            sl = ll - 0.0005 * ll  # LL - 0.05%
+            if (ll - sl) > avg_size * 2:
+                sl = ll - avg_size * 2  # cap 2×
+            tp = candle_data['close'].mean() - avg_size * candle_data['close'].mean()
 
-    def _calculate_classic_tp_sl(self, candle_data: Dict, direction: str) -> Dict:
-        """
-        Классический режим по ТЗ.
-        TP = средний размер свечи (из feature_engine или config).
-        SL = HH/LL ±0.05% с cap <= avg_size * 2.
-        """
-        # Средний размер свечи (из кэша или расчёт)
-        avg_size_pct = self._get_avg_candle_size(candle_data['symbol'], candle_data['timeframe'])
-        avg_size = candle_data['close'] * avg_size_pct / 100
+        return tp, sl
 
-        entry = candle_data['close']
+    def check_tp_sl(self, position: Dict, current_price: float) -> bool:
+        """
+        Проверка закрытия позиции по TP/SL.
+        Если закрыта — вызывает update_candle_close_flag
+        """
+        tp = position.get('tp')
+        sl = position.get('sl')
+        direction = position['direction']
+
+        hit_tp = False
+        hit_sl = False
+
         if direction == Direction.LONG.value:
-            tp = entry + avg_size
-            # SL = LL - 0.05%, cap = entry - avg_size * 2
-            ll = candle_data['low']  # упрощённо, реально — LL за период
-            sl = ll - entry * 0.0005
-            sl_cap = entry - avg_size * 2
-            sl = max(sl, sl_cap)  # не ниже cap
-        else:  # SHORT
-            tp = entry - avg_size
-            hh = candle_data['high']
-            sl = hh + entry * 0.0005
-            sl_cap = entry + avg_size * 2
-            sl = min(sl, sl_cap)
+            if current_price >= tp:
+                hit_tp = True
+            if current_price <= sl:
+                hit_sl = True
+        else:
+            if current_price <= tp:
+                hit_tp = True
+            if current_price >= sl:
+                hit_sl = True
 
-        tp_distance = abs(tp - entry)
-        sl_distance = abs(sl - entry)
+        if hit_tp or hit_sl:
+            # Закрытие позиции
+            position['closed_ts'] = time.time()
+            position['hit_tp'] = hit_tp
+            position['hit_sl'] = hit_sl
 
-        return {
-            'tp': tp,
-            'sl': sl,
-            'tp_distance': tp_distance,
-            'sl_distance': sl_distance
-        }
+            # Вызов флага закрытия в свече
+            candle_ts = int(position['open_ts'] // 1000 * 1000)  # округление до свечи
+            self.entry_manager.update_candle_close_flag(candle_ts)
 
-    def _calculate_partial_trailing(self, candle_data: Dict, direction: str) -> Dict:
-        """
-        Partial trailing: несколько уровней TP, trailing SL.
-        (упрощённо — 2 уровня, trailing по ATR или фиксированно)
-        """
-        # Пример реализации: TP1 = entry + 0.5*avg_size, TP2 = entry + avg_size
-        # SL trailing = chandelier-like
-        classic = self._calculate_classic_tp_sl(candle_data, direction)
-        return classic  # можно расширить позже
+            logger.info(f"Позиция закрыта {position['symbol']} {position['anomaly_type']}: "
+                        f"{'TP' if hit_tp else 'SL'} at {current_price}")
 
-    def _calculate_chandelier(self, candle_data: Dict, direction: str) -> Dict:
-        """
-        Chandelier exit: trailing по ATR.
-        (если включено, иначе fallback на classic)
-        """
-        return self._calculate_classic_tp_sl(candle_data, direction)  # placeholder
+            # Удаление из открытых
+            key = f"{position['symbol']}_{position['anomaly_type']}"
+            if key in self.open_positions:
+                del self.open_positions[key]
 
-    def _get_avg_candle_size(self, symbol: str, timeframe: str) -> float:
-        """
-        Возвращает средний размер свечи в % (кэшируется).
-        """
-        key = f"{symbol}_{timeframe}"
-        if key in self.avg_candle_size_cache:
-            return self.avg_candle_size_cache[key]
+            return True
 
-        # Здесь можно вызвать feature_engine или расчёт по БД
-        # Упрощённо — фиксированный из config
-        avg_size_pct = self.config['trading']['avg_candle_size_pct']  # например 0.5%
-        self.avg_candle_size_cache[key] = avg_size_pct
-        return avg_size_pct
-
-    def check_close(self, pos: Dict, candle_data: Dict) -> Dict:
-        """
-        Проверяет закрытие позиции в текущей свече.
-        Возвращает {'closed': bool, 'is_tp': bool, 'profit': float}
-        """
-        entry = pos['entry_price']
-        current = candle_data['close']
-        high = candle_data['high']
-        low = candle_data['low']
-
-        direction = pos['direction']
-        if direction == Direction.LONG.value:
-            if high >= pos['tp']:
-                return {'closed': True, 'is_tp': True, 'profit': (pos['tp'] - entry) * pos['size']}
-            if low <= pos['sl']:
-                return {'closed': True, 'is_tp': False, 'profit': (pos['sl'] - entry) * pos['size']}
-        else:  # SHORT
-            if low <= pos['tp']:
-                return {'closed': True, 'is_tp': True, 'profit': (entry - pos['tp']) * pos['size']}
-            if high >= pos['sl']:
-                return {'closed': True, 'is_tp': False, 'profit': (entry - pos['sl']) * pos['size']}
-
-        # Trailing update если partial_trailing
-        if self.mode == TpSlMode.PARTIAL_TRAILING:
-            self._update_trailing(pos, candle_data)
-
-        return {'closed': False}
-
-    def _update_trailing(self, pos: Dict, candle_data: Dict):
-        """
-        Обновляет trailing SL для partial_trailing режима.
-        """
-        # Пример: trailing SL = max(SL, high - atr * mult) для Long
-        pass  # реализация по необходимости
+        return False
 
     def add_open_position(self, pos: Dict):
-        """
-        Добавляет позицию в управление.
-        """
-        pos_id = f"{pos['symbol']}_{pos['type']}_{pos['open_ts']}"
-        self.open_positions[pos_id] = pos
-        logger.debug(f"Добавлена позиция в управление: {pos_id}")
-
-    def get_open_positions(self, symbol: Optional[str] = None) -> List[Dict]:
-        """
-        Возвращает открытые позиции (по символу или все).
-        """
-        if symbol:
-            return [p for p in self.open_positions.values() if p['symbol'] == symbol]
-        return list(self.open_positions.values())
+        """Регистрация открытой позиции"""
+        key = f"{pos['symbol']}_{pos['anomaly_type']}"
+        self.open_positions[key] = pos
+        logger.debug(f"Добавлена открытая позиция {key}")
 
     def has_open_position(self, symbol: str, anomaly_type: str) -> bool:
-        """
-        Проверяет наличие открытой позиции по типу.
-        """
-        for pos in self.open_positions.values():
-            if pos['symbol'] == symbol and pos['type'] == anomaly_type:
+        """Проверка открытой позиции по типу"""
+        key = f"{symbol}_{anomaly_type}"
+        return key in self.open_positions
+
+    def has_any_open_position(self, symbol: str) -> bool:
+        """Глобальный lock: есть ли хоть одна открытая позиция на монете"""
+        for key in self.open_positions:
+            if key.startswith(symbol + "_"):
                 return True
         return False

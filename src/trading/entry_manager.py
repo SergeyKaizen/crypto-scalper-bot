@@ -2,38 +2,28 @@
 src/trading/entry_manager.py
 
 === Основной принцип работы файла ===
+
 Менеджер открытия позиций в live-режиме.
 
-Учитывает все последние изменения:
-- multi-TF consensus (только confirmed аномалии)
-- quiet_streak как дополнительная фича
-- sequential паттерны и delta VA в pred_features
-- повышенный min_prob для Q
-- строгое ограничение: только 1 открытая позиция по одному типу аномалии (C/V/CV/Q) на монете
-- запрет новой позиции в свече, где предыдущая закрылась (по ТЗ для live)
-- глобальный lock: нет новой позиции пока есть любая открытая на монете (новое изменение для live)
-
-В live-режиме — консервативно: одна по типу, нет входа после закрытия в той же свeche, нет новой пока открыта текущая.
-Виртуальный режим — та же логика для симуляции PNL без реальных ордеров.
+Ключевые особенности (по ТЗ + последние уточнения):
+- Только 1 позиция на монету в любой момент (глобальный lock)
+- Если несколько сигналов в одной свече — выбирается только тот с максимальным весом (scenario_tracker.get_weight)
+- Остальные сигналы идут в виртуальную торговлю для PR и статистики
+- Запрет новой позиции в свече, где предыдущая закрылась (candle_close_flags)
+- Проверка whitelist, min_prob (повышенный для Q), no open по типу
+- Рассчёт размера через risk_manager, открытие через order_executor/virtual_trader
 
 === Главные функции ===
-- process_signal(symbol: str, anomaly_type: str, direction: str, prob: float, candle_data: dict, candle_ts: int) — основная точка входа:
-  - Проверяет whitelist match (PR config == signal).
-  - Проверяет min_prob (выше для Q).
-  - Проверяет no open position по типу.
-  - Проверяет no close in this candle (флаг от tp_sl_manager).
-  - Рассчитывает size через risk_manager.
-  - Открывает позицию (real или virtual).
-- _can_open_position(symbol: str, anomaly_type: str, candle_ts: int) → bool — проверки условий.
-- _open_position(...) — вызов executor или virtual_trader.
-- update_candle_close_flag(candle_ts: int) — флаг закрытия в свече (от tp_sl_manager).
+- process_signal(...) — основная точка входа: сбор сигналов → выбор top-1 по весу → открытие
+- _can_open_position(...) — глобальный lock + проверка закрытия в свече
+- _resolve_mode(...) — real/virtual по PR match
+- update_candle_close_flag(...) — флаг закрытия в свече
 
 === Примечания ===
-- Signal vs PR: если Signal_BTC == PR_BTC — real, иначе virtual (по ТЗ).
-- Q имеет выше min_prob_q (например, 0.75) для снижения ложных входов.
-- Полностью соответствует ТЗ + уточнениям (одна по типу, no new in closed candle, global lock).
-- Готов к интеграции в live_loop.py.
-- Логи через setup_logger.
+- Глобальный lock: has_any_open_position(symbol) — нет входа пока открыта любая позиция
+- Выбор max веса: только для live, чтобы не перегружать депозит и фокусироваться на лучших сигналах
+- Полностью соответствует ТЗ + твоему уточнению (1 позиция, max вес, no new после закрытия в свече)
+- Логи через setup_logger
 """
 
 from typing import Dict, Optional
@@ -45,67 +35,86 @@ from src.trading.risk_manager import RiskManager
 from src.trading.order_executor import OrderExecutor
 from src.trading.virtual_trader import VirtualTrader
 from src.trading.tp_sl_manager import TPSLManager
+from src.model.scenario_tracker import ScenarioTracker
 from src.utils.logger import setup_logger
 
 logger = setup_logger('entry_manager', logging.INFO)
 
 class EntryManager:
-    """
-    Менеджер открытия позиций в live-режиме.
-    """
-    def __init__(self):
+    def __init__(self, scenario_tracker: ScenarioTracker):
         self.config = load_config()
         self.risk_manager = RiskManager()
         self.order_executor = OrderExecutor()
         self.virtual_trader = VirtualTrader()
-        self.tp_sl_manager = TPSLManager()  # для проверки закрытий
+        self.tp_sl_manager = TPSLManager()
+        self.scenario_tracker = scenario_tracker  # для расчёта веса
 
-        self.mode = TradeMode(self.config['trading']['mode'])  # real / virtual
-        self.candle_close_flags = {}  # candle_ts: bool (было закрытие в этой свече)
+        self.mode = TradeMode(self.config['trading']['mode'])
+        self.candle_close_flags = {}  # candle_ts → True (закрытие в свече)
 
     def process_signal(
         self,
         symbol: str,
-        anomaly_type: str,
-        direction: str,
-        prob: float,
+        signals: list,  # list of {'anom': dict, 'window': int, 'feats': dict, 'prob': float}
         candle_data: Dict,
         candle_ts: int
     ):
         """
-        Основная функция: обработка сигнала от inference.
-        - Проверяет whitelist match.
-        - Проверка вероятности и условий входа.
-        - Открывает позицию (real или virtual).
+        Обработка всех сигналов в свече:
+        - Выбор топ-1 по весу (scenario_tracker.get_weight)
+        - Открытие только этой позиции (если проходит проверки)
+        - Остальные — виртуальные для PR
         """
-        # 1. Проверка whitelist (PR config)
-        whitelist_config = self.storage.get_whitelist_config(symbol)  # best_tf, best_period, best_anomaly, best_direction
-        if not whitelist_config:
-            logger.debug(f"{symbol} не в whitelist — только виртуальный режим")
-            mode = TradeMode.VIRTUAL
-        else:
-            signal_key = f"{anomaly_type}_{direction}"
-            pr_key = f"{whitelist_config['best_anomaly']}_{whitelist_config['best_direction']}"
-            if signal_key == pr_key:
-                mode = self.mode  # real если режим real
-            else:
-                mode = TradeMode.VIRTUAL
-
-        # 2. Проверка вероятности
-        min_prob = self.config['model']['min_prob_q'] if anomaly_type == AnomalyType.QUIET.value else self.config['model']['min_prob_anomaly']
-        if prob < min_prob:
-            logger.debug(f"Низкая вероятность {prob:.2f} < {min_prob:.2f} для {symbol} {anomaly_type}")
+        if not signals:
             return
 
-        # 3. Проверка условий входа
+        # 1. Рассчитываем вес каждого сигнала
+        scored_signals = []
+        for sig in signals:
+            anom = sig['anom']
+            feats = sig['feats']
+            prob = sig['prob']
+            weight = self.scenario_tracker.get_weight(
+                self.scenario_tracker._binarize_features(feats)
+            )
+            scored_signals.append((sig, weight))
+
+        # 2. Сортировка по весу (descending)
+        scored_signals.sort(key=lambda x: x[1], reverse=True)
+
+        # 3. Проверка глобального lock: есть ли уже открытая позиция на монете
+        if self.tp_sl_manager.has_any_open_position(symbol):
+            logger.debug(f"Уже открыта позиция на {symbol} — новые запрещены")
+            # Все сигналы — виртуальные
+            for sig, _ in scored_signals:
+                self.virtual_trader.open_virtual_position(
+                    symbol, sig['anom']['type'], sig['prob'], 
+                    self.tp_sl_manager.calculate_tp_sl(sig['feats'], sig['anom']['type'])
+                )
+            return
+
+        # 4. Берём top-1 по весу
+        top_sig, top_weight = scored_signals[0]
+        anomaly_type = top_sig['anom']['type']
+        direction = self._resolve_direction(anomaly_type, top_sig['feats'])  # L/S по аномалии
+        prob = top_sig['prob']
+
+        # 5. Проверка условий входа
         if not self._can_open_position(symbol, anomaly_type, candle_ts):
+            # Остальные — виртуальные
+            for sig, _ in scored_signals[1:]:
+                self.virtual_trader.open_virtual_position(
+                    symbol, sig['anom']['type'], sig['prob'], 
+                    self.tp_sl_manager.calculate_tp_sl(sig['feats'], sig['anom']['type'])
+                )
             return
 
-        # 4. Расчёт размера позиции
+        # 6. Расчёт размера позиции
+        sl_price = self.tp_sl_manager.calculate_sl(candle_data, direction)
         size = self.risk_manager.calculate_size(
             symbol=symbol,
             entry_price=candle_data['close'],
-            sl_price=self.tp_sl_manager.calculate_sl(candle_data, direction),
+            sl_price=sl_price,
             risk_pct=self.config['trading']['risk_pct']
         )
 
@@ -113,53 +122,71 @@ class EntryManager:
             logger.warning(f"Некорректный размер позиции для {symbol}")
             return
 
-        # 5. Открытие позиции
-        pos = {
+        # 7. Открытие позиции
+        position = {
             'symbol': symbol,
-            'type': anomaly_type,
+            'anomaly_type': anomaly_type,
             'direction': direction,
             'entry_price': candle_data['close'],
             'size': size,
             'open_ts': candle_ts,
-            'prob': prob
+            'prob': prob,
+            'quiet_streak': top_sig['anom'].get('quiet_streak', 0),
+            'consensus_count': top_sig['anom'].get('consensus_count', 1)
         }
 
+        mode = self._resolve_mode(symbol, anomaly_type, direction)
         if mode == TradeMode.REAL:
-            order_id = self.order_executor.place_order(pos)
+            order_id = self.order_executor.place_order(position)
             if order_id:
-                pos['order_id'] = order_id
-                logger.info(f"Открыта реальная позиция {anomaly_type} {direction} на {symbol}, size={size}")
+                position['order_id'] = order_id
+                logger.info(f"Открыта реальная позиция {anomaly_type} {direction} на {symbol}, size={size}, weight={top_weight:.4f}")
             else:
                 logger.error(f"Ошибка открытия реальной позиции {symbol}")
                 return
         else:
-            self.virtual_trader.open_position(pos)
-            logger.debug(f"Открыта виртуальная позиция {anomaly_type} {direction} на {symbol}, size={size}")
+            self.virtual_trader.open_position(position)
+            logger.debug(f"Открыта виртуальная позиция {anomaly_type} {direction} на {symbol}, size={size}, weight={top_weight:.4f}")
 
-        # Добавляем в открытые позиции (для проверки в live_loop)
-        self.tp_sl_manager.add_open_position(pos)
+        self.tp_sl_manager.add_open_position(position)
+
+        # 8. Остальные сигналы — виртуальные для PR
+        for sig, _ in scored_signals[1:]:
+            self.virtual_trader.open_virtual_position(
+                symbol, sig['anom']['type'], sig['prob'], 
+                self.tp_sl_manager.calculate_tp_sl(sig['feats'], sig['anom']['type'])
+            )
 
     def _can_open_position(self, symbol: str, anomaly_type: str, candle_ts: int) -> bool:
         """
-        Проверка возможности открытия позиции.
-        - Нет открытой по этому типу.
-        - Нет закрытия в этой свече.
+        Проверки:
+        - Нет открытой позиции на монете (глобальный lock)
+        - Нет закрытия в этой свече
         """
-        # 1. Нет открытой по типу
-        if self.tp_sl_manager.has_open_position(symbol, anomaly_type):
-            logger.debug(f"Уже открыта позиция {anomaly_type} на {symbol}")
+        # Глобальный lock: нет открытой позиции на монете
+        if self.tp_sl_manager.has_any_open_position(symbol):
+            logger.debug(f"Открытая позиция на {symbol} — новые запрещены")
             return False
 
-        # 2. Нет закрытия в этой свече
+        # Нет закрытия в этой свече
         if self.candle_close_flags.get(candle_ts, False):
-            logger.debug(f"В свече {candle_ts} была закрыта позиция — вход запрещён")
+            logger.debug(f"Закрытие в свече {candle_ts} — вход запрещён")
             return False
 
         return True
 
+    def _resolve_mode(self, symbol: str, anomaly_type: str, direction: str) -> TradeMode:
+        """Real если match с PR config, иначе virtual"""
+        whitelist = self.storage.get_whitelist_config(symbol)
+        if not whitelist:
+            return TradeMode.VIRTUAL
+
+        signal_key = f"{anomaly_type}_{direction}"
+        pr_key = f"{whitelist['best_anomaly']}_{whitelist['best_direction']}"
+
+        return TradeMode.REAL if signal_key == pr_key else TradeMode.VIRTUAL
+
     def update_candle_close_flag(self, candle_ts: int):
-        """
-        Устанавливает флаг закрытия позиции в свeche (вызывается из tp_sl_manager).
-        """
+        """Вызывается из tp_sl_manager после закрытия"""
         self.candle_close_flags[candle_ts] = True
         logger.debug(f"Установлен флаг закрытия в свече {candle_ts}")

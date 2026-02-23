@@ -4,30 +4,29 @@ src/trading/shadow_trading.py
 === Основной принцип работы файла ===
 
 Теневая (shadow) торговля — параллельная симуляция всех реальных сигналов в виртуальном режиме.
-Цель — сравнивать реальные результаты с виртуальными, выявлять slippage, задержки, расхождения в TP/SL hit и PNL.
 
-Поддерживает все последние изменения:
-- quiet_streak
-- consensus_count
-- sequential паттерны
-- delta VA признаки
-- multi-TF consensus
-- сравнение по всем новым фичами
+Цель — сравнивать реальные результаты с виртуальными, выявлять slippage, задержки, расхождения в TP/SL hit, PNL, quiet_streak и consensus_count.
 
-Не влияет на реальные ордера — только мониторит и логирует расхождения.
+Ключевые особенности:
+- shadow_open: дублирует открытие реальной позиции в shadow
+- shadow_update: обновляет все shadow позиции по новой свече
+- compare_real_vs_shadow: детальное сравнение (slippage, hit TP/SL, PNL, quiet_streak, consensus)
+- get_shadow_balance, get_shadow_pnl — статистика теневой торговли
+- Вызов scenario_tracker.add_scenario после закрытия shadow-позиции
 
 === Главные функции ===
-
-- shadow_open(real_pos, real_order_id) — дублирует открытие реальной позиции в shadow
-- shadow_update(candle_data) — обновляет все shadow позиции
-- compare_real_vs_shadow(real_pos, real_close_result) — детальное сравнение (slippage, hit TP/SL, PNL, quiet_streak, consensus)
-- get_shadow_balance(), get_shadow_pnl() — статистика теневой торговли
+- shadow_open(real_pos: dict, real_order_id: str)
+- shadow_update(candle_data: dict)
+- compare_real_vs_shadow(real_pos: dict, real_close_result: dict)
+- get_shadow_balance() → float
+- get_shadow_pnl() → float
 
 === Примечания ===
 - Использует тот же VirtualTrader, что и виртуальный режим
 - Логи с префиксом [SHADOW] для удобства анализа
-- Полностью соответствует ТЗ и всем обновлениям
-- Готов к использованию в live_loop и entry_manager
+- Полностью соответствует ТЗ + всем обновлениям (quiet_streak, consensus_count в сравнении)
+- Готов к интеграции в live_loop и entry_manager
+- Логи через setup_logger
 """
 
 from typing import Dict
@@ -35,6 +34,7 @@ import logging
 
 from src.core.config import load_config
 from src.trading.virtual_trader import VirtualTrader
+from src.model.scenario_tracker import ScenarioTracker
 from src.utils.logger import setup_logger
 
 logger = setup_logger('shadow_trading', logging.INFO)
@@ -45,6 +45,7 @@ class ShadowTrading:
         self.virtual_trader = VirtualTrader()  # тот же экземпляр, что и в live_loop
         self.shadow_positions = {}          # shadow_pos_id → position
         self.real_to_shadow_map = {}        # real_order_id → shadow_pos_id
+        self.scenario_tracker = ScenarioTracker()  # для статистики shadow
 
     def shadow_open(self, real_pos: Dict, real_order_id: str):
         """
@@ -94,6 +95,12 @@ class ShadowTrading:
         real_hit_tp = real_close_result.get('hit_tp', False)
         shadow_hit_tp = shadow_pos.get('closed_is_tp', False)
 
+        real_quiet = real_pos.get('quiet_streak', 0)
+        shadow_quiet = shadow_pos.get('quiet_streak', 0)
+
+        real_consensus = real_pos.get('consensus_count', 1)
+        shadow_consensus = shadow_pos.get('consensus_count', 1)
+
         # Логирование расхождений
         if abs(slippage_pct) > 5.0:
             logger.warning(f"[SHADOW] СИЛЬНОЕ расхождение PNL {real_pnl:.2f} vs {shadow_pnl:.2f} "
@@ -103,14 +110,18 @@ class ShadowTrading:
             logger.warning(f"[SHADOW] Разный исход TP/SL: real={'TP' if real_hit_tp else 'SL'}, "
                            f"shadow={'TP' if shadow_hit_tp else 'SL'} | {real_pos['symbol']}")
 
-        # Сравнение дополнительных фич
-        real_quiet = real_pos.get('quiet_streak', 0)
-        shadow_quiet = shadow_pos.get('quiet_streak', 0)
         if real_quiet != shadow_quiet:
             logger.debug(f"[SHADOW] Разный quiet_streak: real={real_quiet}, shadow={shadow_quiet}")
 
+        if real_consensus != shadow_consensus:
+            logger.debug(f"[SHADOW] Разный consensus_count: real={real_consensus}, shadow={shadow_consensus}")
+
         logger.info(f"[SHADOW] Сравнение завершено | real_PNL={real_pnl:.2f} shadow_PNL={shadow_pnl:.2f} "
                     f"slippage={slippage_pct:+.1f}% | {real_pos['symbol']}")
+
+        # Вызов scenario_tracker для shadow
+        outcome = 1 if shadow_hit_tp else 0
+        self.scenario_tracker.add_scenario(shadow_pos, outcome)
 
     def get_shadow_balance(self) -> float:
         return self.virtual_trader.get_balance()

@@ -3,138 +3,97 @@ src/trading/virtual_trader.py
 
 === Основной принцип работы файла ===
 
-Этот файл реализует виртуальную торговлю (симуляцию сделок без реальных ордеров на бирже).
-Он полностью повторяет логику реальной торговли, но вместо вызова order_executor просто обновляет виртуальный депозит, позиции и PNL.
+Виртуальный трейдер для симуляции позиций и расчёта PR без реальных ордеров.
 
-Ключевые задачи:
-- Открытие виртуальных позиций (при получении сигнала от entry_manager).
-- Обновление позиций в каждой новой свече (проверка TP/SL, trailing, partial close).
-- Расчёт виртуального PNL с учётом комиссии, плеча и размера позиции.
-- Передача закрытий в tp_sl_manager и scenario_tracker (для статистики).
-- Синхронизация с реальным режимом: те же проверки (no open по типу, no new in closed candle).
+Ключевые особенности:
+- open_position: регистрация виртуальной позиции
+- update_positions: мониторинг и закрытие по TP/SL (через tp_sl_manager)
+- _close_position: расчёт net_pnl с комиссией, вызов scenario_tracker.add_scenario
+- get_balance, get_pnl — статистика виртуальной торговли
+- Поддержка extra (quiet_streak, consensus_count) в position для анализа
 
-Виртуальный режим используется:
-- Когда монета не в whitelist (только симуляция для расчёта PR).
-- В режиме "virtual" для всего бота.
-- Для тестирования без риска.
-
-=== Главные функции и за что отвечают ===
-
-- VirtualTrader() — инициализация: виртуальный баланс (из config или storage), комиссии, открытые позиции.
-- open_position(pos: dict) — открывает виртуальную позицию (расчёт размера, запись в open_positions).
-- update_positions(candle_data: dict) — проверяет все открытые позиции на закрытие (TP/SL hit).
-- _close_position(pos_id: str, is_tp: bool, price: float) — закрывает позицию, обновляет баланс, передаёт в scenario_tracker.
-- get_pnl() → float — текущий виртуальный профит/убыток.
-- get_balance() → float — текущий виртуальный депозит.
+=== Главные функции ===
+- open_position(pos: dict)
+- update_positions(candle_data: dict)
+- _close_position(pos: dict, hit_tp: bool)
+- get_balance() → float
+- get_pnl() → float
 
 === Примечания ===
-- Комиссия: taker fee из config (например, 0.04%).
-- Плечо: берётся из config или per-symbol.
-- Полностью соответствует ТЗ: виртуальная торговля для PR и тестирования.
-- Нет реальных ордеров — только симуляция.
-- Логи через setup_logger.
-- Готов к использованию в live_loop и entry_manager.
+- Комиссия учитывается в net_pnl (entry + exit)
+- Вызов scenario_tracker.add_scenario после закрытия (для статистики)
+- Полностью соответствует ТЗ + последним изменениям (extra в position)
+- Готов к интеграции в live_loop и entry_manager
+- Логи через setup_logger
 """
 
-from typing import Dict, Optional
-import time
+from typing import Dict
+import logging
 
 from src.core.config import load_config
-from src.core.enums import Direction, TradeMode
-from src.trading.tp_sl_manager import TPSLManager
+from src.trading.tp_sl_manager import TP_SL_Manager
 from src.model.scenario_tracker import ScenarioTracker
 from src.utils.logger import setup_logger
 
 logger = setup_logger('virtual_trader', logging.INFO)
 
 class VirtualTrader:
-    """
-    Симулятор виртуальной торговли.
-    """
     def __init__(self):
         self.config = load_config()
-        self.balance = self.config['trading']['initial_balance']  # Начальный виртуальный депозит
-        self.positions: Dict[str, Dict] = {}  # pos_id → pos dict
-        self.tp_sl_manager = TPSLManager()
+        self.tp_sl_manager = TP_SL_Manager()
         self.scenario_tracker = ScenarioTracker()
-        self.commission_rate = self.config['trading']['commission_rate']  # taker fee, e.g. 0.0004
+        self.positions = {}  # pos_id → position
+        self.balance = self.config.get('deposit', 10000.0)  # начальный депозит
+        self.commission_rate = self.config['trading']['commission']
 
     def open_position(self, pos: Dict):
         """
-        Открывает виртуальную позицию.
-        pos: {'symbol', 'type', 'direction', 'entry_price', 'size', 'tp', 'sl', ...}
+        Открытие виртуальной позиции
         """
-        pos_id = f"{pos['symbol']}_{pos['type']}_{int(time.time()*1000)}"
+        pos_id = f"virtual_{pos['symbol']}_{pos['anomaly_type']}_{int(pos['open_ts'])}"
         pos['pos_id'] = pos_id
-        pos['open_time'] = time.time()
-        pos['entry_price'] = pos['entry_price']
-        pos['size'] = pos['size']
-        pos['direction'] = pos['direction']
-        pos['tp'] = pos['tp']
-        pos['sl'] = pos['sl']
-
-        # Вычитаем комиссию открытия
-        commission = pos['size'] * pos['entry_price'] * self.commission_rate
-        self.balance -= commission
+        pos['entry_commission'] = pos['size'] * pos['entry_price'] * self.commission_rate
 
         self.positions[pos_id] = pos
-        self.tp_sl_manager.add_open_position(pos)
-
-        logger.info(f"[VIRTUAL] Открыта позиция {pos['type']} {pos['direction']} на {pos['symbol']}, size={pos['size']}, entry={pos['entry_price']}")
+        logger.debug(f"[VIRTUAL] Открыта позиция {pos['symbol']} {pos['anomaly_type']} "
+                     f"size={pos['size']:.4f} entry={pos['entry_price']:.2f} "
+                     f"quiet_streak={pos.get('quiet_streak', 0)} consensus={pos.get('consensus_count', 1)}")
 
     def update_positions(self, candle_data: Dict):
         """
-        Обновляет все виртуальные позиции по новой свече.
-        Проверяет TP/SL, закрывает если нужно, обновляет баланс.
+        Обновление всех виртуальных позиций по новой свече
         """
-        closed = []
+        current_price = candle_data['close']
         for pos_id, pos in list(self.positions.items()):
-            close_result = self.tp_sl_manager.check_close(pos, candle_data)
-            if close_result['closed']:
-                self._close_position(pos_id, close_result['is_tp'], close_result['price'])
-                closed.append(pos_id)
+            if self.tp_sl_manager.check_tp_sl(pos, current_price):
+                hit_tp = pos.get('hit_tp', False)
+                self._close_position(pos, hit_tp)
 
-        for pos_id in closed:
-            del self.positions[pos_id]
-
-    def _close_position(self, pos_id: str, is_tp: bool, close_price: float):
+    def _close_position(self, pos: Dict, hit_tp: bool):
         """
-        Закрывает виртуальную позицию, обновляет баланс и статистику.
+        Закрытие виртуальной позиции, расчёт net_pnl, вызов scenario_tracker
         """
-        pos = self.positions[pos_id]
-        direction = pos['direction']
-        size = pos['size']
-        entry = pos['entry_price']
+        exit_price = pos['tp'] if hit_tp else pos['sl']
+        gross_pnl = (exit_price - pos['entry_price']) * pos['size'] if pos['direction'] == 'long' else \
+                    (pos['entry_price'] - exit_price) * pos['size']
 
-        if direction == Direction.LONG.value:
-            pnl = (close_price - entry) * size
-        else:
-            pnl = (entry - close_price) * size
-
-        # Комиссия закрытия
-        commission = size * close_price * self.commission_rate
-        net_pnl = pnl - commission
+        exit_commission = pos['size'] * exit_price * self.commission_rate
+        net_pnl = gross_pnl - pos['entry_commission'] - exit_commission
 
         self.balance += net_pnl
 
-        # Передача в scenario_tracker
-        self.scenario_tracker.update_scenario(
-            scenario_key=pos['scenario_key'] if 'scenario_key' in pos else "unknown",
-            is_win=is_tp
-        )
+        # Вызов scenario_tracker
+        outcome = 1 if hit_tp else 0
+        self.scenario_tracker.add_scenario(pos, outcome)
 
-        logger.info(f"[VIRTUAL] Закрыта позиция {pos['type']} {direction} на {pos['symbol']}, PNL={net_pnl:.2f}, баланс={self.balance:.2f}")
+        logger.info(f"[VIRTUAL] Закрыта позиция {pos['symbol']} {pos['anomaly_type']} "
+                    f"{'TP' if hit_tp else 'SL'} at {exit_price:.2f} net_pnl={net_pnl:.2f} "
+                    f"balance={self.balance:.2f}")
+
+        del self.positions[pos['pos_id']]
 
     def get_balance(self) -> float:
-        """Текущий виртуальный баланс."""
         return self.balance
 
     def get_pnl(self) -> float:
-        """Общий виртуальный PNL (с момента запуска)."""
-        return self.balance - self.config['trading']['initial_balance']
-
-    def get_open_positions(self, symbol: Optional[str] = None) -> list:
-        """Список открытых виртуальных позиций."""
-        if symbol:
-            return [p for p in self.positions.values() if p['symbol'] == symbol]
-        return list(self.positions.values())
+        return self.balance - self.config.get('deposit', 10000.0)

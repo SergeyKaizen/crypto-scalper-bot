@@ -2,32 +2,34 @@
 src/trading/live_loop.py
 
 === Основной принцип работы файла ===
+
 Бесконечный цикл реальной/виртуальной торговли на Binance Futures.
 
-Ключевые задачи (по ТЗ + утверждённые изменения):
-- Докачка новых свечей по всем TF (downloader)
-- Сбор признаков по всем TF и окнам (feature_engine)
-- Сбор всех потенциальных сигналов в свече, сортировка по весу из scenario_tracker
-- Предикт только для top-1 по весу (самый большой вес)
-- Открытие 1 позиции если предикт > min_prob и монета в whitelist
-- Мониторинг TP/SL, update депозита и PR после закрытия
+Ключевые задачи (по ТЗ + последние уточнения):
+- Докачка новых свечей по всем TF
+- Сбор признаков по всем TF и окнам
+- Детекция аномалий + мульти-TF consensus
+- Сбор всех потенциальных сигналов в свече
+- Выбор top-1 по весу из scenario_tracker (самый большой вес)
+- Открытие только 1 позиции (глобальный lock: нет открытой на монете)
+- Остальные сигналы — виртуальные для PR
+- Запрет новой позиции в свече после закрытия предыдущей
 - Retrain модели каждую неделю отдельно по каждому TF
-- Ежедневное обновление списка монет (update_markets_list → auto delisted remove)
+- Ежедневное обновление списка монет (auto delisted remove)
 - Graceful shutdown на сигналы
 
 === Главные функции ===
 - live_loop() — основной цикл
-- process_candle(symbol, timeframe) — обработка новой свечи (сбор сигналов, выбор top-1 по весу)
+- process_candle(symbol, timeframe) — сбор сигналов → выбор top-1 → открытие
 - handle_closed_position(position) — PR и депозит update
-- shutdown() — закрытие позиций при остановке
+- shutdown() — закрытие позиций
 
 === Примечания ===
-- Только 1 позиция в live: top-1 по весу из всех сигналов в свече
-- Если несколько сигналов — остальные виртуальные для PR
-- Global lock: нет входа пока есть любая открытая позиция (через entry_manager)
+- Только 1 позиция в live: top-1 по весу + глобальный lock
+- Если несколько сигналов — остальные виртуальные
 - retrain: last_retrain[tf] → проверка timedelta(days=7)
 - quiet_streak: per-symbol/per-TF в quiet_streaks dict
-- consensus: только для младших TF (1m,3m,5m) требуют подтверждения старших
+- consensus: только для младших TF требуют подтверждения старших
 - polling fallback (WS можно добавить позже)
 """
 
@@ -81,8 +83,8 @@ def live_loop():
     storage = Storage()
     inference = Inference()
     trainer = Trainer()
-    scenario_tracker = ScenarioTracker()  # для весов
-    entry_manager = EntryManager()
+    scenario_tracker = ScenarioTracker()
+    entry_manager = EntryManager(scenario_tracker)  # передаём tracker для весов
     order_executor = OrderExecutor()
     tp_sl_manager = TP_SL_Manager()
     risk_manager = RiskManager()
@@ -90,9 +92,8 @@ def live_loop():
     pr_calculator = PRCalculator()
 
     global last_markets_update
-    last_markets_update = datetime.utcnow() - timedelta(days=8)  # force update on start
+    last_markets_update = datetime.utcnow() - timedelta(days=8)
 
-    # Инициализация last_retrain для каждого TF
     timeframes = config['timeframes']
     for tf in timeframes:
         last_retrain[tf] = datetime.utcnow() - timedelta(days=8)
@@ -113,11 +114,11 @@ def live_loop():
                 last_markets_update = datetime.utcnow()
                 symbols = storage.get_whitelisted_symbols()
 
-            # 2. Докачка новых свечей по всем монетам и TF
+            # 2. Докачка новых свечей
             for symbol in symbols:
                 for tf in timeframes:
                     download_new_candles(symbol, tf)
-                    time.sleep(0.1)  # rate-limit
+                    time.sleep(0.1)
 
             # 3. Еженедельный retrain per-TF
             now = datetime.utcnow()
@@ -127,7 +128,7 @@ def live_loop():
                     trainer.retrain(timeframe=tf)
                     last_retrain[tf] = now
 
-            # 4. Обработка новых свечей (polling; WS можно добавить позже)
+            # 4. Обработка новых свечей
             with concurrent.futures.ThreadPoolExecutor(max_workers=config['hardware']['max_workers']) as executor:
                 futures = []
                 for symbol in symbols:
@@ -157,16 +158,14 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
                    risk_manager: RiskManager, order_executor: OrderExecutor,
                    virtual_trader: VirtualTrader, pr_calculator: PRCalculator, config: dict):
     """
-    Обработка новой свечи для монеты и TF:
+    Обработка новой свечи:
     - Сбор признаков по всем TF
     - Детекция аномалий + consensus
     - Сбор всех potential сигналов в свече
-    - Сортировка по весу из scenario_tracker
-    - Предикт и открытие только для top-1 по весу (самый большой вес)
+    - Выбор top-1 по весу (самый большой вес)
+    - Открытие только этой позиции (если проходит проверки)
     - Остальные — виртуальные для PR
-    - Проверка глобального lock: нет открытой позиции на монете
     """
-    # Получаем данные по всем TF для мульти-TF consensus
     features_by_tf = {}
     for tf in config['timeframes']:
         df = storage.get_candles(symbol, tf, limit=config['seq_len'])
@@ -176,12 +175,10 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
     if not features_by_tf:
         return
 
-    # Детекция аномалий + consensus
     anomalies = detect_anomalies(features_by_tf, timeframe)
 
     tf_anomalies = anomalies.get(timeframe, {})
 
-    # Сбор всех potential сигналов в свече (list of (anom, window, weight, feats))
     signals = []
     for window, anom in tf_anomalies.items():
         if not anom['confirmed']:
@@ -191,7 +188,6 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
         if anomaly_type == 'Q':
             continue
 
-        # Quiet streak per-symbol/per-TF
         quiet_streak = quiet_streaks[symbol][timeframe]
         if anomaly_type != 'Q':
             quiet_streaks[symbol][timeframe] = 0
@@ -199,7 +195,6 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
             quiet_streaks[symbol][timeframe] += 1
             quiet_streak = quiet_streaks[symbol][timeframe]
 
-        # Предикт модели (с extra quiet_streak)
         predict_prob = inference.predict(
             features_by_tf[timeframe][window],
             anomaly_type,
@@ -209,59 +204,78 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
         if predict_prob < config['trading']['min_prob']:
             continue
 
-        # Whitelist check
         wl = storage.get_whitelist_settings(symbol)
         if not wl or wl['tf'] != timeframe or wl['anomaly_type'] != anomaly_type:
-            # Виртуальная для PR
             if virtual_trader:
                 tp_sl = tp_sl_manager.calculate_tp_sl(features_by_tf[timeframe][window])
                 virtual_trader.open_virtual_position(symbol, anomaly_type, predict_prob, tp_sl)
             continue
 
-        # Рассчитываем вес сигнала
         feats = features_by_tf[timeframe][window]
         weight = scenario_tracker.get_weight(scenario_tracker._binarize_features(feats))
 
-        signals.append((anom, window, weight, feats, predict_prob, quiet_streak))
+        signals.append({
+            'anom': anom,
+            'window': window,
+            'feats': feats,
+            'prob': predict_prob,
+            'quiet_streak': quiet_streak,
+            'weight': weight
+        })
 
-    # Если несколько сигналов — сортировка по весу, выбор top-1
     if signals:
-        signals.sort(key=lambda x: x[2], reverse=True)
-        top_anom, top_window, top_weight, top_feats, top_prob, top_quiet = signals[0]
+        # Выбор top-1 по весу
+        signals.sort(key=lambda x: x['weight'], reverse=True)
+        top_sig = signals[0]
 
-        # Проверка глобального lock: нет открытой позиции на монете
-        if entry_manager.has_any_open_position(symbol):
-            logger.debug(f"Открытая позиция на {symbol} — новая не открывается")
-            return
-
-        # Расчёт и открытие top-1
-        anomaly_type = top_anom['type']
+        anomaly_type = top_sig['anom']['type']
         direction = wl['direction']  # L/S/LS → resolve
 
-        risk = risk_manager.calculate_risk(config['trading']['risk_pct'], config['deposit'])
-        sl_distance = tp_sl_manager.sl_distance(top_feats)
-        position_size = risk_manager.calculate_position_size(risk, sl_distance)
-
-        min_size = config.get('min_order_size', {}).get(symbol, 0.001)
-        if position_size < min_size:
-            logger.warning(f"Маленький размер позиции для {symbol}")
-            return
-
-        tp, sl = tp_sl_manager.calculate_tp_sl(top_feats, timeframe)
-        position = entry_manager.open_position(
-            symbol, direction, position_size, tp, sl,
-            order_executor, virtual_trader,
-            extra={'quiet_streak': top_quiet}
+        sl_price = tp_sl_manager.calculate_sl(candle_data, direction)
+        size = risk_manager.calculate_size(
+            symbol=symbol,
+            entry_price=candle_data['close'],
+            sl_price=sl_price,
+            risk_pct=config['trading']['risk_pct']
         )
 
-        if position:
-            open_positions[symbol].append(position)
-            logger.info(f"Открыта топ-позиция {anomaly_type} {direction} на {symbol} с весом {top_weight:.4f}")
+        if size <= 0:
+            logger.warning(f"Некорректный размер позиции для {symbol}")
+            return
 
-        # Остальные сигналы — виртуальные для PR
-        for _, _, _, feats, prob, quiet in signals[1:]:
-            tp_sl = tp_sl_manager.calculate_tp_sl(feats, timeframe)
-            virtual_trader.open_virtual_position(symbol, anomaly_type, prob, tp_sl, extra={'quiet_streak': quiet})
+        position = {
+            'symbol': symbol,
+            'anomaly_type': anomaly_type,
+            'direction': direction,
+            'entry_price': candle_data['close'],
+            'size': size,
+            'open_ts': candle_ts,
+            'prob': top_sig['prob'],
+            'quiet_streak': top_sig['quiet_streak'],
+            'consensus_count': top_sig['anom'].get('consensus_count', 1)
+        }
+
+        mode = entry_manager._resolve_mode(symbol, anomaly_type, direction)
+        if mode == TradeMode.REAL:
+            order_id = order_executor.place_order(position)
+            if order_id:
+                position['order_id'] = order_id
+                logger.info(f"Открыта реальная позиция {anomaly_type} {direction} на {symbol}, size={size}, weight={top_sig['weight']:.4f}")
+            else:
+                logger.error(f"Ошибка открытия реальной позиции {symbol}")
+                return
+        else:
+            virtual_trader.open_position(position)
+            logger.debug(f"Открыта виртуальная позиция {anomaly_type} {direction} на {symbol}, size={size}, weight={top_sig['weight']:.4f}")
+
+        tp_sl_manager.add_open_position(position)
+
+        # Остальные сигналы — виртуальные
+        for sig in signals[1:]:
+            virtual_trader.open_virtual_position(
+                symbol, sig['anom']['type'], sig['prob'],
+                tp_sl_manager.calculate_tp_sl(sig['feats'], sig['anom']['type'])
+            )
 
     # Мониторинг открытых позиций
     if symbol in open_positions:
@@ -274,7 +288,6 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
 
 
 def handle_closed_position(position: dict, pr_calculator: PRCalculator, risk_manager: RiskManager, config: dict):
-    """Обработка закрытой позиции"""
     net_pl = position.get('net_pl', 0)
     risk_manager.update_deposit(net_pl)
     pr_calculator.update_pr(
