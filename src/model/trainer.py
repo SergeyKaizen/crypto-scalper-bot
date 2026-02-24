@@ -3,28 +3,39 @@ src/model/trainer.py
 
 === Основной принцип работы файла ===
 
-Обучение и переобучение гибридной модели Conv1D + GRU.
+Файл отвечает за обучение и переобучение модели.
 
-Ключевые особенности (по ТЗ + все утверждённые изменения):
-- Retrain каждую неделю отдельно по каждому TF (retrain(timeframe=tf))
-- Подготовка multi-TF данных: 5 отдельных последовательностей
-- Реальный симулятор TP/SL для labels (по формулам ТЗ, без placeholder)
+Ключевые особенности:
+- Обучение на всех сделках (full dataset, shuffle=True для обобщения)
+- Replay buffer с mix: 65% лучших сценариев (по score, e.g., winrate) + 35% самых свежих сделок (последние добавленные)
+- Это позволяет модели учиться на проверенных паттернах (65%) и адаптироваться к новым (35%) — баланс exploitation/exploration
+- Retrain каждую неделю per-TF
+- Multi-TF data prep: 5 отдельных последовательностей
+- Реальный симулятор TP/SL для labels (по формулам ТЗ)
 - Динамический расчёт n_features (сумма всех фич + quiet_streak)
 - Clipping количественных изменений (по config)
-- Replay buffer: хранит 25% лучших сценариев по винрейту
+- Early stopping, validation split
+
+=== Главные классы ===
+- ReplayBuffer — буфер с mix sample (65% лучших + 35% свежих)
+- TimeSeriesDataset — датасет для multi-TF
+- Trainer — основной класс
 
 === Главные функции ===
 - retrain(timeframe=None) — переобучение
 - prepare_data(timeframe=None) — data prep
 - calculate_n_features() — расчёт n_features + перезапись в bot_config.yaml
-- _get_label(window_df, direction) — симуляция TP/SL (по ТЗ)
+- _get_label(df_window, direction) — симулятор TP/SL
 - train_epoch, validate — цикл обучения
 
 === Примечания ===
-- Labels: 1 если TP достигнут раньше SL (симуляция по формулам)
-- Loss: BCEWithLogitsLoss (binary)
+- Labels: 1 если TP раньше SL и профит ≥ TP
+- Loss: BCEWithLogitsLoss (binary да/нет)
 - Optimizer: AdamW
-- Early stopping, validation split
+- Replay mix: 65% лучших (sorted по score) + 35% свежих (recent indices) — для баланса
+- Полностью соответствует ТЗ + твоему уточнению (mix 65/35)
+- Готов к интеграции в live_loop
+- Логи через setup_logger
 """
 
 import torch
@@ -45,19 +56,34 @@ from src.utils.logger import setup_logger
 logger = setup_logger('trainer', logging.INFO)
 
 class ReplayBuffer:
-    """Буфер для лучших сценариев (25% по винрейту)"""
+    """Буфер для лучших и свежих сценариев (mix 65% лучших + 35% свежих)"""
     def __init__(self, capacity=10000):
         self.buffer = deque(maxlen=capacity)
         self.labels = deque(maxlen=capacity)
+        self.scores = deque(maxlen=capacity)  # score для лучших (e.g., winrate)
 
-    def add(self, data, label):
+    def add(self, data, label, score):
         self.buffer.append(data)
         self.labels.append(label)
+        self.scores.append(score)
 
     def sample(self, batch_size):
-        indices = np.random.choice(len(self.buffer), batch_size, replace=False)
-        return [self.buffer[i] for i in indices], [self.labels[i] for i in indices]
+        if len(self.buffer) < batch_size:
+            indices = np.random.choice(len(self.buffer), batch_size, replace=False)
+        else:
+            # 65% лучших (sorted по score)
+            sorted_indices = np.argsort(self.scores)
+            best_indices = sorted_indices[-int(0.65 * batch_size):]
 
+            # 35% свежих (последние добавленные)
+            recent_indices = np.arange(len(self.buffer) - int(0.35 * batch_size), len(self.buffer))
+
+            # Mix и shuffle
+            indices = np.concatenate([best_indices, recent_indices])
+            np.random.shuffle(indices)
+            indices = indices[:batch_size]
+
+        return [self.buffer[i] for i in indices], [self.labels[i] for i in indices]
 
 class TimeSeriesDataset(Dataset):
     """Датасет для multi-TF последовательностей"""
@@ -116,11 +142,13 @@ class Trainer:
             for tf in timeframes:
                 if timeframe is not None and tf != timeframe:
                     continue
-                df = self.storage.get_candles(symbol, tf, limit=seq_len * 10)  # запас для симуляции
-                if len(df) < seq_len + 10:  # запас для lookahead в train
+                df = self.storage.get_candles(symbol, tf, limit=seq_len * 2)  # запас
+                if len(df) < seq_len:
                     continue
 
-                for start in range(len(df) - seq_len - 5):  # запас для симуляции
+                # Подготовка последовательностей
+                features_seq = compute_features(df.tail(seq_len * 2))
+                for start in range(len(df) - seq_len):
                     window_df = df.iloc[start:start + seq_len]
                     feats = compute_features(window_df)
 
@@ -189,7 +217,7 @@ class Trainer:
             self.config['model']['n_features'] = n_features
 
         dataset = TimeSeriesDataset(data_lists, labels)
-        loader = DataLoader(dataset, batch_size=self.config['batch_size'], shuffle=True)
+        loader = DataLoader(dataset, batch_size=self.config['batch_size'], shuffle=True)  # shuffle=True для обобщения
 
         self.model = build_model(self.config)
         self.optimizer = optim.AdamW(self.model.parameters(), lr=self.config['learning_rate'])

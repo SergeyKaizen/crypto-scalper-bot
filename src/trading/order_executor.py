@@ -7,11 +7,11 @@ src/trading/order_executor.py
 
 Ключевые особенности:
 - place_order: market entry + установка TP (LIMIT reduceOnly) + SL (STOP_MARKET reduceOnly)
-- Установка leverage перед открытием
-- Полная обработка ошибок (InsufficientFunds, RateLimit, InvalidOrder, etc.)
+- Установка leverage перед открытием (по config)
+- Полная обработка ошибок (InsufficientFunds, RateLimit, InvalidOrder и т.д.)
 - cancel_order, get_order_status
-- Логирование с quiet_streak и consensus_count (для анализа в live)
-- Поддержка extra в position (quiet_streak, consensus_count)
+- Логирование с quiet_streak, consensus_count и weight (если передан)
+- Поддержка extra в position (quiet_streak, consensus_count, weight)
 
 === Главные функции ===
 - place_order(position: dict) → order_id или None
@@ -62,6 +62,7 @@ class OrderExecutor:
         sl = position.get('sl')
         quiet_streak = position.get('quiet_streak', 0)
         consensus_count = position.get('consensus_count', 1)
+        weight = position.get('weight', None)  # если передан из entry_manager
 
         try:
             # Установка leverage
@@ -102,9 +103,13 @@ class OrderExecutor:
                     }
                 )
 
-            logger.info(f"[ORDER] Открыта позиция {direction} {symbol} size={size:.4f} "
-                        f"entry={entry_price:.2f} TP={tp} SL={sl} "
-                        f"quiet_streak={quiet_streak} consensus={consensus_count} order_id={order_id}")
+            # Лог с дополнительными параметрами
+            log_msg = f"[ORDER] Открыта позиция {direction} {symbol} size={size:.4f} " \
+                      f"entry={entry_price:.2f} TP={tp} SL={sl} " \
+                      f"quiet_streak={quiet_streak} consensus={consensus_count}"
+            if weight is not None:
+                log_msg += f" weight={weight:.4f}"
+            logger.info(log_msg + f" order_id={order_id}")
 
             return order_id
 
@@ -128,7 +133,7 @@ class OrderExecutor:
         except Exception as e:
             logger.error(f"Ошибка отмены ордера {order_id}: {e}")
 
-    def get_order_status(self, order_id: str):
+    def get_order_status(self, order_id: str) -> Optional[str]:
         """Статус ордера"""
         try:
             order = self.exchange.fetch_order(order_id)

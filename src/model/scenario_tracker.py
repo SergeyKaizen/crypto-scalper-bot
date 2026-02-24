@@ -9,7 +9,7 @@ src/model/scenario_tracker.py
 - Бинаризация всех признаков → уникальный ключ сценария (tuple)
 - Обновление статистики после каждой закрытой сделки (win/loss)
 - Вес сценария = winrate × log(count + 1) — чтобы редкие 100% не перевешивали частые 70%
-- Кластеризация HDBSCAN для выявления топ-групп (лучше K-Means для sparse данных)
+- Кластеризация HDBSCAN для выявления топ-групп (лучше K-Means для неравномерных данных)
 - Экспорт в CSV каждые 1000 сделок + по команде (для Google Sheets)
 - Принудительная выгрузка через export_statistics()
 
@@ -25,8 +25,9 @@ src/model/scenario_tracker.py
 - Бинаризация: increased/decreased, >threshold, count ≥2/≥4 и т.д.
 - Sequential паттерны — все из списка (~20–25 штук)
 - Quiet streak — бинарный (ge3, ge5)
-- Статистика in-memory + pickle для persistence
+- Статистика in-memory + pickle для persistence между перезапусками
 - Полностью соответствует ТЗ + всем обновлениям
+- Готов к использованию в live_loop, entry_manager, virtual_trader
 """
 
 import numpy as np
@@ -53,7 +54,7 @@ class ScenarioTracker:
         self.pickle_path = os.path.join(self.data_dir, 'scenario_tracker.pkl')
         self.min_count_weight = 5  # минимум сделок для значимого веса
 
-        # Загрузка из pickle если есть
+        # Загрузка из pickle если есть (persistence между перезапусками)
         self._load_from_pickle()
 
     def _load_from_pickle(self):

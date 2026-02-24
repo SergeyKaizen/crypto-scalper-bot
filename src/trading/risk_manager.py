@@ -13,7 +13,7 @@ src/trading/risk_manager.py
 - Логирование quiet_streak и consensus_count (для анализа в live)
 
 === Главные функции ===
-- calculate_size(symbol, entry_price, sl_price, risk_pct) → size
+- calculate_size(symbol, entry_price, sl_price, risk_pct, quiet_streak=0, consensus_count=1) → size
 - update_deposit(net_pl) — обновление баланса
 - get_balance() — текущий баланс (реальный или симулированный)
 
@@ -21,7 +21,7 @@ src/trading/risk_manager.py
 - Формула соответствует ТЗ: риск = % от депозита / расстояние до SL
 - Leverage из config (по умолчанию 20)
 - Комиссия учитывается в net_pl (от order_executor/virtual_trader)
-- Полностью соответствует ТЗ + последним изменениям (логи extra)
+- Полностью соответствует ТЗ + последним изменениям (extra в log)
 - Готов к интеграции в entry_manager и live_loop
 - Логи через setup_logger
 """
@@ -47,16 +47,17 @@ class RiskManager:
         self.balance = self._get_real_balance()  # начальный баланс из Binance
         self.leverage = self.config['trading'].get('leverage', 20)
 
-    def calculate_size(self, symbol: str, entry_price: float, sl_price: float, risk_pct: float) -> float:
+    def calculate_size(self, symbol: str, entry_price: float, sl_price: float, risk_pct: float,
+                       quiet_streak: int = 0, consensus_count: int = 1) -> float:
         """
         Расчёт размера позиции по ТЗ.
         """
-        if sl_price == entry_price:
-            logger.warning(f"SL = entry для {symbol} — размер позиции = 0")
+        if sl_price == entry_price or np.isnan(sl_price):
+            logger.warning(f"SL = entry или NaN для {symbol} — размер позиции = 0")
             return 0.0
 
         sl_distance = abs(entry_price - sl_price) / entry_price  # в долях
-        if sl_distance == 0:
+        if sl_distance == 0 or np.isnan(sl_distance):
             return 0.0
 
         risk_amount = self.balance * (risk_pct / 100)
@@ -68,7 +69,8 @@ class RiskManager:
             logger.warning(f"Размер позиции {size:.4f} ниже min_notional {min_notional} для {symbol}")
             return 0.0
 
-        logger.debug(f"Расчёт размера для {symbol}: risk={risk_amount:.2f}, distance={sl_distance:.4f}, size={size:.4f}")
+        logger.debug(f"Расчёт размера для {symbol}: risk={risk_amount:.2f}, distance={sl_distance:.4f}, "
+                     f"size={size:.4f}, quiet_streak={quiet_streak}, consensus={consensus_count}")
         return size
 
     def update_deposit(self, net_pl: float):

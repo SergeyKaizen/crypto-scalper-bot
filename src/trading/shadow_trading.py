@@ -11,8 +11,8 @@ src/trading/shadow_trading.py
 - shadow_open: дублирует открытие реальной позиции в shadow
 - shadow_update: обновляет все shadow позиции по новой свече
 - compare_real_vs_shadow: детальное сравнение (slippage, hit TP/SL, PNL, quiet_streak, consensus)
+- Вызов scenario_tracker.add_scenario для shadow после закрытия
 - get_shadow_balance, get_shadow_pnl — статистика теневой торговли
-- Вызов scenario_tracker.add_scenario после закрытия shadow-позиции
 
 === Главные функции ===
 - shadow_open(real_pos: dict, real_order_id: str)
@@ -119,7 +119,7 @@ class ShadowTrading:
         logger.info(f"[SHADOW] Сравнение завершено | real_PNL={real_pnl:.2f} shadow_PNL={shadow_pnl:.2f} "
                     f"slippage={slippage_pct:+.1f}% | {real_pos['symbol']}")
 
-        # Вызов scenario_tracker для shadow
+        # Вызов scenario_tracker для shadow (для статистики)
         outcome = 1 if shadow_hit_tp else 0
         self.scenario_tracker.add_scenario(shadow_pos, outcome)
 

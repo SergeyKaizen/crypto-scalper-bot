@@ -1,23 +1,23 @@
 # config/default.yaml
 # Финальная дефолтная конфигурация проекта (февраль 2026)
-# Все параметры можно переопределять в bot_config.yaml или trading_modes/*.yaml
+# Переопределяется в bot_config.yaml и trading_modes/*.yaml
 
 paths:
   data_dir: "data/"
   models_dir: "data/models/"
   logs_dir: "logs/"
-  export_dir: "data/exports/"          # для scenario_stats.csv и кластеров
+  export_dir: "data/exports/"          # для scenario_stats.csv, top_clusters.csv и т.д.
 
 binance:
   api_key: "YOUR_API_KEY_HERE"
   api_secret: "YOUR_API_SECRET_HERE"
 
-# Таймфреймы и окна
+# Таймфреймы и окна анализа
 timeframes: ["1m", "3m", "5m", "10m", "15m"]
 seq_len: 100
 windows: [24, 50, 74, 100]
 
-# Hardware (Colab → Server)
+# Hardware (переключается через hardware_mode в bot_config.yaml)
 hardware:
   max_workers: 16
   model_size: "medium"                 # small / medium / large (large на сервере)
@@ -26,10 +26,11 @@ hardware:
 trading:
   mode: "balanced"                     # aggressive / balanced / conservative / custom
   min_prob: 0.65                       # минимальная вероятность для обычных аномалий
-  min_prob_q: 0.75                     # повышенный порог для Quiet (Q)
+  min_prob_q: 0.75                     # повышенный порог для Quiet (Q) — снижает ложняки в боковике
   risk_pct: 1.0                        # % от депозита на сделку
   commission: 0.0004                   # taker fee Binance Futures
   dropout: 0.3
+  leverage: 20                         # базовое плечо
 
 # Модель
 model:
@@ -38,8 +39,8 @@ model:
   epochs: 30
   batch_size: 64
   learning_rate: 0.0005
-  retrain_interval_days: 7             # каждую неделю per-TF (последнее изменение)
-  n_features: 128                      # placeholder — рассчитывается динамически в trainer
+  retrain_interval_days: 7             # каждую неделю per-TF
+  n_features: 128                      # placeholder — перезаписывается trainer'ом
   bidirectional: true                  # Bidirectional GRU
 
 # Фильтры монет и бэктест
@@ -50,15 +51,15 @@ filter:
 
 # Value Area и Delta VA
 va:
-  va_percentage: 0.70
-  price_bin_step_pct: 0.002
+  va_percentage: 0.70                  # 70% объёма от POC для VAH/VAL
+  price_bin_step_pct: 0.002            # шаг бина цены в профиле
 
 # Мульти-TF consensus
 consensus:
-  min_tf_consensus: 2
-  va_confirm_enabled: false            # строгое подтверждение VA отключено (модель сама учится)
+  min_tf_consensus: 2                  # минимум старших TF для подтверждения аномалии
+  va_confirm_enabled: false            # строгое подтверждение VA — отключено (модель сама учится)
 
-# Clipping для количественных фич (защита от выбросов)
+# Clipping для защиты от выбросов в фичах
 clipping_bounds:
   delta_change_pct: [-100, 100]
   volatility_change_pct: [-50, 50]

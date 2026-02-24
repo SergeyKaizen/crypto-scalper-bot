@@ -10,7 +10,7 @@ src/trading/virtual_trader.py
 - update_positions: мониторинг и закрытие по TP/SL (через tp_sl_manager)
 - _close_position: расчёт net_pnl с комиссией, вызов scenario_tracker.add_scenario
 - get_balance, get_pnl — статистика виртуальной торговли
-- Поддержка extra (quiet_streak, consensus_count) в position для анализа
+- Поддержка extra в position (quiet_streak, consensus_count) для анализа
 
 === Главные функции ===
 - open_position(pos: dict)
@@ -29,6 +29,7 @@ src/trading/virtual_trader.py
 
 from typing import Dict
 import logging
+import time
 
 from src.core.config import load_config
 from src.trading.tp_sl_manager import TP_SL_Manager
@@ -82,13 +83,13 @@ class VirtualTrader:
 
         self.balance += net_pnl
 
-        # Вызов scenario_tracker
+        # Вызов scenario_tracker для статистики
         outcome = 1 if hit_tp else 0
         self.scenario_tracker.add_scenario(pos, outcome)
 
         logger.info(f"[VIRTUAL] Закрыта позиция {pos['symbol']} {pos['anomaly_type']} "
                     f"{'TP' if hit_tp else 'SL'} at {exit_price:.2f} net_pnl={net_pnl:.2f} "
-                    f"balance={self.balance:.2f}")
+                    f"balance={self.balance:.2f} quiet_streak={pos.get('quiet_streak', 0)}")
 
         del self.positions[pos['pos_id']]
 

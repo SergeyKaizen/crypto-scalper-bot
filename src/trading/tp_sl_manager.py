@@ -3,30 +3,30 @@ src/trading/tp_sl_manager.py
 
 === Основной принцип работы файла ===
 
-Менеджер расчёта и мониторинга TP/SL для открытых позиций.
+Менеджер расчёта и мониторинга TP/SL для открытых позиций (реальных и виртуальных).
 
-Реализует расчёт уровней по ТЗ:
-- TP = средний размер свечи (avg candle range)
-- SL = HH/LL ±0.05% с cap на 2× средний размер свечи
-- Поддерживает режимы: classic, partial_trailing, chandelier (по config)
-- Мониторит закрытие позиций (TP/SL hit) каждую новую свечу
-- Вызывает entry_manager.update_candle_close_flag после закрытия (запрет новых входов в свече)
-- Хранит открытые позиции (symbol_anomaly_type → pos)
+Ключевые особенности (по ТЗ):
+- calculate_tp_sl: TP = средний размер свечи, SL = HH/LL ±0.05% с cap на 2× avg_size
+- Поддержка режимов: classic (основной), partial_trailing, chandelier (по config)
+- check_tp_sl: мониторинг закрытия позиции (TP/SL hit), вызов update_candle_close_flag после закрытия
+- add_open_position / has_open_position / has_any_open_position — регистрация и проверки
+- Глобальный lock (has_any_open_position) — только 1 позиция на монету в live
 
 === Главные функции ===
 - calculate_tp_sl(candle_data, timeframe) → tp, sl (основной расчёт по ТЗ)
-- calculate_levels(candle_data, direction, mode='classic') — расчёт по режиму
 - check_tp_sl(position, current_price) — проверка закрытия, вызов update_flag
-- add_open_position(pos) — регистрация позиции
-- has_open_position(symbol, anomaly_type) — проверка открытой по типу
-- update_candle_close_flag(candle_ts) — вызов entry_manager (новое)
+- add_open_position(pos)
+- has_open_position(symbol, anomaly_type)
+- has_any_open_position(symbol) — глобальный lock для live
+- update_candle_close_flag(candle_ts) — вызов entry_manager
 
 === Примечания ===
-- Cap 2× avg_size — по ТЗ (если HH/LL > cap → shift к следующему)
-- Вызов update_flag после закрытия — обеспечивает запрет новой позиции в свече
+- Cap 2× avg_size — строго по ТЗ
+- Вызов update_flag после любого закрытия — обеспечивает запрет новой позиции в свече
 - quiet_streak и consensus_count передаются в pos (для log и анализа)
-- Полностью соответствует ТЗ + последним изменениям
+- Полностью соответствует ТЗ + всем уточнениям (1 позиция в live, флаг после закрытия)
 - Готов к интеграции в live_loop и entry_manager
+- Логи через setup_logger
 """
 
 from typing import Dict, Tuple, Optional
@@ -52,7 +52,8 @@ class TP_SL_Manager:
         # Средний размер свечи (в % от close)
         avg_size = candle_data.get('volatility_mean', 0.0)
 
-        if avg_size == 0:
+        if avg_size == 0 or np.isnan(avg_size):
+            # Fallback на средний range
             avg_size = np.mean(candle_data['high'] - candle_data['low']) / candle_data['close'].mean()
 
         direction = candle_data.get('direction', Direction.LONG.value)
@@ -106,7 +107,8 @@ class TP_SL_Manager:
             self.entry_manager.update_candle_close_flag(candle_ts)
 
             logger.info(f"Позиция закрыта {position['symbol']} {position['anomaly_type']}: "
-                        f"{'TP' if hit_tp else 'SL'} at {current_price}")
+                        f"{'TP' if hit_tp else 'SL'} at {current_price:.2f} "
+                        f"quiet_streak={position.get('quiet_streak', 0)} consensus={position.get('consensus_count', 1)}")
 
             # Удаление из открытых
             key = f"{position['symbol']}_{position['anomaly_type']}"
@@ -121,7 +123,7 @@ class TP_SL_Manager:
         """Регистрация открытой позиции"""
         key = f"{pos['symbol']}_{pos['anomaly_type']}"
         self.open_positions[key] = pos
-        logger.debug(f"Добавлена открытая позиция {key}")
+        logger.debug(f"Добавлена открытая позиция {key} quiet_streak={pos.get('quiet_streak', 0)}")
 
     def has_open_position(self, symbol: str, anomaly_type: str) -> bool:
         """Проверка открытой позиции по типу"""

@@ -8,8 +8,8 @@ src/model/inference.py
 Ключевые особенности (по ТЗ + последние уточнения):
 - Multi-TF input: 5 отдельных тензоров (1m,3m,5m,10m,15m)
 - Binary предсказание: да/нет — будет ли прибыль ≥ TP и дойдёт ли до TP раньше SL
-- quiet_streak как дополнительный канал (repeat по seq_len)
-- n_features из config (рассчитано в trainer)
+- quiet_streak добавляется как дополнительный канал (repeat по seq_len)
+- n_features из config (динамически рассчитано в trainer)
 - Проверка shape перед forward (защита от ошибок)
 - Eval mode для скорости в live_loop
 
@@ -86,7 +86,7 @@ class Inference:
 
         # Предикт
         with torch.no_grad():
-            prob = self.model(inputs)[0].item()  # binary prob (0-1)
+            prob = self.model(inputs).item()  # binary prob (0-1)
 
         logger.debug(f"Предикт для {anomaly_type}: {prob:.4f}")
         return prob
