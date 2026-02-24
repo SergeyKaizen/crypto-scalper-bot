@@ -5,23 +5,24 @@ src/model/architectures.py
 
 Гибридная архитектура Conv1D + Bidirectional GRU для предсказания.
 
-Изменения по последнему ТЗ:
+Изменения по последнему ТЗ + интеграция кластеров:
 - Multi-TF input: 5 отдельных тензоров (1m,3m,5m,10m,15m)
 - Input shape: (batch, seq_len, n_features) на каждый TF
-- Предсказание: не только да/нет (binary prob), но и ожидаемый профит (tp_distance / sl_distance если TP раньше SL, иначе -1)
-- Multi-task: BCE для binary + MSE для regression
+- Предсказание: binary prob + expected_profit_ratio (multi-task)
 - Bidirectional GRU включён по умолчанию
 - Масштабирование под железо (model_size)
+- Добавлен cluster_id как фича: nn.Embedding(num_clusters, embedding_dim) → concat к fused после Conv
 
 === Главные классы ===
 
 - ConvBranch — Conv1D ветка для одного TF
-- HybridMultiTFConvGRU — основная модель (multi-task output)
+- HybridMultiTFConvGRU — основная модель (multi-task + cluster embedding)
 
 === Примечания ===
-- Input: list of 5 tensors (по TF)
+- Input: list of 5 tensors (по TF) + cluster_id (scalar)
 - Output: [prob, expected_profit_ratio] (prob > min_prob → сигнал, ratio >1 → TP раньше SL)
 - n_features динамический (из config)
+- cluster_id = 0 для fallback (outlier или нет кластера)
 - Готов к trainer/inference/live_loop
 """
 
@@ -29,6 +30,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from src.core.config import load_config
+
+logger = logging.getLogger(__name__)
 
 class ConvBranch(nn.Module):
     """Conv1D ветка для одного таймфрейма"""
@@ -41,7 +44,7 @@ class ConvBranch(nn.Module):
         self.pool = nn.AdaptiveAvgPool1d(1)
 
     def forward(self, x):
-        x = x.transpose(1, 2)
+        x = x.transpose(1, 2)  # (batch, channels, seq_len)
         x = F.relu(self.bn1(self.conv1(x)))
         x = F.relu(self.bn2(self.conv2(x)))
         x = self.pool(x).squeeze(-1)  # (batch, hidden_size)
@@ -50,7 +53,8 @@ class ConvBranch(nn.Module):
 
 class HybridMultiTFConvGRU(nn.Module):
     def __init__(self, n_features: int, num_tf: int = 5, seq_len: int = 100,
-                 hidden_size: int = 128, dropout: float = 0.3, model_size: str = 'medium'):
+                 hidden_size: int = 128, dropout: float = 0.3, model_size: str = 'medium',
+                 num_clusters: int = 50, cluster_embedding_dim: int = 16):
         super().__init__()
         self.num_tf = num_tf
         self.seq_len = seq_len
@@ -76,9 +80,12 @@ class HybridMultiTFConvGRU(nn.Module):
         self.fusion_dense = nn.Linear(fusion_in, hidden_size * 2)
         self.bn_fusion = nn.BatchNorm1d(hidden_size * 2)
 
+        # Embedding для cluster_id
+        self.cluster_emb = nn.Embedding(num_clusters + 1, cluster_embedding_dim)  # +1 для fallback/outlier
+
         # Bidirectional GRU
         self.gru = nn.GRU(
-            input_size=hidden_size * 2,
+            input_size=hidden_size * 2 + cluster_embedding_dim,  # + embedding dim
             hidden_size=hidden_size,
             num_layers=gru_layers,
             batch_first=True,
@@ -92,9 +99,10 @@ class HybridMultiTFConvGRU(nn.Module):
         self.fc_binary = nn.Linear(hidden_size * 2, 1)   # для да/нет
         self.fc_regression = nn.Linear(hidden_size * 2, 1)  # для ожидаемого профита
 
-    def forward(self, inputs: list):
+    def forward(self, inputs: list, cluster_id: torch.Tensor):
         """
         inputs: list of 5 tensors (по TF), каждый (batch, seq_len, n_features)
+        cluster_id: tensor (batch,) — id кластера (0 для fallback)
         """
         if len(inputs) != self.num_tf:
             raise ValueError(f"Ожидается {self.num_tf} входов по TF, получено {len(inputs)}")
@@ -105,12 +113,16 @@ class HybridMultiTFConvGRU(nn.Module):
 
         fused = torch.cat(branch_outputs, dim=1)  # (batch, hidden_size * num_tf)
 
-        fused = F.relu(self.bn_fusion(self.fusion_dense(fused)))
+        fused = F.relu(self.bn_fusion(self.fusion_dense(fused)))  # (batch, hidden_size * 2)
 
-        fused = fused.unsqueeze(1)  # (batch, 1, hidden_size*2)
+        # Добавляем embedding кластера
+        cluster_emb = self.cluster_emb(cluster_id.long())  # (batch, embedding_dim)
+        fused = torch.cat([fused, cluster_emb], dim=1)  # (batch, hidden_size * 2 + embedding_dim)
+
+        fused = fused.unsqueeze(1)  # (batch, 1, hidden_size * 2 + embedding_dim)
 
         gru_out, _ = self.gru(fused)
-        gru_out = gru_out[:, -1, :]  # last hidden (batch, hidden_size*2)
+        gru_out = gru_out[:, -1, :]  # last hidden (batch, hidden_size * 2)
 
         out = self.dropout(gru_out)
 
@@ -130,6 +142,8 @@ def build_model(config):
     model_size = config.get('model_size', 'medium')
     dropout = config.get('dropout', 0.3)
     hidden_size = config.get('hidden_size', 128)
+    num_clusters = config.get('num_clusters', 50)
+    cluster_embedding_dim = config.get('cluster_embedding_dim', 16)
 
     model = HybridMultiTFConvGRU(
         n_features=n_features,
@@ -137,12 +151,14 @@ def build_model(config):
         seq_len=seq_len,
         hidden_size=hidden_size,
         dropout=dropout,
-        model_size=model_size
+        model_size=model_size,
+        num_clusters=num_clusters,
+        cluster_embedding_dim=cluster_embedding_dim
     )
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
     model.eval()  # inference mode
 
-    logger.info(f"Модель построена: {model_size}, TF: {num_tf}, features: {n_features}, seq_len: {seq_len}")
+    logger.info(f"Модель построена: {model_size}, TF: {num_tf}, features: {n_features}, seq_len: {seq_len}, clusters: {num_clusters}")
     return model

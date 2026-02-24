@@ -42,6 +42,8 @@ model:
   retrain_interval_days: 7             # каждую неделю per-TF
   n_features: 128                      # placeholder — перезаписывается trainer'ом
   bidirectional: true                  # Bidirectional GRU
+  num_clusters: 50                     # максимальное количество кластеров в HDBSCAN
+  cluster_embedding_dim: 16            # размерность эмбеддинга кластера в модели
 
 # Фильтры монет и бэктест
 filter:
@@ -72,3 +74,10 @@ logging:
   level: "INFO"
   file: "logs/bot.log"
   max_size_mb: 100
+
+# Параметры для walk-forward (добавлены для WFO)
+backtest:
+  walk_forward: false                  # включить режим walk-forward (по умолчанию выключен)
+  walk_forward_periods: 8              # количество сегментов
+  walk_forward_segment_months: 3       # длина одного сегмента в месяцах
+  walk_forward_retrain_frequency: "weekly"  # частота retrain в in-sample
