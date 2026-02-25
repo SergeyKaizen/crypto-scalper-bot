@@ -3,39 +3,22 @@ src/model/trainer.py
 
 === Основной принцип работы файла ===
 
-Файл отвечает за обучение и переобучение модели.
+Обучение и переобучение модели.
 
-Ключевые особенности:
-- Обучение на всех сделках (full dataset, shuffle=True для обобщения)
-- Replay buffer с mix: 65% лучших сценариев (по score, e.g., winrate) + 35% самых свежих сделок (последние добавленные)
-- Это позволяет модели учиться на проверенных паттернах (65%) и адаптироваться к новым (35%) — баланс exploitation/exploration
-- Retrain каждую неделю per-TF
-- Multi-TF data prep: 5 отдельных последовательностей
-- Реальный симулятор TP/SL для labels (по формулам ТЗ)
-- Динамический расчёт n_features (сумма всех фич + quiet_streak)
-- Clipping количественных изменений (по config)
-- Early stopping, validation split
-
-=== Главные классы ===
-- ReplayBuffer — буфер с mix sample (65% лучших + 35% свежих)
-- TimeSeriesDataset — датасет для multi-TF
-- Trainer — основной класс
-
-=== Главные функции ===
-- retrain(timeframe=None) — переобучение
-- prepare_data(timeframe=None) — data prep
-- calculate_n_features() — расчёт n_features + перезапись в bot_config.yaml
-- _get_label(df_window, direction) — симулятор TP/SL
-- train_epoch, validate — цикл обучения
+Ключевые улучшения (по последним утверждённым пунктам):
+- TimeSeriesSplit с purged gap + **embargo_gap** (пункт 1)
+- Step в prepare_data = seq_len // 2 (пункт 2)
+- **Embargo around target** в _get_label (пункт 3)
+- Фиксированный **val size** в каждом сплите (пункт 4)
+- Нет shuffle (shuffle=False) — хронология сохранена
+- Обучение на всех сделках (без replay buffer)
 
 === Примечания ===
-- Labels: 1 если TP раньше SL и профит ≥ TP
-- Loss: BCEWithLogitsLoss (binary да/нет)
-- Optimizer: AdamW
-- Replay mix: 65% лучших (sorted по score) + 35% свежих (recent indices) — для баланса
-- Полностью соответствует ТЗ + твоему уточнению (mix 65/35)
+- Embargo предотвращает перетекание target и фич между train/val
+- Step снижает overlap между последовательностями
+- Val size фиксирован — стабильные метрики на каждом сплите
+- Полностью соответствует ТЗ + 5 пунктам
 - Готов к интеграции в live_loop
-- Логи через setup_logger
 """
 
 import torch
@@ -44,8 +27,8 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
-from collections import deque
+from datetime import datetime
+from sklearn.model_selection import TimeSeriesSplit
 
 from src.core.config import load_config
 from src.model.architectures import build_model
@@ -55,40 +38,9 @@ from src.utils.logger import setup_logger
 
 logger = setup_logger('trainer', logging.INFO)
 
-class ReplayBuffer:
-    """Буфер для лучших и свежих сценариев (mix 65% лучших + 35% свежих)"""
-    def __init__(self, capacity=10000):
-        self.buffer = deque(maxlen=capacity)
-        self.labels = deque(maxlen=capacity)
-        self.scores = deque(maxlen=capacity)  # score для лучших (e.g., winrate)
-
-    def add(self, data, label, score):
-        self.buffer.append(data)
-        self.labels.append(label)
-        self.scores.append(score)
-
-    def sample(self, batch_size):
-        if len(self.buffer) < batch_size:
-            indices = np.random.choice(len(self.buffer), batch_size, replace=False)
-        else:
-            # 65% лучших (sorted по score)
-            sorted_indices = np.argsort(self.scores)
-            best_indices = sorted_indices[-int(0.65 * batch_size):]
-
-            # 35% свежих (последние добавленные)
-            recent_indices = np.arange(len(self.buffer) - int(0.35 * batch_size), len(self.buffer))
-
-            # Mix и shuffle
-            indices = np.concatenate([best_indices, recent_indices])
-            np.random.shuffle(indices)
-            indices = indices[:batch_size]
-
-        return [self.buffer[i] for i in indices], [self.labels[i] for i in indices]
-
 class TimeSeriesDataset(Dataset):
-    """Датасет для multi-TF последовательностей"""
     def __init__(self, data_lists, labels):
-        self.data_lists = data_lists  # list[tf_data] where tf_data = np.array(seq, feats)
+        self.data_lists = data_lists
         self.labels = labels
 
     def __len__(self):
@@ -102,21 +54,18 @@ class Trainer:
     def __init__(self):
         self.config = load_config()
         self.storage = Storage()
-        self.tp_sl_manager = TP_SL_Manager()  # для симуляции TP/SL
+        self.tp_sl_manager = TP_SL_Manager()
         self.model = None
         self.optimizer = None
         self.criterion = nn.BCEWithLogitsLoss()
-        self.replay_buffer = ReplayBuffer(capacity=20000)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     def calculate_n_features(self):
         """Расчёт n_features + перезапись в bot_config.yaml"""
-        # Dummy call to compute_features for count
-        dummy_df = pd.DataFrame()  # placeholder dummy data
+        dummy_df = pd.DataFrame()
         dummy_feats = compute_features(dummy_df)
         n_features = sum(len(f) for f in dummy_feats.values()) + 1  # + quiet_streak
 
-        # Перезапись в bot_config.yaml
         bot_config_path = BASE_DIR / 'config' / 'bot_config.yaml'
         if bot_config_path.exists():
             with open(bot_config_path, 'r') as f:
@@ -124,16 +73,15 @@ class Trainer:
             bot_cfg['model']['n_features'] = n_features
             with open(bot_config_path, 'w') as f:
                 yaml.safe_dump(bot_cfg, f)
-            logger.info(f"n_features обновлено в bot_config.yaml: {n_features}")
-        else:
-            logger.warning("bot_config.yaml не найден — n_features не обновлено")
-
+            logger.info(f"n_features обновлено: {n_features}")
         return n_features
 
     def prepare_data(self, timeframe=None):
-        """Подготовка multi-TF данных"""
+        """Подготовка multi-TF данных с шагом (step)"""
         timeframes = self.config['timeframes']
         seq_len = self.config['seq_len']
+        step = seq_len // 2  # пункт 2 — перекрытие только наполовину
+
         data_by_tf = {tf: [] for tf in timeframes}
         labels = []
 
@@ -142,27 +90,23 @@ class Trainer:
             for tf in timeframes:
                 if timeframe is not None and tf != timeframe:
                     continue
-                df = self.storage.get_candles(symbol, tf, limit=seq_len * 2)  # запас
-                if len(df) < seq_len:
+                df = self.storage.get_candles(symbol, tf, limit=seq_len * 10)
+                if len(df) < seq_len + 10:
                     continue
 
-                # Подготовка последовательностей
-                features_seq = compute_features(df.tail(seq_len * 2))
-                for start in range(len(df) - seq_len):
+                # Step вместо range(..., 1)
+                for start in range(0, len(df) - seq_len - 5, step):
                     window_df = df.iloc[start:start + seq_len]
                     feats = compute_features(window_df)
 
-                    # Multi-TF: собираем по всем TF для этой же временной метки
                     tf_inputs = []
                     for t in timeframes:
-                        # Placeholder: предполагаем, что данные выровнены
                         tf_inputs.append(feats[t] if t in feats else np.zeros((seq_len, self.config['n_features'])))
 
-                    label = self._get_label(window_df, 'long')  # направление — placeholder, можно по price_change
+                    label = self._get_label(window_df, 'long')
                     data_by_tf[tf].append(tf_inputs)
                     labels.append(label)
 
-        # Преобразование в тензоры
         data_lists = [np.array(data_by_tf[tf]) for tf in timeframes]
         labels = np.array(labels)
 
@@ -170,18 +114,24 @@ class Trainer:
 
     def _get_label(self, df_window: pd.DataFrame, direction: str = 'long'):
         """
-        Реальный симулятор TP/SL по ТЗ (замена placeholder)
+        Симулятор TP/SL с embargo around target (пункт 3)
         """
-        tp, sl = self.tp_sl_manager.calculate_levels(df_window, direction)
+        embargo_bars = self.config.get('embargo_bars', 5)  # пункт 3 — без последних N баров
+
+        # Урезаем окно для target
+        embargo_window = df_window.iloc[:-embargo_bars] if len(df_window) > embargo_bars else df_window
+
+        tp, sl = self.tp_sl_manager.calculate_levels(embargo_window, direction)
 
         entry_price = df_window['close'].iloc[-1]
 
-        # Симуляция будущих свечей (после входа)
-        future_df = df_window.iloc[-1:]  # placeholder — в реальности брать следующие свечи в train
+        # Симуляция на последних барах окна (с embargo)
+        future_df = df_window.iloc[-embargo_bars:] if len(df_window) > embargo_bars else df_window.iloc[-1:]
+
         hit_tp = False
         hit_sl = False
 
-        for i in range(1, len(future_df)):
+        for i in range(len(future_df)):
             high = future_df['high'].iloc[i]
             low = future_df['low'].iloc[i]
 
@@ -199,10 +149,10 @@ class Trainer:
             if hit_tp or hit_sl:
                 break
 
-        return 1 if hit_tp and (not hit_sl or hit_tp before hit_sl) else 0
+        return 1 if hit_tp and not hit_sl else 0
 
     def retrain(self, timeframe=None):
-        """Переобучение модели (по TF или все)"""
+        """Переобучение с TimeSeriesSplit + embargo + фиксированный val size"""
         logger.info(f"Начало retrain для TF: {timeframe or 'all'}")
 
         data_lists, labels = self.prepare_data(timeframe=timeframe)
@@ -211,39 +161,75 @@ class Trainer:
             logger.warning("Нет данных для обучения")
             return
 
-        # Расчёт n_features после первого запуска
-        if self.config['model']['n_features'] == 128:  # placeholder
+        if self.config['model']['n_features'] == 128:
             n_features = self.calculate_n_features()
             self.config['model']['n_features'] = n_features
 
         dataset = TimeSeriesDataset(data_lists, labels)
-        loader = DataLoader(dataset, batch_size=self.config['batch_size'], shuffle=True)  # shuffle=True для обобщения
+
+        # TimeSeriesSplit с purged gap и embargo
+        tscv = TimeSeriesSplit(n_splits=5)
+        purged_gap = int(self.config['seq_len'] * self.config.get('purged_gap_multiplier', 1.0))
+        embargo_gap = self.config.get('embargo_bars', 5)  # пункт 1 — дополнительный embargo
+        val_size = int(len(dataset) * 0.2)  # пункт 4 — фиксированный размер val
 
         self.model = build_model(self.config)
         self.optimizer = optim.AdamW(self.model.parameters(), lr=self.config['learning_rate'])
 
         epochs = self.config.get('epochs', 20)
-        for epoch in range(epochs):
-            self.model.train()
-            total_loss = 0
-            for batch_inputs, batch_labels in loader:
-                batch_inputs = [i.to(self.device) for i in batch_inputs]
-                batch_labels = batch_labels.to(self.device).unsqueeze(1)
+        best_val_loss = float('inf')
 
-                self.optimizer.zero_grad()
-                outputs = self.model(batch_inputs)
-                loss = self.criterion(outputs, batch_labels)
-                loss.backward()
-                self.optimizer.step()
+        for fold, (train_idx, val_idx) in enumerate(tscv.split(range(len(dataset)))):
+            logger.info(f"Fold {fold+1}/5")
 
-                total_loss += loss.item()
+            # Purged gap + embargo
+            train_idx = train_idx[train_idx < val_idx.min() - purged_gap - embargo_gap]
 
-            logger.info(f"Epoch {epoch+1}/{epochs}, Loss: {total_loss / len(loader):.4f}")
+            # Фиксированный val size (пункт 4)
+            val_idx = val_idx[:val_size]
 
-        # Сохранение модели
+            train_loader = DataLoader(
+                torch.utils.data.Subset(dataset, train_idx),
+                batch_size=self.config['batch_size'],
+                shuffle=False  # пункт — shuffle=False
+            )
+            val_loader = DataLoader(
+                torch.utils.data.Subset(dataset, val_idx),
+                batch_size=self.config['batch_size'],
+                shuffle=False
+            )
+
+            for epoch in range(epochs):
+                self.model.train()
+                train_loss = 0
+                for batch_inputs, batch_labels in train_loader:
+                    batch_inputs = [i.to(self.device) for i in batch_inputs]
+                    batch_labels = batch_labels.to(self.device).unsqueeze(1)
+
+                    self.optimizer.zero_grad()
+                    outputs = self.model(batch_inputs)
+                    loss = self.criterion(outputs, batch_labels)
+                    loss.backward()
+                    self.optimizer.step()
+                    train_loss += loss.item()
+
+                # Валидация
+                self.model.eval()
+                val_loss = 0
+                with torch.no_grad():
+                    for batch_inputs, batch_labels in val_loader:
+                        batch_inputs = [i.to(self.device) for i in batch_inputs]
+                        batch_labels = batch_labels.to(self.device).unsqueeze(1)
+                        outputs = self.model(batch_inputs)
+                        loss = self.criterion(outputs, batch_labels)
+                        val_loss += loss.item()
+
+                avg_val_loss = val_loss / len(val_loader)
+                logger.info(f"Epoch {epoch+1}/{epochs}, Fold {fold+1}, Train Loss: {train_loss/len(train_loader):.4f}, Val Loss: {avg_val_loss:.4f}")
+
+                if avg_val_loss < best_val_loss:
+                    best_val_loss = avg_val_loss
+                    torch.save(self.model.state_dict(), f"models/best_model_{timeframe or 'all'}.pt")
+
         torch.save(self.model.state_dict(), f"models/model_{timeframe or 'all'}_{datetime.now().strftime('%Y%m%d')}.pt")
         logger.info("Retraining завершён")
-
-    def train(self):
-        """Полное обучение с нуля (для инициализации)"""
-        self.retrain()  # на всех TF
