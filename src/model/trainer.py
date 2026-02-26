@@ -5,7 +5,7 @@ src/model/trainer.py
 
 Обучение и переобучение модели.
 
-Ключевые улучшения (по последним утверждённым пунктам):
+Ключевые изменения (по утверждённым 5 пунктам):
 - TimeSeriesSplit с purged gap + **embargo_gap** (пункт 1)
 - Step в prepare_data = seq_len // 2 (пункт 2)
 - **Embargo around target** в _get_label (пункт 3)
@@ -191,7 +191,7 @@ class Trainer:
             train_loader = DataLoader(
                 torch.utils.data.Subset(dataset, train_idx),
                 batch_size=self.config['batch_size'],
-                shuffle=False  # пункт — shuffle=False
+                shuffle=False  # shuffle=False по утверждению
             )
             val_loader = DataLoader(
                 torch.utils.data.Subset(dataset, val_idx),

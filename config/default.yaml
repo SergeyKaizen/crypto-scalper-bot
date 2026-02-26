@@ -31,6 +31,7 @@ trading:
   commission: 0.0004                   # taker fee Binance Futures
   dropout: 0.3
   leverage: 20                         # базовое плечо
+  max_open_time_hours: 2               # максимальное время удержания позиции (автозакрытие)
 
 # Модель
 model:
@@ -42,8 +43,8 @@ model:
   retrain_interval_days: 7             # каждую неделю per-TF
   n_features: 128                      # placeholder — перезаписывается trainer'ом
   bidirectional: true                  # Bidirectional GRU
-  num_clusters: 50                     # максимальное количество кластеров в HDBSCAN
-  cluster_embedding_dim: 16            # размерность эмбеддинга кластера в модели
+  mc_dropout_passes: 5                 # количество проходов MC Dropout в предикте
+  uncertainty_threshold: 0.05          # порог неуверенности (std) для пропуска сигнала
 
 # Фильтры монет и бэктест
 filter:
@@ -75,14 +76,11 @@ logging:
   file: "logs/bot.log"
   max_size_mb: 100
 
-# Параметры для walk-forward и purged CV (добавлены для WFO)
+# Параметры для walk-forward и purged CV
 backtest:
   walk_forward: false                  # включить режим walk-forward (по умолчанию выключен)
   walk_forward_periods: 8              # количество сегментов
   walk_forward_segment_months: 3       # длина одного сегмента в месяцах
   walk_forward_retrain_frequency: "weekly"  # частота retrain в in-sample
   purged_gap_multiplier: 1.0           # множитель purged gap (gap = seq_len * multiplier)
-
-# Параметры для PositionManager
-trading:
-  max_open_time_hours: 2               # максимальное время удержания позиции (автозакрытие)
+  wfo_windows: 3                       # количество окон для упрощённой WFO (80% эффекта)
