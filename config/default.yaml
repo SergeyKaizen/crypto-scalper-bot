@@ -26,7 +26,7 @@ hardware:
 trading:
   mode: "balanced"                     # aggressive / balanced / conservative / custom
   min_prob: 0.65                       # минимальная вероятность для обычных аномалий
-  min_prob_q: 0.75                     # повышенный порог для Quiet (Q)
+  min_prob_q: 0.75                     # повышенный порог для Quiet (Q) — снижает ложняки в боковике
   risk_pct: 1.0                        # % от депозита на сделку
   commission: 0.0004                   # taker fee Binance Futures
   dropout: 0.3
@@ -44,7 +44,7 @@ model:
   n_features: 128                      # placeholder — перезаписывается trainer'ом
   bidirectional: true                  # Bidirectional GRU
   mc_dropout_passes: 5                 # MC Dropout для uncertainty в предикте
-  uncertainty_threshold: 0.05          # порог std для пропуска сигнала
+  uncertainty_threshold: 0.05          # базовый порог std для пропуска сигнала (используется в adaptive)
 
 # Фильтры монет и бэктест
 filter:
@@ -91,9 +91,10 @@ scenario_tracker:
   bayesian_prior_losses: 3.0
   # Bayesian smoothing: smoothed_winrate = (wins + prior_wins) / (count + prior_wins + prior_losses)
   # Примеры влияния:
-  # - 1/1: 2/5 = 40% (защищает от 1/1 = 100%)
-  # - 2/2: 3/6 = 50%
-  # - 5/7: 6/11 ≈ 54.5%
+  # - 0/0 → 1/4 = 25%
+  # - 1/1 → 2/5 = 40% (защищает от 100%)
+  # - 2/2 → 3/6 = 50%
+  # - 5/7 → 6/11 ≈ 54.5%
   # - при большом count prior почти не влияет
 
   decay_half_life_days: 90.0

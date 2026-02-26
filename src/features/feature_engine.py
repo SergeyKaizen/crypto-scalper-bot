@@ -6,17 +6,18 @@ src/features/feature_engine.py
 Расчёт всех признаков для окна свечей.
 
 Ключевые улучшения (последние утверждённые):
-- Добавлены 2 бинарных признака для regime separation на основе half-comparator:
-  - regime_bull_strength: 1 если delta_diff_norm > 0.65
-  - regime_bear_strength: 1 если delta_diff_norm < -0.65
+- Формула волатильности: (high - low) / high * 100 — размер свечи в % от high
+- Средняя волатильность: expanding.mean() (нарастающее окно)
+- Regime separation: 2 бинарных признака на основе half-comparator
+  - regime_bull_strength: delta_diff_norm > 0.65
+  - regime_bear_strength: delta_diff_norm < -0.65
 - delta_diff_norm = (right_delta_mean - left_delta_mean) / avg_candle_size
-- avg_candle_size = средний (high - low) за окно
-- Bayesian smoothing и time-decay — используются в scenario_tracker, но здесь только фичи
-- Warm-up сохранён (min_bars_for_stats)
-- Валидация через FeaturesSchema (data-contract + versioning)
+- Warm-up: если len(df) < min_bars → fallback
+- Валидация схемы через FeaturesSchema
 
 === Примечания ===
-- regime признаки добавляются в конец feats → попадают в ключ сценария
+- Все признаки локальны на df (up_to_now) — нет lookahead
+- Regime-признаки попадают в конец feats → в ключ сценария
 - Полностью соответствует ТЗ + утверждённым 3 пунктам
 - Готов к использованию в live_loop, backtest, trainer
 """
@@ -37,10 +38,6 @@ FEATURES_VERSION = "1.0"
 def compute_features(df: pd.DataFrame) -> Dict:
     """
     Расчёт всех признаков для окна свечей.
-    
-    - Warm-up: если len(df) < min_bars → fallback
-    - Статистики: expanding для скользящих (как было ранее)
-    - Новое: 2 бинарных признака для regime (bull/bear strength) из half-comparator
     """
     config = load_config()
     min_bars = config.get('features', {}).get('min_bars_for_stats', 30)
@@ -49,12 +46,13 @@ def compute_features(df: pd.DataFrame) -> Dict:
         logger.debug(f"Окно слишком короткое ({len(df)} < {min_bars}) — fallback")
         return {field: 0.0 for field in FeaturesSchema.__fields__ if field != 'version'}
 
-    # Базовые расчёты (как раньше)
+    # Базовые расчёты
     price_change_pct = df['close'].pct_change().iloc[-1] * 100 if len(df) > 1 else 0.0
 
-    volatility = (df['high'] - df['low']) / df['close']
-    volatility_mean = volatility.expanding().mean().iloc[-1]
-    volatility_change_pct = volatility.pct_change().iloc[-1] * 100 if len(volatility) > 1 else 0.0
+    # Волатильность — исправленная формула (твоя)
+    volatility_pct = ((df['high'] - df['low']) / df['high']) * 100
+    volatility_mean = volatility_pct.expanding().mean().iloc[-1]
+    volatility_change_pct = volatility_pct.pct_change().iloc[-1] * 100 if len(volatility_pct) > 1 else 0.0
 
     # Delta (если есть)
     if 'delta' in df:
@@ -78,9 +76,8 @@ def compute_features(df: pd.DataFrame) -> Dict:
 
     quiet_streak = 0  # placeholder
 
-    # Новое: Regime separation на основе half-comparator
-    # Предполагаем, что half-comparator уже вернул признаки для окна 50 (или другого)
-    # Здесь упрощённо — берём средние значения из половин (реальная логика в half_comparator)
+    # Regime separation: на основе half-comparator (дельта)
+    # Предполагаем, что half-comparator вернул признаки для окна 50
     mid = len(df) // 2
     left = df.iloc[:mid]
     right = df.iloc[mid:]
@@ -113,7 +110,7 @@ def compute_features(df: pd.DataFrame) -> Dict:
         'quiet_streak': quiet_streak,
         'regime_bull_strength': regime_bull_strength,
         'regime_bear_strength': regime_bear_strength,
-        # ... остальные признаки
+        # ... остальные признаки из ТЗ
     }
 
     # Валидация схемы

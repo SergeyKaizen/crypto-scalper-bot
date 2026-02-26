@@ -7,7 +7,7 @@ src/model/scenario_tracker.py
 
 Ключевые улучшения (по утверждённым пунктам):
 - Bayesian smoothing в get_weight (prior_wins=1, prior_losses=3 из конфига)
-- Time-decay веса: exp(-days_since_last / half_life_days), half_life_days=90
+- Time-decay веса: exp(-days_since_last / half_life_days), half_life_days=90 (из конфига)
 - Regime separation: 2 бинарных признака в конце ключа (regime_bull_strength, regime_bear_strength)
   - на основе delta_diff_norm > 0.65 / < -0.65 (порог из конфига)
 - Ограничение памяти: deque(maxlen=max_scenarios)
