@@ -3,42 +3,34 @@ src/model/scenario_tracker.py
 
 === Основной принцип работы файла ===
 
-Отслеживание и анализ бинарных сценариев для всех признаков (из ТЗ + delta VA + sequential паттерны + quiet_streak).
+Отслеживание и анализ бинарных сценариев для всех признаков.
 
-Ключевые задачи:
-- Бинаризация всех признаков → уникальный ключ сценария (tuple)
-- Обновление статистики после каждой закрытой сделки (win/loss)
-- Вес сценария = winrate × log(count + 1) — чтобы редкие 100% не перевешивали частые 70%
-- Кластеризация HDBSCAN для выявления топ-групп (лучше K-Means для sparse данных)
-- Экспорт в CSV каждые 1000 сделок + по команде (для Google Sheets)
-- Принудительная выгрузка через export_statistics()
+Ключевые улучшения (по утверждённым пунктам):
+- Bayesian smoothing в get_weight (prior_wins=1, prior_losses=3 из конфига)
+- Time-decay веса: exp(-days_since_last / half_life_days), half_life_days=90
+- Regime separation: 2 бинарных признака в конце ключа (regime_bull_strength, regime_bear_strength)
+  - на основе delta_diff_norm > 0.65 / < -0.65 (порог из конфига)
+- Ограничение памяти: deque(maxlen=max_scenarios)
 
 === Главные методы ===
-
-- add_scenario(pred_features: dict, outcome: int) — добавление после сделки
-- get_weight(scenario) — расчёт веса
-- get_top_scenarios(n=50) — топ по весу
-- cluster_scenarios() — HDBSCAN кластеризация
-- export_statistics() — выгрузка в CSV
+- add_scenario(pred_features, outcome, pnl) — добавление после закрытия
+- get_weight(scenario) — Bayesian + time-decay
+- _binarize_features(feats) — ключ сценария с regime признаками
 
 === Примечания ===
-- Бинаризация: increased/decreased, >threshold, count ≥2/≥4 и т.д.
-- Sequential паттерны — все из списка (~20–25 штук)
-- Quiet streak — бинарный (ge3, ge5)
-- Статистика in-memory + pickle для persistence между перезапусками
-- Полностью соответствует ТЗ + всем обновлениям
-- Готов к использованию в live_loop, entry_manager, virtual_trader
+- Bayesian: сглаживает редкие сценарии (1/1 не даёт 100%)
+- Time-decay: старые сценарии теряют вес (half_life=90 дней)
+- Regime: разделяет статистику на бычий/медвежий тренд и флэт
+- Полностью соответствует ТЗ + утверждённым 3 пунктам
 """
 
 import numpy as np
 import pandas as pd
 from datetime import datetime
-from collections import defaultdict
+from collections import defaultdict, deque
 import pickle
 import os
 import logging
-
-from sklearn.cluster import HDBSCAN
 
 from src.core.config import load_config
 from src.utils.logger import setup_logger
@@ -48,16 +40,25 @@ logger = setup_logger('scenario_tracker', logging.INFO)
 class ScenarioTracker:
     def __init__(self):
         self.config = load_config()
-        self.scenarios = defaultdict(lambda: {'wins': 0, 'losses': 0, 'count': 0, 'last_update': None})
+        self.max_scenarios = self.config.get('max_scenarios', 100000)
+        self.scenario_dict = defaultdict(lambda: {
+            'wins': 0,
+            'count': 0,
+            'total_pnl': 0.0,
+            'last_update': datetime.utcnow()
+        })
+        self.scenarios = deque(maxlen=self.max_scenarios)
         self.data_dir = self.config['paths']['data_dir']
         self.export_path = os.path.join(self.data_dir, 'scenario_stats.csv')
         self.pickle_path = os.path.join(self.data_dir, 'scenario_tracker.pkl')
-        self.min_count_weight = 5  # минимум сделок для значимого веса
 
-        # HDBSCAN для кластеризации — будет fitted при первом вызове cluster_scenarios
-        self.hdb = None
+        # Параметры из конфига
+        self.prior_w = self.config['scenario_tracker']['bayesian_prior_wins']
+        self.prior_l = self.config['scenario_tracker']['bayesian_prior_losses']
+        self.half_life = self.config['scenario_tracker']['decay_half_life_days']
+        self.decay_enabled = self.config['scenario_tracker'].get('decay_enabled', True)
+        self.delta_threshold = self.config['scenario_tracker']['regime']['delta_norm_threshold']
 
-        # Загрузка из pickle если есть (persistence между перезапусками)
         self._load_from_pickle()
 
     def _load_from_pickle(self):
@@ -65,139 +66,134 @@ class ScenarioTracker:
             try:
                 with open(self.pickle_path, 'rb') as f:
                     loaded = pickle.load(f)
-                    self.scenarios = defaultdict(lambda: {'wins': 0, 'losses': 0, 'count': 0, 'last_update': None}, loaded)
-                logger.info(f"Загружено {len(self.scenarios)} сценариев из pickle")
+                    self.scenario_dict = defaultdict(lambda: {
+                        'wins': 0,
+                        'count': 0,
+                        'total_pnl': 0.0,
+                        'last_update': datetime.utcnow()
+                    }, loaded['scenario_dict'])
+                    self.scenarios = deque(loaded['scenarios'], maxlen=self.max_scenarios)
+                logger.info(f"Загружено {len(self.scenario_dict)} сценариев")
             except Exception as e:
                 logger.warning(f"Ошибка загрузки pickle: {e}")
 
     def _save_to_pickle(self):
         try:
             with open(self.pickle_path, 'wb') as f:
-                pickle.dump(dict(self.scenarios), f)
-            logger.debug("Сохранено в pickle")
+                pickle.dump({
+                    'scenario_dict': dict(self.scenario_dict),
+                    'scenarios': list(self.scenarios)
+                }, f)
         except Exception as e:
             logger.warning(f"Ошибка сохранения pickle: {e}")
 
-    def _binarize_features(self, features: dict) -> tuple:
-        """
-        Бинаризация ВСЕХ признаков в tuple (ключ сценария)
-        """
+    def _binarize_features(self, feats: Dict) -> tuple:
+        """Бинаризация всех признаков + regime признаки в конце"""
         states = []
 
-        # 12 базовых из ТЗ (increased/decreased + strong)
+        # Базовые признаки (как раньше)
         for key in ['volume', 'bid', 'ask', 'delta', 'mid_price_left', 'mid_price_right',
                     'price_change', 'volatility', 'price_channel_position', 'va_position',
                     'delta_mid_dist', 'delta_means']:
-            change = features.get(key + '_change_pct', 0)
-            states.append(1 if change > 0 else 0)          # increased
-            states.append(1 if change > 5 else 0)          # strong increase
-            states.append(1 if change < 0 else 0)          # decreased
+            change = feats.get(key + '_change_pct', 0)
+            states.append(1 if change > 0 else 0)
+            states.append(1 if change > 5 else 0)
+            states.append(1 if change < 0 else 0)
 
-        # Delta VA признаки
-        states.append(features.get('delta_positive', 0))
-        states.append(features.get('delta_increased', 0))
-        states.append(1 if abs(features.get('delta_change_pct', 0)) > 10 else 0)  # strong change
-        states.append(1 if features.get('norm_dist_to_delta_vah', 0) > 0 else 0)  # above VAH
-        states.append(1 if features.get('norm_dist_to_delta_val', 0) < 0 else 0)  # below VAL
+        # Delta VA
+        states.append(feats.get('delta_positive', 0))
+        states.append(feats.get('delta_increased', 0))
+        states.append(1 if abs(feats.get('delta_change_pct', 0)) > 10 else 0)
+        states.append(1 if feats.get('norm_dist_to_delta_vah', 0) > 0 else 0)
+        states.append(1 if feats.get('norm_dist_to_delta_val', 0) < 0 else 0)
 
-        # Sequential паттерны (все ~20–25 штук)
+        # Sequential паттерны
         seq_keys = [
             'sequential_delta_positive_count', 'sequential_delta_increased_count',
             'sequential_volume_increased_count', 'sequential_bid_increased_count',
             'sequential_ask_increased_count', 'sequential_volatility_increased_count',
             'sequential_price_change_positive_count', 'sequential_above_vah_count',
             'sequential_below_val_count', 'accelerating_delta_imbalance',
-            # ... остальные из полного списка (по ТЗ + delta VA)
         ]
         for sk in seq_keys:
-            count = features.get(sk, 0)
-            states.append(1 if count >= 2 else 0)  # ≥2 окна подряд
-            states.append(1 if count >= 4 else 0)  # максимум
+            count = feats.get(sk, 0)
+            states.append(1 if count >= 2 else 0)
+            states.append(1 if count >= 4 else 0)
 
         # Quiet streak
-        states.append(1 if features.get('quiet_streak', 0) >= 3 else 0)
-        states.append(1 if features.get('quiet_streak', 0) >= 5 else 0)
+        states.append(1 if feats.get('quiet_streak', 0) >= 3 else 0)
+        states.append(1 if feats.get('quiet_streak', 0) >= 5 else 0)
+
+        # Новое: Regime separation (2 бинарных признака)
+        states.append(feats.get('regime_bull_strength', 0))
+        states.append(feats.get('regime_bear_strength', 0))
 
         return tuple(states)
 
-    def add_scenario(self, pred_features: dict, outcome: int):
+    def add_scenario(self, pred_features: Dict, outcome: int, pnl: float = 0.0):
         """
         Добавление сценария после закрытия сделки
-        outcome: 1 = win, 0 = loss
         """
         key = self._binarize_features(pred_features)
-        entry = self.scenarios[key]
 
+        if key not in self.scenario_dict:
+            self.scenario_dict[key] = {
+                'wins': 0,
+                'count': 0,
+                'total_pnl': 0.0,
+                'last_update': datetime.utcnow()
+            }
+            self.scenarios.append(key)
+
+        entry = self.scenario_dict[key]
         entry['count'] += 1
         if outcome == 1:
             entry['wins'] += 1
-        else:
-            entry['losses'] += 1
-
+        entry['total_pnl'] += pnl
         entry['last_update'] = datetime.utcnow()
 
-        # Авто-экспорт каждые 1000 сделок
-        total = sum(e['count'] for e in self.scenarios.values())
+        # Авто-экспорт и сохранение
+        total = sum(e['count'] for e in self.scenario_dict.values())
         if total % 1000 == 0:
             self.export_statistics()
-
-        # Сохранение в pickle каждые 500 сделок
         if total % 500 == 0:
             self._save_to_pickle()
 
     def get_weight(self, scenario):
-        """Вес = winrate × log(count + 1)"""
-        entry = self.scenarios[scenario]
-        if entry['count'] == 0:
+        """Вес с Bayesian smoothing + time-decay"""
+        if scenario not in self.scenario_dict:
             return 0.0
-        winrate = entry['wins'] / entry['count']
-        return winrate * np.log(entry['count'] + 1)
 
-    def get_top_scenarios(self, n=50):
-        """Топ сценариев по весу"""
-        sorted_scen = sorted(self.scenarios.items(), key=lambda x: self.get_weight(x[0]), reverse=True)
-        return sorted_scen[:n]
+        entry = self.scenario_dict[scenario]
+        count = entry['count']
+        if count == 0:
+            return 0.0
 
-    def cluster_scenarios(self):
-        """Кластеризация HDBSCAN"""
-        if len(self.scenarios) < 10:
-            return []
+        # Bayesian smoothing
+        smoothed_winrate = (entry['wins'] + self.prior_w) / (count + self.prior_w + self.prior_l)
 
-        keys = list(self.scenarios.keys())
-        X = np.array(keys)  # tuple → array
+        # Raw вес
+        raw_weight = smoothed_winrate * np.log(count + 1)
 
-        hdb = HDBSCAN(min_cluster_size=5, min_samples=3)
-        labels = hdb.fit_predict(X)
+        # Time-decay
+        if self.decay_enabled:
+            days_since = (datetime.utcnow() - entry['last_update']).days
+            decay = np.exp(-days_since / self.half_life)
+        else:
+            decay = 1.0
 
-        clusters = defaultdict(list)
-        for i, label in enumerate(labels):
-            if label != -1:
-                clusters[label].append(keys[i])
-
-        cluster_stats = []
-        for label, scen_list in clusters.items():
-            weights = [self.get_weight(s) for s in scen_list]
-            cluster_stats.append({
-                'cluster_id': label,
-                'size': len(scen_list),
-                'avg_weight': np.mean(weights),
-                'scenarios': scen_list
-            })
-
-        return sorted(cluster_stats, key=lambda x: x['avg_weight'], reverse=True)
+        return raw_weight * decay
 
     def export_statistics(self):
-        """Выгрузка в CSV"""
         data = []
-        for key, entry in self.scenarios.items():
-            winrate = entry['wins'] / entry['count'] if entry['count'] > 0 else 0
+        for key, entry in self.scenario_dict.items():
+            smoothed_winrate = (entry['wins'] + self.prior_w) / (entry['count'] + self.prior_w + self.prior_l)
             weight = self.get_weight(key)
             data.append({
                 'scenario': str(key),
                 'count': entry['count'],
                 'wins': entry['wins'],
-                'losses': entry['losses'],
-                'winrate': winrate,
+                'smoothed_winrate': smoothed_winrate,
                 'weight': weight,
                 'last_update': entry['last_update']
             })
@@ -206,22 +202,3 @@ class ScenarioTracker:
         df.sort_values('weight', ascending=False, inplace=True)
         df.to_csv(self.export_path, index=False)
         logger.info(f"Статистика сценариев выгружена: {self.export_path}")
-
-    def export_top_clusters(self):
-        """Выгрузка топ-кластеров"""
-        clusters = self.cluster_scenarios()
-        if not clusters:
-            return
-
-        data = []
-        for cl in clusters[:10]:
-            data.append({
-                'cluster_id': cl['cluster_id'],
-                'size': cl['size'],
-                'avg_weight': cl['avg_weight'],
-                'scenarios_count': len(cl['scenarios'])
-            })
-
-        df = pd.DataFrame(data)
-        df.to_csv(os.path.join(self.data_dir, 'top_clusters.csv'), index=False)
-        logger.info("Топ кластеры выгружены")

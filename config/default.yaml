@@ -1,59 +1,68 @@
 # config/default.yaml
 # Финальная дефолтная конфигурация проекта (февраль 2026)
+# Переопределяется в bot_config.yaml и trading_modes/*.yaml
 
 paths:
   data_dir: "data/"
   models_dir: "data/models/"
   logs_dir: "logs/"
-  export_dir: "data/exports/"
+  export_dir: "data/exports/"          # для scenario_stats.csv, top_clusters.csv и т.д.
 
 binance:
   api_key: "YOUR_API_KEY_HERE"
   api_secret: "YOUR_API_SECRET_HERE"
 
+# Таймфреймы и окна анализа
 timeframes: ["1m", "3m", "5m", "10m", "15m"]
 seq_len: 100
 windows: [24, 50, 74, 100]
 
+# Hardware (переключается через hardware_mode в bot_config.yaml)
 hardware:
   max_workers: 16
-  model_size: "medium"
+  model_size: "medium"                 # small / medium / large (large на сервере)
 
+# Торговые параметры
 trading:
-  mode: "balanced"
-  min_prob: 0.65
-  min_prob_q: 0.75
-  risk_pct: 1.0
-  commission: 0.0004
+  mode: "balanced"                     # aggressive / balanced / conservative / custom
+  min_prob: 0.65                       # минимальная вероятность для обычных аномалий
+  min_prob_q: 0.75                     # повышенный порог для Quiet (Q)
+  risk_pct: 1.0                        # % от депозита на сделку
+  commission: 0.0004                   # taker fee Binance Futures
   dropout: 0.3
-  leverage: 20
-  max_open_time_hours: 2
+  leverage: 20                         # базовое плечо
+  max_open_time_hours: 2               # автозакрытие позиции
 
+# Модель
 model:
   hidden_size: 128
   dropout: 0.3
   epochs: 30
   batch_size: 64
   learning_rate: 0.0005
-  retrain_interval_days: 7
-  n_features: 128
-  bidirectional: true
-  mc_dropout_passes: 5
-  uncertainty_threshold: 0.05
+  retrain_interval_days: 7             # каждую неделю per-TF
+  n_features: 128                      # placeholder — перезаписывается trainer'ом
+  bidirectional: true                  # Bidirectional GRU
+  mc_dropout_passes: 5                 # MC Dropout для uncertainty в предикте
+  uncertainty_threshold: 0.05          # порог std для пропуска сигнала
 
+# Фильтры монет и бэктест
 filter:
   min_age_months: 3
   min_pr: 5.0
   min_trades: 20
 
+# Value Area и Delta VA
 va:
-  va_percentage: 0.70
-  price_bin_step_pct: 0.002
+  va_percentage: 0.70                  # 70% объёма от POC для VAH/VAL
+  price_bin_step_pct: 0.002            # шаг бина цены в профиле
 
+# Мульти-TF consensus
 consensus:
-  min_tf_consensus: 2
-  va_confirm_enabled: false
+  min_tf_consensus: 2                  # минимум старших TF для подтверждения
+  va_confirm_enabled: false            # строгое VA-подтверждение отключено
 
+# Clipping для защиты от выбросов
 clipping_bounds:
   delta_change_pct: [-100, 100]
   volatility_change_pct: [-50, 50]
@@ -61,15 +70,45 @@ clipping_bounds:
   delta_shift_pct: [-20, 20]
   volume_change_pct: [-200, 200]
 
+# Логирование
 logging:
   level: "INFO"
   file: "logs/bot.log"
   max_size_mb: 100
 
+# Параметры бэктеста и WFO
 backtest:
   walk_forward: false
   walk_forward_periods: 8
   walk_forward_segment_months: 3
   walk_forward_retrain_frequency: "weekly"
   purged_gap_multiplier: 1.0
-  wfo_windows: 3
+  wfo_windows: 3                       # упрощённая WFO для новичка (80% эффекта)
+
+# Параметры scenario_tracker — все новые улучшения здесь
+scenario_tracker:
+  bayesian_prior_wins: 1.0
+  bayesian_prior_losses: 3.0
+  # Bayesian smoothing: smoothed_winrate = (wins + prior_wins) / (count + prior_wins + prior_losses)
+  # Примеры влияния:
+  # - 1/1: 2/5 = 40% (защищает от 1/1 = 100%)
+  # - 2/2: 3/6 = 50%
+  # - 5/7: 6/11 ≈ 54.5%
+  # - при большом count prior почти не влияет
+
+  decay_half_life_days: 90.0
+  decay_enabled: true
+  # Time-decay: weight *= exp(-days_since_last / half_life)
+  # Примеры (half_life=90):
+  # 30 дней → ~71.7% от исходного веса
+  # 60 дней → ~51.3%
+  # 90 дней → ~36.8%
+  # 180 дней → ~13.5% (почти не влияет)
+
+  regime:
+    delta_norm_threshold: 0.65
+    # Порог для regime_bull_strength / regime_bear_strength
+    # delta_diff_norm = (right_delta_mean - left_delta_mean) / avg_candle_size
+    # > +0.65 → бычий тренд
+    # < -0.65 → медвежий тренд
+    # 0.65 — сильный сигнал (можно уменьшить до 0.5 для более слабых трендов)

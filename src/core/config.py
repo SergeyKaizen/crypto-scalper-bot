@@ -29,6 +29,9 @@ DEFAULT_CONFIG_PATH = BASE_DIR / 'config' / 'default.yaml'
 
 @lru_cache(maxsize=1)
 def load_config(override_path=None):
+    """
+    Загрузка и слияние всей конфигурации.
+    """
     config = {}
 
     # 1. default.yaml
@@ -68,6 +71,15 @@ def load_config(override_path=None):
     config.setdefault('retrain_interval_days', 7)
     config.setdefault('min_tf_consensus', 2)
     config.setdefault('va_confirm_enabled', False)
+
+    # Параметры для scenario_tracker (новые)
+    config.setdefault('scenario_tracker', {})
+    config['scenario_tracker'].setdefault('bayesian_prior_wins', 1.0)
+    config['scenario_tracker'].setdefault('bayesian_prior_losses', 3.0)
+    config['scenario_tracker'].setdefault('decay_half_life_days', 90.0)
+    config['scenario_tracker'].setdefault('decay_enabled', True)
+    config['scenario_tracker'].setdefault('regime', {})
+    config['scenario_tracker']['regime'].setdefault('delta_norm_threshold', 0.65)
 
     return config
 
