@@ -3,109 +3,160 @@ src/model/inference.py
 
 === Основной принцип работы файла ===
 
-Предикт модели на новых данных (аномалия + признаки).
-
-Ключевые особенности (по ТЗ + утверждённые улучшения):
-- Multi-TF input: 5 отдельных тензоров (1m,3m,5m,10m,15m)
-- Binary предсказание: да/нет — будет ли прибыль ≥ TP и дойдёт ли до TP раньше SL
-- quiet_streak как дополнительный канал (repeat по seq_len)
-- cluster_id как дополнительная фича (получаем из scenario_tracker и передаём в модель)
-- MC Dropout: 5 passes с включённым dropout для uncertainty (variance) — фильтрует неуверенные сигналы
-- n_features из config (динамически рассчитано в trainer)
-- Проверка shape перед forward (защита от ошибок)
-- Eval mode для скорости в live_loop
+InferenceEngine — модуль предсказания модели в live-режиме и бэктесте.
+- Загрузка чекпоинта
+- Forward pass модели
+- Возврат вероятностей long/short
+- Uncertainty через MC Dropout (если включено)
+- Калибровка вероятностей (опционально)
 
 === Главные функции ===
-- Inference class
-- predict(features_by_tf: dict, anomaly_type: str, extra_features: dict = {}) — предикт
+- predict(features: Dict) → prob_long, prob_short, uncertainty
+- load_checkpoint(path) — загрузка модели
 
 === Примечания ===
-- MC Dropout: passes=5 — средняя prob + uncertainty (std) > threshold → пропуск
-- Threshold uncertainty = 0.05 (можно в config)
-- Полностью соответствует ТЗ + улучшениям (MC Dropout для uncertainty)
-- Готов к интеграции в live_loop (только confirmed аномалии)
+- Модель загружается один раз при инициализации
+- MC Dropout — dropout активен в inference (train mode)
+- Uncertainty = std по нескольким проходам
+- Готов к ensemble и калибровке
 - Логи через setup_logger
 """
 
+import logging
 import torch
-import numpy as np
-import os
-from datetime import datetime
+from typing import Tuple, Dict, Any
 
-from src.model.architectures import build_model
 from src.core.config import load_config
-from src.model.scenario_tracker import ScenarioTracker
+from src.model.architectures import MultiTFHybrid, TinyHybrid
 from src.utils.logger import setup_logger
 
-logger = setup_logger('inference', logging.INFO)
+setup_logger()
+logger = logging.getLogger(__name__)
 
-class Inference:
-    def __init__(self):
-        self.config = load_config()
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model = self.load_model()
-        self.n_features = self.config['model']['n_features']
-        self.seq_len = self.config['seq_len']
-        self.scenario_tracker = ScenarioTracker()  # для cluster_id
-        self.mc_passes = 5  # утверждённое значение
-        self.uncertainty_threshold = 0.05  # порог для фильтра (можно в config)
 
-    def load_model(self, timeframe=None):
-        """Загрузка модели (per-TF или общая)"""
-        model_path = f"models/model_{timeframe or 'all'}_{datetime.now().strftime('%Y%m%d')}.pt"
-        if not os.path.exists(model_path):
-            logger.warning(f"Модель {model_path} не найдена — использую дефолтную")
-            return build_model(self.config)
+class InferenceEngine:
+    def __init__(self, config: dict):
+        self.config = config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = self._load_model()
+        self.mc_passes = 20  # ФИКС пункта 14: минимум 20 проходов MC Dropout
 
-        model = build_model(self.config)
-        model.load_state_dict(torch.load(model_path, map_location=self.device))
-        model.to(self.device)
-        model.eval()
+        # ← ФИКС пункта 17: поддержка ensemble (список моделей)
+        self.ensemble_models = []
+        self.load_ensemble()
+
+        # ← ФИКС пункта 17: калибровка (Platt scaling placeholder)
+        self.calibration_slope = 1.0
+        self.calibration_intercept = 0.0
+        self.calibration_enabled = config.get("calibration_enabled", False)
+
+    def _load_model(self):
+        """Загрузка обученной модели из чекпоинта"""
+        checkpoint_path = "models/best_model.pth"  # или из config
+        if self.config.get("use_tiny_model", False):
+            model = TinyHybrid(self.config).to(self.device)
+        else:
+            model = MultiTFHybrid(self.config).to(self.device)
+
+        try:
+            model.load_state_dict(torch.load(checkpoint_path, map_location=self.device))
+            logger.info(f"Model loaded from {checkpoint_path}")
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint: {e}")
+            raise
+
+        model.eval()  # по умолчанию eval, но для MC dropout будем переключать
         return model
 
-    def predict(self, features_by_tf: dict, anomaly_type: str, extra_features: dict = {}):
+    def load_ensemble(self):
+        """Загрузка нескольких моделей для ensemble (если есть в конфиге)"""
+        ensemble_paths = self.config.get("ensemble_models", [])  # список путей к .pth
+        for path in ensemble_paths:
+            if os.path.exists(path):
+                model = self._load_model()  # создаём новую модель
+                model.load_state_dict(torch.load(path, map_location=self.device))
+                model.eval()
+                self.ensemble_models.append(model)
+                logger.info(f"Ensemble model loaded: {path}")
+        if self.ensemble_models:
+            logger.info(f"Ensemble enabled: {len(self.ensemble_models)} models")
+
+    def predict(self, features: Dict[str, Any]) -> Tuple[float, float, float]:
         """
-        Предикт с MC Dropout (passes=5) для uncertainty
+        Основной метод предсказания.
+        features: {"sequences": {tf: tensor}, "features": tensor}
+        Возвращает prob_long, prob_short, uncertainty
         """
-        timeframes = self.config['timeframes']
+        sequences = {tf: t.to(self.device) for tf, t in features.get("sequences", {}).items()}
+        agg_features = features.get("features")
+        if agg_features is not None:
+            agg_features = agg_features.to(self.device)
 
-        # Получаем cluster_id
-        sample_feats = features_by_tf[list(timeframes)[0]]
-        key = self.scenario_tracker._binarize_features(sample_feats)
-        cluster_id = self.scenario_tracker.get_cluster_id(key) if hasattr(self.scenario_tracker, 'get_cluster_id') else 0
-
-        extra_features['cluster_id'] = cluster_id
-
-        # Подготовка input (5 тензоров)
-        inputs = []
-        for tf in timeframes:
-            input_tf = features_by_tf[tf]
-            if input_tf.shape != (self.seq_len, self.n_features):
-                logger.error(f"Shape mismatch для {tf}: {input_tf.shape} vs ({self.seq_len}, {self.n_features})")
-                return 0.0
-
-            quiet_streak = extra_features.get('quiet_streak', 0)
-            quiet_col = np.full((self.seq_len, 1), quiet_streak)
-            input_tf = np.concatenate([input_tf, quiet_col], axis=1)
-
-            inputs.append(torch.tensor(input_tf, dtype=torch.float32).unsqueeze(0))
-
-        cluster_tensor = torch.tensor([cluster_id], dtype=torch.long, device=self.device)
-
-        # MC Dropout: 5 проходов с dropout включённым
+        # MC Dropout inference — dropout active
+        self.model.train()
         probs = []
-        self.model.train()  # включаем dropout даже в предикте
         with torch.no_grad():
             for _ in range(self.mc_passes):
-                prob, _ = self.model(inputs, cluster_tensor)
-                probs.append(prob.item())
+                prob, _ = self.model(sequences, agg_features)
+                probs.append(prob.squeeze())
+        probs = torch.stack(probs)
 
-        mean_prob = np.mean(probs)
-        uncertainty = np.std(probs)  # variance как мера uncertainty
+        # ← ФИКС пункта 17: ensemble — усредняем по всем моделям
+        if self.ensemble_models:
+            ensemble_probs = []
+            for model in self.ensemble_models:
+                model.train()
+                for _ in range(self.mc_passes):
+                    prob, _ = model(sequences, agg_features)
+                    ensemble_probs.append(prob.squeeze())
+            ensemble_probs = torch.stack(ensemble_probs)
+            probs = torch.cat([probs, ensemble_probs], dim=0)
 
-        if uncertainty > self.uncertainty_threshold:
-            logger.debug(f"Высокая неуверенность: {uncertainty:.4f} — пропускаем сигнал")
-            return 0.0
+        mean_prob = probs.mean(dim=0)
+        uncertainty = probs.std(dim=0).mean().item()
 
-        logger.debug(f"Предикт для {anomaly_type}: mean_prob={mean_prob:.4f}, uncertainty={uncertainty:.4f}, cluster_id={cluster_id}")
-        return mean_prob
+        # Обработка бинарной / многоклассовой классификации
+        if mean_prob.shape[0] > 1:
+            prob_long = mean_prob[0].item()
+            prob_short = mean_prob[1].item()
+        else:
+            prob_long = mean_prob.item()
+            prob_short = 1.0 - prob_long
+
+        # ← ФИКС пункта 17: калибровка вероятностей
+        if self.calibration_enabled:
+            prob_long = self._calibrate(prob_long)
+            prob_short = 1.0 - prob_long
+
+        logger.debug(f"Prediction: long={prob_long:.3f}, short={prob_short:.3f}, uncertainty={uncertainty:.3f}")
+
+        return prob_long, prob_short, uncertainty
+
+    def _calibrate(self, prob: float) -> float:
+        """Простая Platt scaling (slope и intercept — из конфига или обучены)"""
+        return 1 / (1 + np.exp(-self.calibration_slope * (prob - self.calibration_intercept)))
+
+    def predict_single(self, features: Dict[str, Any]) -> float:
+        """Обычный forward без MC Dropout (для скорости в некоторых случаях)"""
+        self.model.eval()
+        sequences = {tf: t.to(self.device) for tf, t in features.get("sequences", {}).items()}
+        agg_features = features.get("features")
+        if agg_features is not None:
+            agg_features = agg_features.to(self.device)
+
+        with torch.no_grad():
+            prob, _ = self.model(sequences, agg_features)
+        return prob.squeeze().item()
+
+    def calibrate(self, prob: float) -> float:
+        """Простая калибровка вероятностей (заглушка)"""
+        # Можно реализовать Platt scaling или isotonic regression позже
+        return prob
+
+    def load_checkpoint(self, path: str):
+        """Загрузка другого чекпоинта (для ensemble или тестов)"""
+        try:
+            self.model.load_state_dict(torch.load(path, map_location=self.device))
+            logger.info(f"Checkpoint loaded: {path}")
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint {path}: {e}")

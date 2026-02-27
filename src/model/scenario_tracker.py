@@ -55,9 +55,12 @@ class ScenarioTracker:
         # Параметры из конфига
         self.prior_w = self.config['scenario_tracker']['bayesian_prior_wins']
         self.prior_l = self.config['scenario_tracker']['bayesian_prior_losses']
-        self.half_life = self.config['scenario_tracker']['decay_half_life_days']
+        self.half_life = self.config['scenario_tracker']['decay_half_life_days']  # ← ФИКС пункта 16
         self.decay_enabled = self.config['scenario_tracker'].get('decay_enabled', True)
         self.delta_threshold = self.config['scenario_tracker']['regime']['delta_norm_threshold']
+
+        # ← ФИКС пункта 16: уменьшаем half-life до 30 дней (интрадей: сценарии живут 2–8 недель)
+        self.half_life = 30.0
 
         self._load_from_pickle()
 

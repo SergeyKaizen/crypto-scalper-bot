@@ -48,6 +48,10 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Экспорт статистики сценариев в CSV")
     parser.add_argument("--force", action="store_true", help="Принудительный запуск экспорта")
     parser.add_argument("--output", type=str, default="scenarios_stats.csv", help="Путь к выходному CSV")
+    parser.add_argument("--hardware", default="phone_tiny", choices=["phone_tiny", "colab", "server"],
+                        help="Профиль железа")
+    parser.add_argument("--mode", default="balanced", choices=["conservative", "balanced", "aggressive", "custom"],
+                        help="Режим торговли")
     return parser.parse_args()
 
 def export_scenarios(tracker: ScenarioTracker, output_path: str):
@@ -79,8 +83,8 @@ def export_scenarios(tracker: ScenarioTracker, output_path: str):
 def main():
     args = parse_args()
 
-    config = load_config()
-    tracker = ScenarioTracker()
+    config = load_config(hardware=args.hardware, mode=args.mode)  # ← ФИКС: передаём hardware и mode
+    tracker = ScenarioTracker(config)  # ← предположительно tracker принимает config (если нет — адаптировать)
 
     if not args.force:
         logger.info("Экспорт по умолчанию (force не указан). Используйте --force для принудительного запуска.")

@@ -1,5 +1,5 @@
 """
-src/trading/risk_manager.py
+src/trading_risk_manager.py
 
 === Основной принцип работы файла ===
 
@@ -28,103 +28,82 @@ src/trading/risk_manager.py
 - Логи через setup_logger
 """
 
-import ccxt
 import logging
-from typing import Optional
+from typing import Dict, Optional
 
 from src.core.config import load_config
 from src.utils.logger import setup_logger
 
-logger = setup_logger('risk_manager', logging.INFO)
+setup_logger()
+logger = logging.getLogger(__name__)
+
 
 class RiskManager:
-    def __init__(self):
-        self.config = load_config()
-        self.exchange = ccxt.binance({
-            'apiKey': self.config['binance']['api_key'],
-            'secret': self.config['binance']['api_secret'],
-            'enableRateLimit': True,
-            'options': {'defaultType': 'future'}
-        })
-        self.balance = self._get_real_balance()  # начальный баланс из Binance
-        self.leverage = self.config['trading'].get('leverage', 20)
-        self.min_notional = self.config.get('min_notional', {}).get('default', 5.0)
+    def __init__(self, config: dict):
+        self.config = config
+        self.risk_per_trade = config["risk"]["per_trade"] / 100
+        self.daily_loss_limit = config["risk"]["daily_max"] / 100
+        self.max_drawdown = config["risk"].get("max_drawdown_stop", 25.0) / 100
+        self.initial_balance = config["initial_balance"]
+        self.current_balance = self.initial_balance
+        self.daily_pnl = 0.0
+        self.max_equity = self.initial_balance
 
-        # Кэш min_lot per-symbol (загружаем при первом вызове)
-        self.min_lot_cache = {}
+    def update_balance(self, pnl: float):
+        """Обновление баланса после закрытия сделки"""
+        self.current_balance += pnl
+        self.daily_pnl += pnl
+        self.max_equity = max(self.max_equity, self.current_balance)
 
-    def calculate_size(self, symbol: str, entry_price: float, sl_price: float, risk_pct: float,
-                       quiet_streak: int = 0, consensus_count: int = 1) -> float:
+        if self.daily_pnl <= -self.daily_loss_limit * self.initial_balance:
+            logger.critical(f"Daily loss limit reached: {self.daily_pnl:.2f} ({self.daily_pnl/self.initial_balance*100:.1f}%)")
+            raise RuntimeError("Daily loss limit exceeded")
+
+        drawdown = (self.max_equity - self.current_balance) / self.max_equity
+        if drawdown >= self.max_drawdown:
+            logger.critical(f"Max drawdown reached: {drawdown*100:.1f}%")
+            raise RuntimeError("Max drawdown exceeded")
+
+    def reset_daily(self):
+        """Сброс daily PnL (вызывается в 00:00 UTC)"""
+        self.daily_pnl = 0.0
+
+    def calculate_position_size(self,
+                               current_price: float,
+                               direction: str,
+                               confidence: float = 0.5,
+                               atr: float = None,
+                               regime_bull: float = 0.0,
+                               regime_bear: float = 0.0) -> float:
         """
-        Расчёт размера позиции по ТЗ + проверка min_notional и min_lot
+        Расчёт размера позиции в базовой валюте.
+        ← ФИКС пункта 12: regime_strength влияет на размер
         """
-        if sl_price == entry_price or np.isnan(sl_price):
-            logger.warning(f"SL = entry или NaN для {symbol} — размер позиции = 0")
-            return 0.0
+        if atr is None:
+            atr = current_price * 0.001
 
-        sl_distance = abs(entry_price - sl_price) / entry_price
-        if sl_distance == 0 or np.isnan(sl_distance):
-            return 0.0
+        sl_multiplier = self.config["tp_sl"].get("sl_multiplier", 1.2)
+        stop_distance = atr * sl_multiplier
 
-        risk_amount = self.balance * (risk_pct / 100)
-        size = risk_amount / (sl_distance * entry_price) * self.leverage
+        risk_amount = self.risk_per_trade * self.current_balance
+        size_in_base = risk_amount / stop_distance
 
-        # Min notional check
-        if size * entry_price < self.min_notional:
-            logger.warning(f"Размер позиции {size:.4f} ниже min_notional {self.min_notional} для {symbol}")
-            return 0.0
+        confidence_factor = confidence ** 2
+        size_in_base *= confidence_factor
 
-        # Min lot check (минимальный объём по монете)
-        min_lot = self._get_min_lot(symbol)
-        if size < min_lot:
-            logger.warning(f"Размер позиции {size:.4f} ниже min_lot {min_lot} для {symbol}")
-            return 0.0
+        # ← Корректировка на силу режима
+        regime_factor = 1.0
+        if direction == "L" and regime_bull > 0.7:
+            regime_factor = 1.2  # +20% размера в сильном бычьем
+        elif direction == "S" and regime_bear > 0.7:
+            regime_factor = 1.2
+        size_in_base *= regime_factor
 
-        logger.debug(f"Расчёт размера для {symbol}: risk={risk_amount:.2f}, distance={sl_distance:.4f}, "
-                     f"size={size:.4f}, quiet_streak={quiet_streak}, consensus={consensus_count}")
-        return size
+        max_leverage = self.config["leverage"]["max"]
+        max_size_by_leverage = (self.current_balance * max_leverage) / current_price
+        size_in_base = min(size_in_base, max_size_by_leverage)
 
-    def update_deposit(self, net_pl: float):
-        """
-        Обновление баланса после закрытия позиции (с комиссией)
-        """
-        self.balance += net_pl
-        logger.info(f"Обновлён баланс: {self.balance:.2f} (net_pl={net_pl:.2f})")
+        logger.debug(f"Size calc: risk={risk_amount:.2f}, stop={stop_distance:.4f}, "
+                     f"regime_factor={regime_factor:.2f}, size={size_in_base:.4f}")
 
-        # Синхрон с реальным балансом Binance
-        try:
-            real_balance = self._get_real_balance()
-            if abs(real_balance - self.balance) > 0.1:
-                logger.warning(f"Расхождение баланса: local={self.balance:.2f}, real={real_balance:.2f}")
-                self.balance = real_balance
-        except Exception as e:
-            logger.debug(f"Не удалось синхронизировать баланс: {e}")
-
-    def _get_real_balance(self) -> float:
-        """Получение реального баланса USDT с Binance"""
-        try:
-            balance = self.exchange.fetch_balance()
-            return balance['USDT']['free']
-        except Exception as e:
-            logger.error(f"Ошибка получения баланса: {e}")
-            return self.balance  # fallback на локальный
-
-    def _get_min_lot(self, symbol: str) -> float:
-        """Получение минимального объёма (lot size) для монеты"""
-        if symbol in self.min_lot_cache:
-            return self.min_lot_cache[symbol]
-
-        try:
-            markets = self.exchange.load_markets()
-            if symbol in markets:
-                min_amount = markets[symbol]['limits']['amount']['min']
-                self.min_lot_cache[symbol] = min_amount or 0.0
-                return self.min_lot_cache[symbol]
-        except Exception as e:
-            logger.warning(f"Не удалось загрузить min_lot для {symbol}: {e}")
-
-        return 0.0  # fallback — нет ограничения
-
-    def get_balance(self) -> float:
-        """Текущий баланс (локальный или реальный)"""
-        return self.balance
+        return size_in_base

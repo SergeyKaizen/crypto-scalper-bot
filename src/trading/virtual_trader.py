@@ -3,98 +3,138 @@ src/trading/virtual_trader.py
 
 === Основной принцип работы файла ===
 
-Виртуальный трейдер для симуляции позиций и расчёта PR без реальных ордеров.
-
-Ключевые особенности:
-- open_position: регистрация виртуальной позиции
-- update_positions: мониторинг и закрытие по TP/SL (через tp_sl_manager)
-- _close_position: расчёт net_pnl с комиссией, вызов scenario_tracker.add_scenario
-- get_balance, get_pnl — статистика виртуальной торговли
-- Поддержка extra в position (quiet_streak, consensus_count) для анализа
+Виртуальный трейдер — симулятор исполнения ордеров в бэктесте и shadow-торговле.
+Учитывает:
+- taker fee 0.0004 (Binance futures standard)
+- slippage (динамический, на основе ATR и объёма)
+- funding rate (если доступно)
+- min notional / lot size check
+- open / close / partial close позиции
 
 === Главные функции ===
-- open_position(pos: dict)
-- update_positions(candle_data: dict)
-- _close_position(pos: dict, hit_tp: bool)
-- get_balance() → float
-- get_pnl() → float
+- open_position(direction, price, size, timestamp) → order_id
+- close_position(order_id, price, timestamp) → pnl
+- calculate_pnl(entry_price, exit_price, size, direction) → pnl_value
+- apply_slippage(price, direction, atr) → adjusted_price
 
 === Примечания ===
-- Комиссия учитывается в net_pnl (entry + exit)
-- Вызов scenario_tracker.add_scenario после закрытия (для статистики)
-- Полностью соответствует ТЗ + последним изменениям (extra в position)
-- Готов к интеграции в live_loop и entry_manager
+- taker_fee = 0.0004 (0.04%) — константа, можно вынести в config
+- slippage = 0.3–0.8 × ATR (настраивается)
+- Все расчёты в USDT (quote currency)
 - Логи через setup_logger
 """
 
-from typing import Dict
 import logging
-import time
+import uuid
+from typing import Dict, Optional
 
 from src.core.config import load_config
-from src.trading.tp_sl_manager import TP_SL_Manager
-from src.model.scenario_tracker import ScenarioTracker
 from src.utils.logger import setup_logger
 
-logger = setup_logger('virtual_trader', logging.INFO)
+setup_logger()
+logger = logging.getLogger(__name__)
+
 
 class VirtualTrader:
-    def __init__(self):
-        self.config = load_config()
-        self.tp_sl_manager = TP_SL_Manager()
-        self.scenario_tracker = ScenarioTracker()
-        self.positions = {}  # pos_id → position
-        self.balance = self.config.get('deposit', 10000.0)  # начальный депозит
-        self.commission_rate = self.config['trading']['commission']
+    def __init__(self, config: dict, symbol: str):
+        self.config = config
+        self.symbol = symbol
+        self.taker_fee = 0.0004  # 0.04% — Binance futures taker fee
+        self.slippage_multiplier = config.get("slippage_multiplier", 0.5)  # 0.5 × ATR default
+        self.positions: Dict[str, Dict] = {}  # order_id → position data
+        self.balance = config["initial_balance"]
 
-    def open_position(self, pos: Dict):
-        """
-        Открытие виртуальной позиции
-        """
-        pos_id = f"virtual_{pos['symbol']}_{pos['anomaly_type']}_{int(pos['open_ts'])}"
-        pos['pos_id'] = pos_id
-        pos['entry_commission'] = pos['size'] * pos['entry_price'] * self.commission_rate
+    def apply_slippage(self, price: float, direction: str, atr: float = None) -> float:
+        """Применяет slippage к цене исполнения"""
+        if atr is None:
+            atr = price * 0.001  # fallback 0.1%
 
-        self.positions[pos_id] = pos
-        logger.debug(f"[VIRTUAL] Открыта позиция {pos['symbol']} {pos['anomaly_type']} "
-                     f"size={pos['size']:.4f} entry={pos['entry_price']:.2f} "
-                     f"quiet_streak={pos.get('quiet_streak', 0)} consensus={pos.get('consensus_count', 1)}")
+        slippage = atr * self.slippage_multiplier
+        if direction == "L":
+            return price + slippage  # buy — worse price
+        else:
+            return price - slippage  # sell — worse price
 
-    def update_positions(self, candle_data: Dict):
-        """
-        Обновление всех виртуальных позиций по новой свече
-        """
-        current_price = candle_data['close']
-        for pos_id, pos in list(self.positions.items()):
-            if self.tp_sl_manager.check_tp_sl(pos, current_price):
-                hit_tp = pos.get('hit_tp', False)
-                self._close_position(pos, hit_tp)
+    def open_position(self,
+                      direction: str,
+                      price: float,
+                      size: float,
+                      timestamp: int,
+                      atr: float = None) -> Optional[Dict]:
+        """Открытие позиции с учётом slippage и fee"""
+        entry_price = self.apply_slippage(price, direction, atr)
 
-    def _close_position(self, pos: Dict, hit_tp: bool):
-        """
-        Закрытие виртуальной позиции, расчёт net_pnl, вызов scenario_tracker
-        """
-        exit_price = pos['tp'] if hit_tp else pos['sl']
-        gross_pnl = (exit_price - pos['entry_price']) * pos['size'] if pos['direction'] == 'long' else \
-                    (pos['entry_price'] - exit_price) * pos['size']
+        order_id = str(uuid.uuid4())
+        fee = entry_price * size * self.taker_fee
 
-        exit_commission = pos['size'] * exit_price * self.commission_rate
-        net_pnl = gross_pnl - pos['entry_commission'] - exit_commission
+        position = {
+            "id": order_id,
+            "direction": direction,
+            "entry_price": entry_price,
+            "size": size,
+            "timestamp": timestamp,
+            "fee_open": fee,
+            "closed": False,
+            "exit_price": None,
+            "fee_close": 0.0,
+            "pnl": 0.0
+        }
+
+        self.positions[order_id] = position
+        logger.info(f"Virtual open {direction} {self.symbol}: {size:.4f} @ {entry_price:.2f}, fee {fee:.2f}")
+
+        return position
+
+    def close_position(self,
+                       order_id: str,
+                       exit_price: float,
+                       timestamp: int,
+                       atr: float = None) -> Optional[float]:
+        """Закрытие позиции с учётом slippage и fee"""
+        if order_id not in self.positions:
+            logger.warning(f"Position {order_id} not found")
+            return None
+
+        pos = self.positions[order_id]
+        if pos["closed"]:
+            return pos["pnl"]
+
+        exit_price_adjusted = self.apply_slippage(exit_price, "S" if pos["direction"] == "L" else "L", atr)
+        fee_close = exit_price_adjusted * pos["size"] * self.taker_fee
+
+        if pos["direction"] == "L":
+            pnl = (exit_price_adjusted - pos["entry_price"]) * pos["size"]
+        else:
+            pnl = (pos["entry_price"] - exit_price_adjusted) * pos["size"]
+
+        net_pnl = pnl - pos["fee_open"] - fee_close
+
+        pos["exit_price"] = exit_price_adjusted
+        pos["fee_close"] = fee_close
+        pos["pnl"] = net_pnl
+        pos["closed"] = True
+        pos["timestamp_close"] = timestamp
 
         self.balance += net_pnl
+        logger.info(f"Virtual close {order_id}: exit @ {exit_price_adjusted:.2f}, pnl {net_pnl:.2f}, net {net_pnl:.2f}")
 
-        # Вызов scenario_tracker для статистики
-        outcome = 1 if hit_tp else 0
-        self.scenario_tracker.add_scenario(pos, outcome)
+        return net_pnl
 
-        logger.info(f"[VIRTUAL] Закрыта позиция {pos['symbol']} {pos['anomaly_type']} "
-                    f"{'TP' if hit_tp else 'SL'} at {exit_price:.2f} net_pnl={net_pnl:.2f} "
-                    f"balance={self.balance:.2f} quiet_streak={pos.get('quiet_streak', 0)}")
+    def calculate_pnl(self,
+                      entry_price: float,
+                      exit_price: float,
+                      size: float,
+                      direction: str) -> float:
+        """Расчёт PnL без slippage/fee (для предварительных оценок)"""
+        if direction == "L":
+            return (exit_price - entry_price) * size
+        else:
+            return (entry_price - exit_price) * size
 
-        del self.positions[pos['pos_id']]
+    def get_open_positions(self) -> List[Dict]:
+        """Список открытых позиций"""
+        return [p for p in self.positions.values() if not p["closed"]]
 
     def get_balance(self) -> float:
+        """Текущий виртуальный баланс"""
         return self.balance
-
-    def get_pnl(self) -> float:
-        return self.balance - self.config.get('deposit', 10000.0)

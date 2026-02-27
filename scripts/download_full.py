@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 async def main():
-    config = load_config()  # Автоопределение или из аргументов
+    config = load_config(hardware_profile=args.hardware)  # ← ФИКС: передаём hardware_profile
     downloader = Downloader(config)
     storage = Storage(config)
 
@@ -84,7 +84,11 @@ async def main():
 if __name__ == "__main__":
     # Поддержка аргументов (можно расширить argparse)
     import sys
-    hardware = "phone_tiny" if "--hardware" not in sys.argv else sys.argv[sys.argv.index("--hardware") + 1]
+    import argparse
 
-    config = load_config(hardware_profile=hardware)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--hardware", default="phone_tiny", choices=["phone_tiny", "colab", "server"])
+    args = parser.parse_args()
+
+    config = load_config(hardware_profile=args.hardware)  # ← ФИКС: используем argparse
     asyncio.run(main())

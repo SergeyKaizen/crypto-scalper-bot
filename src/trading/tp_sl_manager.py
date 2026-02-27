@@ -25,72 +25,134 @@ src/trading/tp_sl_manager.py
 - Логи через setup_logger
 """
 
-from typing import Tuple, Dict
-import numpy as np
+import logging
+from typing import Dict, List, Optional
 
 from src.core.config import load_config
 from src.utils.logger import setup_logger
 
-logger = setup_logger('tp_sl_manager', logging.INFO)
+setup_logger()
+logger = logging.getLogger(__name__)
 
-class TP_SL_Manager:
-    def __init__(self):
-        self.config = load_config()
 
-    def calculate_tp_sl(self, candle_data: Dict, timeframe: str) -> Tuple[float, float]:
-        """
-        Основной расчёт TP/SL по ТЗ (classic mode)
-        """
-        # Средний размер свечи (в % от close)
-        avg_size = candle_data.get('volatility_mean', 0.0)
+class Position:
+    def __init__(self, pos_id: str, direction: str, entry_price: float, size: float, timestamp: int):
+        self.id = pos_id
+        self.direction = direction  # "L" или "S"
+        self.entry_price = entry_price
+        self.size = size
+        self.timestamp = timestamp
+        self.closed = False
+        self.exit_price = None
+        self.exit_reason = None
+        self.partial_closed = 0.0  # накопленный % закрытых частей
 
-        if avg_size == 0 or np.isnan(avg_size):
-            # Fallback на средний range
-            avg_size = np.mean(candle_data['high'] - candle_data['low']) / candle_data['close'].mean()
-
-        direction = candle_data.get('direction', 'long')
-
-        if direction == 'long':
-            hh = candle_data['high'].max()
-            sl = hh + 0.0005 * hh  # HH + 0.05%
-            if (sl - hh) > avg_size * 2:
-                sl = hh + avg_size * 2  # cap 2×
-            tp = candle_data['close'].mean() + avg_size * candle_data['close'].mean()
+    def pnl(self, current_price: float) -> float:
+        """Текущий PnL позиции"""
+        if self.direction == "L":
+            return (current_price - self.entry_price) * self.size
         else:
-            ll = candle_data['low'].min()
-            sl = ll - 0.0005 * ll  # LL - 0.05%
-            if (ll - sl) > avg_size * 2:
-                sl = ll - avg_size * 2  # cap 2×
-            tp = candle_data['close'].mean() - avg_size * candle_data['close'].mean()
+            return (self.entry_price - current_price) * self.size
 
-        return tp, sl
 
-    def calculate_sl(self, candle_data: Dict, direction: str) -> float:
-        """Расчёт только SL (для risk_manager)"""
-        tp, sl = self.calculate_tp_sl(candle_data, self.config['timeframes'][0])
-        return sl
+class TPSLManager:
+    def __init__(self, config: dict):
+        self.config = config
+        self.positions: Dict[str, Position] = {}
+        self.trailing_activation = config["trailing"]["activation"]
+        self.trailing_step = config["trailing"].get("step", 0.001)
+        self.partial_levels = config["partial_take_profit"].get("levels", [])
 
-    def check_tp_sl(self, position: Dict, current_price: float) -> Tuple[bool, bool]:
-        """
-        Проверка закрытия позиции по TP/SL.
-        Возвращает (hit_tp, hit_sl) — дальше закрытие в PositionManager
-        """
-        tp = position.get('tp')
-        sl = position.get('sl')
-        direction = position['direction']
+    def register_position(self, position_data: Dict):
+        """Регистрация новой позиции после открытия"""
+        pos_id = position_data["id"]
+        if pos_id in self.positions:
+            logger.warning(f"Position {pos_id} already registered")
+            return
 
-        hit_tp = False
-        hit_sl = False
+        pos = Position(
+            pos_id=pos_id,
+            direction=position_data["direction"],
+            entry_price=position_data["price"],
+            size=position_data["size"],
+            timestamp=position_data["timestamp"]
+        )
+        self.positions[pos_id] = pos
+        logger.info(f"Registered position {pos_id}: {pos.direction} @ {pos.entry_price:.2f}, size {pos.size:.4f}")
 
-        if direction == 'long':
-            if current_price >= tp:
-                hit_tp = True
-            if current_price <= sl:
-                hit_sl = True
-        else:
-            if current_price <= tp:
-                hit_tp = True
-            if current_price >= sl:
-                hit_sl = True
+    def update_position(self,
+                        pos_id: str,
+                        current_price: float,
+                        high: float,
+                        low: float,
+                        timestamp: int) -> Optional[Dict]:
+        """Проверка и обработка одной позиции на текущей свече"""
+        if pos_id not in self.positions:
+            return None
 
-        return hit_tp, hit_sl
+        pos = self.positions[pos_id]
+        if pos.closed:
+            return None
+
+        pnl_pct = ((current_price - pos.entry_price) / pos.entry_price * 100
+                   if pos.direction == "L" else
+                   (pos.entry_price - current_price) / pos.entry_price * 100)
+
+        # Partial take-profit
+        for level in self.partial_levels:
+            target_pct = level["target"] * 100
+            close_pct = level["percent"] / 100.0
+            if pnl_pct >= target_pct and pos.partial_closed < level["percent"]:
+                close_size = pos.size * close_pct
+                pos.partial_closed += level["percent"]
+                pos.size -= close_size
+                logger.info(f"Partial TP {pos.id}: {level['percent']}% closed @ {current_price:.4f}")
+
+        # Trailing stop (простая реализация)
+        if pnl_pct >= self.trailing_activation * 100:
+            # Можно хранить trailing_sl в pos, но пока просто логика проверки
+            pass  # полная реализация trailing будет в пунктах улучшений
+
+        # Hard SL check
+        sl_distance = self.config["tp_sl"].get(
+            "sl_distance_long" if pos.direction == "L" else "sl_distance_short", 0.003
+        )
+        sl_price = pos.entry_price * (1 - sl_distance) if pos.direction == "L" else pos.entry_price * (1 + sl_distance)
+
+        if (pos.direction == "L" and low <= sl_price) or (pos.direction == "S" and high >= sl_price):
+            pos.closed = True
+            pos.exit_price = sl_price
+            pos.exit_reason = "SL hit"
+            return {"closed": True, "exit_price": sl_price, "reason": "SL"}
+
+        # Hard TP check
+        tp_distance = self.config["tp_sl"].get(
+            "tp_distance_long" if pos.direction == "L" else "tp_distance_short", 0.006
+        )
+        tp_price = pos.entry_price * (1 + tp_distance) if pos.direction == "L" else pos.entry_price * (1 - tp_distance)
+
+        if (pos.direction == "L" and high >= tp_price) or (pos.direction == "S" and low <= tp_price):
+            pos.closed = True
+            pos.exit_price = tp_price
+            pos.exit_reason = "TP hit"
+            return {"closed": True, "exit_price": tp_price, "reason": "TP"}
+
+        return None
+
+    def update_all_positions(self, current_price: float, current_time: int, high: float, low: float) -> List[Dict]:
+        """Обновление всех открытых позиций за одну свечу"""
+        updates = []
+        for pos_id in list(self.positions):
+            update = self.update_position(pos_id, current_price, high, low, current_time)
+            if update:
+                updates.append(update)
+        return updates
+
+    def close_position(self, pos_id: str, exit_price: float, reason: str):
+        """Принудительное закрытие позиции"""
+        if pos_id in self.positions:
+            pos = self.positions[pos_id]
+            pos.closed = True
+            pos.exit_price = exit_price
+            pos.exit_reason = reason
+            del self.positions[pos_id]

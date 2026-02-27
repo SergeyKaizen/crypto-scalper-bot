@@ -20,6 +20,8 @@
     --mode: conservative / balanced / aggressive / custom
     --retrain: fine-tune на последних данных (по умолчанию full train)
     --epochs: переопределить кол-во эпох (по умолчанию из конфига)
+    --symbol: Монета для обучения (по умолчанию BTCUSDT)
+    --timeframe: Таймфрейм обучения
 """
 
 import argparse
@@ -30,6 +32,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
+from datetime import datetime
 
 from src.core.config import load_config
 from src.core.types import Candle
@@ -78,9 +81,18 @@ async def prepare_dataset(config, symbol: str, timeframe: str):
     agg_features_list = []
     labels = []
 
+    # ← Реальные параметры из конфига (tp_sl)
+    tp_sl_cfg = config.get("tp_sl", {})
+    look_ahead_candles = tp_sl_cfg.get("look_ahead_candles", 20)
+    sl_distance_long = tp_sl_cfg.get("sl_distance_long", 0.003)   # 0.3% default
+    sl_distance_short = tp_sl_cfg.get("sl_distance_short", 0.003)
+    tp_distance_long = tp_sl_cfg.get("tp_distance_long", 0.006)   # 0.6% default (R:R ≥ 2)
+    tp_distance_short = tp_sl_cfg.get("tp_distance_short", 0.006)
+    allowed_directions = tp_sl_cfg.get("directions", ["L", "S"])  # по умолчанию оба
+
     # Скользящее окно
-    for i in tqdm(range(len(df) - config["seq_len"] - 20), desc="Подготовка датасета"):
-        window_df = df.slice(i, config["seq_len"] + 20)  # +20 для look-ahead
+    for i in tqdm(range(len(df) - config["seq_len"] - look_ahead_candles), desc="Подготовка датасета"):
+        window_df = df.slice(i, config["seq_len"] + look_ahead_candles)
 
         # Признаки и sequence
         features_dict = await feature_engine.build_features({timeframe: window_df})
@@ -91,16 +103,36 @@ async def prepare_dataset(config, symbol: str, timeframe: str):
 
         agg = features_dict["features"].get(timeframe, {})
 
-        # Label: 1 если в следующие 20 свечей цена прошла TP расстояние
+        # Entry price — последняя закрытая свеча в sequence
         entry_price = window_df["close"][config["seq_len"] - 1]
-        tp_distance = 0.5  # Placeholder — в реальном коде от tp_sl_manager
-        future_df = window_df.tail(20)
-        if direction == "L":  # Пример
-            max_future = future_df["high"].max()
-            label = 1 if max_future >= entry_price * (1 + tp_distance) else 0
-        else:
-            min_future = future_df["low"].min()
-            label = 1 if min_future <= entry_price * (1 - tp_distance) else 0
+
+        # Future часть для проверки TP/SL
+        future_df = window_df.tail(look_ahead_candles)
+
+        label = 0  # по умолчанию — неудачная сделка
+
+        # Проверяем для каждого разрешённого направления
+        for direction in allowed_directions:
+            if direction == "L":
+                tp_level = entry_price * (1 + tp_distance_long)
+                sl_level = entry_price * (1 - sl_distance_long)
+                highs = future_df["high"]
+                lows = future_df["low"]
+                hit_tp = (highs >= tp_level).any()
+                hit_sl = (lows <= sl_level).any()
+                if hit_tp and not hit_sl:
+                    label = 1
+                    break  # достаточно одного успешного направления
+            elif direction == "S":
+                tp_level = entry_price * (1 - tp_distance_short)
+                sl_level = entry_price * (1 + sl_distance_short)
+                highs = future_df["high"]
+                lows = future_df["low"]
+                hit_tp = (lows <= tp_level).any()
+                hit_sl = (highs >= sl_level).any()
+                if hit_tp and not hit_sl:
+                    label = 1
+                    break
 
         sequences.append(seq)
         agg_features_list.append(agg)
@@ -120,10 +152,11 @@ def train_model(config, sequences, agg_features, labels):
     train_loader = DataLoader(train_dataset, batch_size=config["model"]["batch_size"], shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=config["model"]["batch_size"])
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if config.get("use_tiny_model", False):
-        model = TinyHybrid(config).to(torch.device("cpu"))
+        model = TinyHybrid(config).to(device)
     else:
-        model = MultiTFHybrid(config).to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        model = MultiTFHybrid(config).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=config["model"]["learning_rate"])
     criterion = nn.BCEWithLogitsLoss()
@@ -160,14 +193,31 @@ def train_model(config, sequences, agg_features, labels):
         logger.info("Epoch %d/%d, Loss: %.4f, Val Accuracy: %.4f", epoch+1, epochs, total_loss / len(train_loader), accuracy)
 
     # Сохранение
-    path = f"models/model_{config['hardware_profile']}_{datetime.now().strftime('%Y%m%d_%H%M')}.pth"
+    path = f"models/model_{config.get('hardware_profile', 'unknown')}_{datetime.now().strftime('%Y%m%d_%H%M')}.pth"
     torch.save(model.state_dict(), path)
     logger.info("Модель сохранена: %s", path)
 
 
-if __name__ == "__main__":
+async def main():
+    """Основная асинхронная функция запуска обучения"""
+    global args  # чтобы использовать args в train_model
     args = parse_args()
-    config = load_config(args.hardware, args.mode)
+    config = load_config(hardware=args.hardware, mode=args.mode)
 
-    # Основной запуск
+    logger.info(f"Запуск обучения | Symbol: {args.symbol} | TF: {args.timeframe} | Mode: {args.mode} | Retrain: {args.retrain}")
+
+    # Подготовка датасета
+    sequences, agg_features, labels = await prepare_dataset(config, args.symbol, args.timeframe)
+
+    if not sequences:
+        logger.error("Датасет пустой — обучение невозможно")
+        return
+
+    logger.info(f"Подготовлен датасет: {len(sequences)} примеров")
+
+    # Обучение
+    train_model(config, sequences, agg_features, labels)
+
+
+if __name__ == "__main__":
     asyncio.run(main())

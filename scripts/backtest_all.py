@@ -103,11 +103,15 @@ def filter_and_update_whitelist(config: dict, all_results: List[Dict]):
 
 def main():
     parser = argparse.ArgumentParser(description="Параллельный бэктест по всем монетам + обновление whitelist")
+    parser.add_argument("--hardware", default="phone_tiny", choices=["phone_tiny", "colab", "server"],
+                        help="Профиль железа")
+    parser.add_argument("--mode", default="balanced", choices=["conservative", "balanced", "aggressive", "custom"],
+                        help="Режим торговли")
     parser.add_argument("--top_n", type=int, default=None,
                         help="Ограничить топ-N монет по PR_LS (если не указан — все из whitelist)")
     args = parser.parse_args()
 
-    config = load_config()
+    config = load_config(hardware=args.hardware, mode=args.mode)  # ← ФИКС: передаём hardware и mode
     storage = Storage(config)
 
     # Получаем список монет для бэктеста
