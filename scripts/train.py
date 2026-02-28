@@ -40,6 +40,10 @@ from src.data.storage import Storage
 from src.features.feature_engine import FeatureEngine
 from src.model.architectures import MultiTFHybrid, TinyHybrid
 from src.model.trainer import TradingDataset
+from src.trading.virtual_trader import VirtualTrader
+from src.trading.tp_sl_manager import TP_SL_Manager
+from src.trading.risk_manager import RiskManager
+from src.trading.entry_manager import EntryManager
 from src.utils.logger import setup_logger
 
 setup_logger()
@@ -80,18 +84,20 @@ async def prepare_dataset(config, symbol: str, timeframe: str):
     agg_features_list = []
     labels = []
 
-    # ← Реальные параметры из конфига (tp_sl)
-    tp_sl_cfg = config.get("tp_sl", {})
-    look_ahead_candles = tp_sl_cfg.get("look_ahead_candles", 20)
-    sl_distance_long = tp_sl_cfg.get("sl_distance_long", 0.003)   # 0.3% default
-    sl_distance_short = tp_sl_cfg.get("sl_distance_short", 0.003)
-    tp_distance_long = tp_sl_cfg.get("tp_distance_long", 0.006)   # 0.6% default (R:R ≥ 2)
-    tp_distance_short = tp_sl_cfg.get("tp_distance_short", 0.006)
-    allowed_directions = tp_sl_cfg.get("directions", ["L", "S"])  # по умолчанию оба
+    # Инициализируем необходимые объекты для симуляции
+    virtual_trader = VirtualTrader()
+    tp_sl_manager = TP_SL_Manager(config)
+    risk_manager = RiskManager(config)
+    entry_manager = EntryManager()  # если нужен для фильтрации сигнала
+
+    # Параметры симуляции (из конфига или фиксированные)
+    taker_fee = 0.0004
+    slippage_pct = 0.0005  # 0.05% — типичный slippage для крипты
+    rr_threshold = 0.5     # фиксируем по пункту 6
 
     # Скользящее окно
-    for i in tqdm(range(len(df) - config["seq_len"] - look_ahead_candles), desc="Подготовка датасета"):
-        window_df = df.slice(i, config["seq_len"] + look_ahead_candles)
+    for i in tqdm(range(len(df) - config["seq_len"] - 1), desc="Подготовка датасета"):
+        window_df = df.slice(i, config["seq_len"])
 
         # Признаки и sequence
         features_dict = await feature_engine.build_features({timeframe: window_df})
@@ -103,35 +109,50 @@ async def prepare_dataset(config, symbol: str, timeframe: str):
         agg = features_dict["features"].get(timeframe, {})
 
         # Entry price — последняя закрытая свеча в sequence
-        entry_price = window_df["close"][config["seq_len"] - 1]
+        entry_price = window_df["close"][-1]
 
-        # Future часть для проверки TP/SL
-        future_df = window_df.tail(look_ahead_candles)
+        # === Пункт 5 + 7: Полноценная симуляция исполнения без look-ahead ===
+        # Открываем виртуальную позицию (допустим L — можно добавить цикл по direction)
+        direction = "L"  # или "S" — можно брать из whitelist или пробовать оба
+        size = risk_manager.calculate_position_size(symbol, entry_price, sl_price=entry_price * (1 - 0.003))  # примерный SL
 
-        label = 0  # по умолчанию — неудачная сделка
+        position = {
+            "symbol": symbol,
+            "entry_price": entry_price,
+            "size": size,
+            "direction": direction,
+            "open_ts": window_df["timestamp"][-1]
+        }
 
-        # Проверяем для каждого разрешённого направления
-        for direction in allowed_directions:
-            if direction == "L":
-                tp_level = entry_price * (1 + tp_distance_long)
-                sl_level = entry_price * (1 - sl_distance_long)
-                highs = future_df["high"]
-                lows = future_df["low"]
-                hit_tp = (highs >= tp_level).any()
-                hit_sl = (lows <= sl_level).any()
-                if hit_tp and not hit_sl:
-                    label = 1
-                    break  # достаточно одного успешного направления
-            elif direction == "S":
-                tp_level = entry_price * (1 - tp_distance_short)
-                sl_level = entry_price * (1 + sl_distance_short)
-                highs = future_df["high"]
-                lows = future_df["low"]
-                hit_tp = (lows <= tp_level).any()
-                hit_sl = (highs >= sl_level).any()
-                if hit_tp and not hit_sl:
-                    label = 1
-                    break
+        # Открываем позицию в виртуальном трейдере
+        virtual_trader.open_position(position)
+
+        # Симулируем закрытие по следующим свечам (без заглядывания за пределы датасета)
+        hit_tp = False
+        hit_sl = False
+        pnl = 0.0
+
+        future_candles = df.slice(i + config["seq_len"], len(df) - i - config["seq_len"])
+        for future in future_candles.iter_rows(named=True):
+            current_price = future["close"]
+            # Проверяем TP/SL
+            if tp_sl_manager.check_tp_sl(position, current_price):
+                if position["hit_tp"]:
+                    hit_tp = True
+                elif position["hit_sl"]:
+                    hit_sl = True
+                pnl = position.get("pnl", 0.0)
+                # Учёт fees и slippage
+                pnl -= position["size"] * entry_price * taker_fee * 2  # открытие + закрытие
+                pnl -= position["size"] * entry_price * slippage_pct
+                break
+
+        # === Пункт 6: label = 1 только если R:R ≥ 0.5 ===
+        if hit_tp and pnl > 0:
+            achieved_rr = pnl / (size * abs(entry_price - position.get("sl_price", entry_price)))
+            label = 1 if achieved_rr >= rr_threshold else 0
+        else:
+            label = 0
 
         sequences.append(seq)
         agg_features_list.append(agg)
@@ -151,7 +172,6 @@ def train_model(config, sequences, agg_features, labels):
     train_loader = DataLoader(train_dataset, batch_size=config["model"]["batch_size"], shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=config["model"]["batch_size"])
 
-    # === ФИКС пункта 28: Проверка доступности CUDA + fallback на CPU ===
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Обучение будет производиться на устройстве: {device} "
                 f"(CUDA доступен: {torch.cuda.is_available()})")
