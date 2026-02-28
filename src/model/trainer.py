@@ -1,4 +1,3 @@
-# scripts/train.py
 """
 Скрипт первоначального обучения и переобучения модели.
 
@@ -131,10 +130,15 @@ def train_model(config, sequences, agg_features, labels):
     train_loader = DataLoader(train_dataset, batch_size=config["model"]["batch_size"], shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=config["model"]["batch_size"])
 
+    # === ФИКС пункта 28: Проверка доступности CUDA + fallback на CPU + лог ===
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Обучение будет производиться на устройстве: {device} "
+                f"(CUDA доступен: {torch.cuda.is_available()})")
+
     if config.get("use_tiny_model", False):
-        model = TinyHybrid(config).to(torch.device("cpu"))
+        model = TinyHybrid(config).to(device)
     else:
-        model = MultiTFHybrid(config).to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        model = MultiTFHybrid(config).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=config["model"]["learning_rate"])
     criterion = nn.BCEWithLogitsLoss()
@@ -143,7 +147,7 @@ def train_model(config, sequences, agg_features, labels):
     if args.retrain:
         epochs = max(10, epochs // 5)  # Fine-tune — меньше эпох
 
-    logger.info("Обучение: %d эпох, batch=%d, device=%s", epochs, config["model"]["batch_size"], model.device)
+    logger.info("Обучение: %d эпох, batch=%d, device=%s", epochs, config["model"]["batch_size"], device)
 
     for epoch in range(epochs):
         model.train()

@@ -160,21 +160,23 @@ class Storage:
         df.columns = [c.upper() for c in df.columns]
 
         if ENGINE == "duckdb":
-            if append:
-                self.con.execute(f"""
-                    INSERT OR REPLACE INTO {table_name}
-                    SELECT * FROM df
-                """, {"df": df})
-            else:
-                self.con.execute(f"DELETE FROM {table_name} WHERE symbol = ?", [symbol])
-                self.con.execute(f"INSERT INTO {table_name} SELECT * FROM df", {"df": df})
-        else:
-            # SQLite — чуть сложнее
-            conn = sqlite3.connect(self.db_path)
             if not append:
-                conn.execute(f"DELETE FROM {table_name} WHERE symbol = ?", (symbol,))
-            df.to_sql(table_name, conn, if_exists="append", index=False)
-            conn.close()
+                self.con.execute(f"DELETE FROM {table_name} WHERE symbol = ?", [symbol])
+
+            # DuckDB: безопасный INSERT без REPLACE (дубликаты обрабатываются PRIMARY KEY)
+            self.con.execute(f"""
+                INSERT INTO {table_name} 
+                SELECT * FROM df
+            """, {"df": df})
+        else:
+            # SQLite — используем pandas to_sql + предварительный DELETE при необходимости
+            conn = sqlite3.connect(self.db_path)
+            try:
+                if not append:
+                    conn.execute(f"DELETE FROM {table_name} WHERE symbol = ?", (symbol,))
+                df.to_sql(table_name, conn, if_exists='append', index=False, method='multi')
+            finally:
+                conn.close()
 
         self.con.commit()
         logger.debug(f"Сохранено {len(df)} свечей {symbol} {timeframe}")
@@ -221,7 +223,7 @@ class Storage:
         - Свечи из всех candles_*
         - Записи из whitelist
         - Помечает delisted=True в symbols_meta
-        - Удаляет связанные модели файлы (models/{symbol}_*.pt, если существуют)
+        - Удаляет связанные модели файлы строго по префиксу {symbol}_*.pt (полное совпадение базовой части имени)
         """
         if not symbols:
             return
@@ -255,11 +257,24 @@ class Storage:
             else:
                 self.con.execute("DELETE FROM whitelist WHERE symbol = ?", (symbol,))
 
-            # Удаление моделей (файлов, если per-монета; по ТЗ модели общие, но на всякий)
+            # Удаление моделей — строго по префиксу {symbol}_*.pt
+            removed_count = 0
             for file in os.listdir(self.models_dir):
-                if file.startswith(f"{symbol}_") and file.endswith('.pt'):
-                    os.remove(os.path.join(self.models_dir, file))
-                    logger.info(f"Удалена модель {file} для {symbol}")
+                full_path = os.path.join(self.models_dir, file)
+                if (
+                    file.startswith(f"{symbol}_")
+                    and file.endswith(".pt")
+                    and len(file) > len(symbol) + 5  # минимум {symbol}_x.pt
+                    and os.path.isfile(full_path)
+                ):
+                    os.remove(full_path)
+                    logger.info(f"Удалена модель {file} для delisted {symbol}")
+                    removed_count += 1
+
+            if removed_count > 0:
+                logger.info(f"Удалено {removed_count} моделей для {symbol}")
+            elif removed_count == 0:
+                logger.debug(f"Модели для {symbol} не найдены (или уже удалены)")
 
         self.con.commit()
         logger.info(f"Удалены данные по {len(symbols)} delisted монетам (включая модели и whitelist)")

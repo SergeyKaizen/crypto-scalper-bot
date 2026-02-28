@@ -66,16 +66,44 @@ open_positions = defaultdict(list)  # symbol → list[positions]
 last_retrain = {}  # tf → datetime последнего retrain
 quiet_streaks = defaultdict(lambda: defaultdict(int))  # symbol → tf → streak
 
+
 def signal_handler(sig, frame):
-    logger.info("Сигнал завершения. Закрываем позиции...")
+    logger.warning(f"Получен сигнал {signal.Signals(sig).name}. Запускаем graceful shutdown...")
     shutdown()
     sys.exit(0)
 
+
 def shutdown():
-    for symbol, positions in open_positions.items():
-        for pos in positions:
-            OrderExecutor.close_position(pos)
-    logger.info("Бот остановлен.")
+    """Graceful shutdown: закрываем все открытые позиции и логируем"""
+    logger.info("Graceful shutdown запущен...")
+
+    # Закрываем все открытые позиции
+    closed_count = 0
+    for symbol, positions in list(open_positions.items()):
+        for pos in positions[:]:  # копия списка, т.к. может модифицироваться
+            try:
+                OrderExecutor.close_position(pos)
+                closed_count += 1
+                logger.info(f"Закрыта позиция {symbol} ({pos.get('direction', 'unknown')}) при остановке бота")
+            except Exception as e:
+                logger.error(f"Ошибка закрытия позиции {symbol}: {e}")
+
+    if closed_count > 0:
+        logger.info(f"Закрыто {closed_count} позиций при shutdown")
+    else:
+        logger.info("Открытых позиций не было")
+
+    # Если есть открытые ордера — отменяем (если метод реализован в OrderExecutor)
+    try:
+        OrderExecutor.cancel_all_open_orders()
+        logger.info("Все открытые ордера отменены")
+    except AttributeError:
+        logger.debug("Метод cancel_all_open_orders не реализован в OrderExecutor")
+    except Exception as e:
+        logger.error(f"Ошибка отмены ордеров при shutdown: {e}")
+
+    logger.info("Бот остановлен. Shutdown завершён.")
+
 
 def live_loop():
     config = load_config()
@@ -98,6 +126,7 @@ def live_loop():
     for tf in timeframes:
         last_retrain[tf] = datetime.utcnow() - timedelta(days=8)
 
+    # Установка обработчиков сигналов
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 

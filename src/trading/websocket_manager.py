@@ -185,5 +185,12 @@ class WebsocketManager:
         """
         self.running = False
         if self.ws:
-            self.ws.close()
+            try:
+                self.ws.close()
+                logger.info("WebSocket соединение закрыто")
+            except Exception as e:
+                logger.error(f"Ошибка при закрытии WebSocket: {e}")
+        if self.thread and self.thread.is_alive():
+            # В daemon=True поток завершится автоматически при выходе из программы
+            pass
         logger.info("WebSocket менеджер остановлен")

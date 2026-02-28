@@ -5,19 +5,14 @@
 Ключевые требования из ТЗ:
 - Обучение и предсказание на нескольких TF: 1m, 3m, 5m, 10m, 15m
 - Модель видит 4 окна (24, 50, 74, 100 свечей) на каждом TF
-- Кэш в памяти ограничен: 500 свечей на телефоне, 2000–5000 на сервере/colab
+- Кэш в памяти: 2000 свечей (colab) / 5000 свечей (server)
 - При добавлении новой 1m свечи мгновенно обновляются все старшие TF
 - Старые свечи автоматически вытесняются из кэша (FIFO через deque)
-- Всё на Polars — очень быстро даже на телефоне
+- Всё на Polars — очень быстро
 - Безопасно для live_loop и websocket_manager (асинхронно, без блокировок)
-
-Логика:
-- add_1m_candle() — добавляет новую 1m свечу → ресэмплинг в старшие TF
-- get_window(tf, size) — возвращает последние size свечей для TF (или None)
-- get_all_windows(tf) — удобный словарь всех окон для модели {24: df, 50: df, ...}
 """
 
-from collections import defaultdict, deque
+from collections import deque
 import polars as pl
 from typing import Dict, Optional
 from src.core.config import load_config
@@ -34,11 +29,9 @@ class Resampler:
 
         # Максимальное количество свечей в памяти для каждого TF
         hardware = config["hardware_mode"]
-        if hardware == "phone_tiny":
-            self.max_cache_per_tf = 500   # ~8 часов на 1m — достаточно для всех окон
-        elif hardware == "server":
+        if hardware == "server":
             self.max_cache_per_tf = 5000  # ~3–4 дня на 1m — комфортно
-        else:  # colab
+        else:  # colab или любой другой → fallback на colab
             self.max_cache_per_tf = 2000
 
         # Кэш: {tf: deque[pl.DataFrame]} — последние свечи в памяти
@@ -170,6 +163,7 @@ if __name__ == "__main__":
     resampler = Resampler(config)
 
     # Пример добавления свечей (для теста)
+    import time
     for i in range(600):
         candle = {
             "timestamp": int(time.time() * 1000) - i * 60000,

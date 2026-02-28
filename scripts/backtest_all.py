@@ -134,7 +134,10 @@ def main():
     logger.info(f"Запуск параллельного бэктеста по {len(symbols)} монетам")
 
     results = []
-    with ThreadPoolExecutor(max_workers=mp.cpu_count()) as executor:
+    # === ФИКС ПУНКТА 27: ОГРАНИЧЕННОЕ КОЛИЧЕСТВО ВОРКЕРОВ ===
+    max_workers = config.get("hardware", {}).get("max_workers", 8)  # берём из конфига, fallback на 8
+    logger.info(f"Запускаем ThreadPoolExecutor с {max_workers} воркерами (вместо mp.cpu_count())")
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_symbol = {executor.submit(run_backtest_for_symbol, config, sym): sym for sym in symbols}
         for future in as_completed(future_to_symbol):
             sym = future_to_symbol[future]

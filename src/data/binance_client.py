@@ -8,7 +8,7 @@ src/data/binance_client.py
 - инициализирует соединение с API key/secret + поддержкой прокси
 - соблюдает rate-limits (встроенный механизм ccxt + ручной retry + backoff)
 - получает актуальный список активных USDT-перпетуальных фьючерсов
-- скачивает OHLCV + taker_buy_base_asset_volume
+- скачивает OHLCV + taker_buy_base_volume
 - вычисляет bid и ask по формуле из ТЗ:
   ask = taker_buy_base_volume (рыночные покупки)
   bid = volume - taker_buy_base_volume (рыночные продажи)
@@ -17,8 +17,8 @@ src/data/binance_client.py
 
 Ключевые изменения:
 - В update_markets_list() автоматически выявляет delisted монеты (сравнивая stored vs active)
-  и вызывает storage.remove_delisted(to_remove) для автоматического удаления.
-- remove_delisted теперь расширен в storage.py (см. ниже) для удаления данных, моделей и из whitelist.
+  и вызывает storage.remove_delisted(to_remove) для автоматической очистки.
+- remove_delisted теперь расширен в storage.py для удаления данных, моделей и из whitelist.
 
 === Главные методы ===
 
@@ -159,14 +159,12 @@ class BinanceClient:
         """
         Скачивает свечи (OHLCV + taker_buy_base_volume).
         Возвращает DataFrame с колонками:
-            timestamp, open, high, low, close, volume, bid, ask
+            timestamp (int ms), open, high, low, close, volume, bid, ask, buy_volume
 
-        bid = volume - taker_buy_base_volume
-        ask = taker_buy_base_volume
+        buy_volume = taker_buy_base_volume (рыночные покупки) — для совместимости с resampler.py
+        bid = volume - buy_volume (рыночные продажи)
 
-        Обработка ошибок:
-        - RateLimitExceeded → экспоненциальный backoff
-        - NetworkError → повтор через 5–15 сек
+        timestamp остаётся в миллисекундах (int), без установки в index — чтобы не дублировать преобразования.
         """
         retries = 6
         backoff = 1
@@ -188,19 +186,20 @@ class BinanceClient:
                 data = []
                 for candle in klines:
                     ts, o, h, l, c, v = candle[:6]
-                    # taker_buy_base_asset_volume — 7-й элемент (индекс 6)
+                    # taker_buy_base_asset_volume — 7-й элемент (индекс 6), если присутствует
                     taker_buy_base = candle[6] if len(candle) > 6 else 0.0
-                    ask_volume = taker_buy_base
+                    buy_volume = taker_buy_base
                     bid_volume = v - taker_buy_base
 
-                    data.append([ts, o, h, l, c, v, bid_volume, ask_volume])
+                    data.append([ts, o, h, l, c, v, bid_volume, buy_volume, buy_volume])
 
                 df = pd.DataFrame(data, columns=[
                     'timestamp', 'open', 'high', 'low', 'close',
-                    'volume', 'bid', 'ask'
+                    'volume', 'bid', 'ask', 'buy_volume'
                 ])
-                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-                df.set_index('timestamp', inplace=True)
+
+                # timestamp остаётся int (ms) — resampler ожидает именно так
+                # НЕ ставим в index, НЕ преобразуем в datetime здесь — это делает storage / resampler при необходимости
 
                 logger.debug(f"Получено {len(df)} свечей {symbol} {timeframe}")
                 return df
