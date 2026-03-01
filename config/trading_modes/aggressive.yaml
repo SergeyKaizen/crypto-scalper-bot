@@ -1,33 +1,37 @@
-# Aggressive mode — максимальная агрессивность для скальпинга на сильных движениях
-# Все параметры жёстко ограничены, чтобы не превышать 50x leverage и не убивать депозит
+# config/trading_modes/aggressive.yaml
+# Агрессивный режим: высокий риск, низкие пороги вероятности, более частые входы
+# Переопределяет default.yaml только в указанных ключах
 
-risk:
-  per_trade: 1.8          # max 1.8% от депозита на сделку (было 3.5% — слишком опасно)
-  daily_max: 6.0          # max 6% убытка в день (было 8%)
-  max_drawdown_stop: 18.0 # остановка при -18% от пика (было выше или отсутствовало)
+trading:
+  mode: "aggressive"
+  min_prob: 0.58                     # ниже порог — больше сигналов
+  min_prob_q: 0.68                   # для Quiet тоже снижен, но не так сильно
+  risk_pct: 0.01                     # FIX: теперь 1% (было завышено)
+  commission: 0.0004
+  dropout: 0.35                      # чуть выше dropout для агрессии
+  leverage: 30                       # выше плечо
+  max_open_time_hours: 1.5           # быстрее выходить
 
-positions:
-  max_open: 3             # максимум 3 одновременно открытые позиции (было 5 — перебор)
-  max_per_direction: 2    # не более 2 в одну сторону
+  # Добавлено по плану Фазы 4 (для работы tp_sl_manager и trailing)
+  trailing_activation_pct: 0.015
+  trailing_distance_pct: 0.008
+  tp_multiplier: 2.0
+  sl_multiplier: 1.0
 
-leverage:
-  max: 50                 # строго не превышать 50x (синхронизировано с bot_config)
-  dynamic: false          # фиксированный, не динамический
+model:
+  hidden_size: 160                   # чуть больше нейронов
+  dropout: 0.35
+  epochs: 40
+  batch_size: 48                     # меньше батч — быстрее обучение
+  learning_rate: 0.0004
 
-trailing:
-  activation: 0.25        # trailing активируется после +0.25% (было 0.4% — поздно)
-  step: 0.15              # шаг трейлинга 0.15%
+scenario_tracker:
+  bayesian_prior_wins: 0.8           # агрессивнее верим в новые сценарии
+  bayesian_prior_losses: 2.5
+  decay_half_life_days: 60.0         # быстрее забываем старое
+  regime:
+    delta_norm_threshold: 0.50       # более чувствителен к тренду
 
-partial_take_profit:
-  enabled: true
-  levels:
-    - percent: 50         # 50% позиции на +0.4%
-      target: 0.004
-    - percent: 30         # 30% на +0.8%
-      target: 0.008
-
-filters:
-  min_rr: 1.8             # минимальный R:R 1.8:1
-  max_holding_time_min: 45 # не держать дольше 45 минут
-
-daily_reset: true         # сброс daily loss в 00:00 UTC
+filter:
+  min_pr: 4.0                        # ниже порог PR — больше монет
+  min_trades: 15

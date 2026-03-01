@@ -18,7 +18,7 @@ backtest:
   max_workers: 12                         # Больше потоков — быстрее скачка и симуляция
 
 trading:
-  risk_pct: 1.0                           # Средний риск — стандарт
+  risk_pct: 0.01                           # FIX Фаза 4: теперь 1% (десятичная форма)
 
 limits:
   max_candles_per_tf: 200000              # Больше истории — лучше обучение
@@ -30,3 +30,9 @@ limits:
 # batch_size: 64 → экономнее VRAM; 256 → быстрее, но может OOM на бесплатном Colab
 # hidden_size: 128 → легче модель; 512 → лучше качество, но выше VRAM
 # max_candles_per_tf: 100000 → экономия; 500000 → больше данных, лучше модель
+
+# FIX Фаза 4 (только добавлено в конец trading-секции)
+  trailing_activation_pct: 0.015
+  trailing_distance_pct: 0.008
+  tp_multiplier: 2.0
+  sl_multiplier: 1.0

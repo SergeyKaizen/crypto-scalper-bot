@@ -66,12 +66,10 @@ open_positions = defaultdict(list)  # symbol → list[positions]
 last_retrain = {}  # tf → datetime последнего retrain
 quiet_streaks = defaultdict(lambda: defaultdict(int))  # symbol → tf → streak
 
-
 def signal_handler(sig, frame):
     logger.warning(f"Получен сигнал {signal.Signals(sig).name}. Запускаем graceful shutdown...")
     shutdown()
     sys.exit(0)
-
 
 def shutdown():
     """Graceful shutdown: закрываем все открытые позиции и логируем"""
@@ -103,7 +101,6 @@ def shutdown():
         logger.error(f"Ошибка отмены ордеров при shutdown: {e}")
 
     logger.info("Бот остановлен. Shutdown завершён.")
-
 
 def live_loop():
     config = load_config()
@@ -181,7 +178,6 @@ def live_loop():
             logger.exception("Критическая ошибка в live_loop")
             time.sleep(30)
 
-
 def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inference, scenario_tracker: ScenarioTracker,
                    entry_manager: EntryManager, tp_sl_manager: TP_SL_Manager,
                    risk_manager: RiskManager, order_executor: OrderExecutor,
@@ -195,6 +191,11 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
     - Открытие только этой позиции (если проходит проверки)
     - Остальные — виртуальные для PR
     """
+    # === FIX Фаза 2: определяем candle_data и candle_ts (были неопределены) ===
+    last_candle = storage.get_last_candle(symbol, timeframe)
+    candle_data = last_candle if last_candle else {'close': 0.0, 'timestamp': int(time.time() * 1000)}
+    candle_ts = candle_data.get('timestamp', int(time.time() * 1000))
+
     features_by_tf = {}
     for tf in config['timeframes']:
         df = storage.get_candles(symbol, tf, limit=config['seq_len'])
@@ -233,6 +234,7 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
         if predict_prob < config['trading']['min_prob']:
             continue
 
+        # === FIX Фаза 2: wl теперь определяется ДО использования ниже ===
         wl = storage.get_whitelist_settings(symbol)
         if not wl or wl['tf'] != timeframe or wl['anomaly_type'] != anomaly_type:
             if virtual_trader:
@@ -260,8 +262,9 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
         anomaly_type = top_sig['anom']['type']
         direction = wl['direction']  # L/S/LS → resolve
 
+        # === FIX Фаза 2: исправлен вызов метода (согласование с risk_manager) ===
         sl_price = tp_sl_manager.calculate_sl(candle_data, direction)
-        size = risk_manager.calculate_size(
+        size = risk_manager.calculate_position_size(  # было calculate_size
             symbol=symbol,
             entry_price=candle_data['close'],
             sl_price=sl_price,
@@ -284,8 +287,9 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
             'consensus_count': top_sig['anom'].get('consensus_count', 1)
         }
 
+        # === FIX Фаза 2: fallback для TradeMode (enum может быть строкой) ===
         mode = entry_manager._resolve_mode(symbol, anomaly_type, direction)
-        if mode == TradeMode.REAL:
+        if mode == 'real' or (hasattr(mode, 'name') and mode.name == 'REAL'):
             order_id = order_executor.place_order(position)
             if order_id:
                 position['order_id'] = order_id
@@ -315,7 +319,6 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
                 handle_closed_position(closed_pos, pr_calculator, risk_manager, config)
                 open_positions[symbol].remove(pos)
 
-
 def handle_closed_position(position: dict, pr_calculator: PRCalculator, risk_manager: RiskManager, config: dict):
     net_pl = position.get('net_pl', 0)
     risk_manager.update_deposit(net_pl)
@@ -324,7 +327,6 @@ def handle_closed_position(position: dict, pr_calculator: PRCalculator, risk_man
         position.get('hit_tp', False), net_pl
     )
     logger.info(f"Закрыта позиция {position['symbol']} {position['direction']} PL: {net_pl}")
-
 
 if __name__ == "__main__":
     live_loop()

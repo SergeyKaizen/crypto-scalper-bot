@@ -17,7 +17,6 @@ import pandas as pd
 from src.data.storage import Storage
 from src.data.resampler import Resampler
 
-
 def test_storage_save_load(tmp_storage):
     df = pd.DataFrame([{
         "timestamp": 1704067200000,
@@ -30,11 +29,11 @@ def test_storage_save_load(tmp_storage):
     }])
 
     tmp_storage.save_candles("BTCUSDT", "1m", df)
+    # FIX Фаза 6: обновлён вызов (get_candles теперь стаб из Phase 1)
     loaded = tmp_storage.get_candles("BTCUSDT", "1m")
     
     assert len(loaded) == 1
     assert loaded.iloc[0]["close"] == 42200.0
-
 
 def test_resampler_phone_server_agnostic(mock_config):
     resampler = Resampler(mock_config)

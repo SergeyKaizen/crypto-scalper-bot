@@ -41,8 +41,8 @@ class AnomalyType(str, Enum):
 
 class Direction(str, Enum):
     """Направление позиции."""
-    LONG = "L"
-    SHORT = "S"
+    LONG = "long"       # FIX Фаза 7: теперь "long" (согласованно с trading-кодом)
+    SHORT = "short"     # FIX Фаза 7: теперь "short"
 
 class TradeMode(str, Enum):
     """Режим торговли."""

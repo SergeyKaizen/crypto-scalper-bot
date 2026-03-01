@@ -26,6 +26,9 @@ import logging
 import torch
 from typing import Tuple, Dict, Any
 
+import os          # FIX Фаза 1: отсутствовал → NameError в load_ensemble
+import numpy as np # FIX Фаза 1: отсутствовал → NameError в _calibrate
+
 from src.core.config import load_config
 from src.model.architectures import MultiTFHybrid, TinyHybrid
 from src.utils.logger import setup_logger

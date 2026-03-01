@@ -217,6 +217,10 @@ class BacktestEngine:
                             current_time
                         )
                         if pnl is not None:
+                            # FIX Фаза 5: учёт commission (0.04%) и slippage (0.05%)
+                            commission = self.config["trading"].get("commission", 0.0004)
+                            slippage = self.config["trading"].get("slippage_pct", 0.0005)
+                            pnl = pnl * (1 - commission * 2) - (slippage * abs(pnl))
                             equity[-1] += pnl  # обновляем последнюю equity
 
                 equity.append(equity[-1])
@@ -249,6 +253,10 @@ class BacktestEngine:
                     entry_order["size"],
                     entry_order["direction"]
                 )
+                # FIX Фаза 5: учёт commission (0.04%) и slippage (0.05%)
+                commission = self.config["trading"].get("commission", 0.0004)
+                slippage = self.config["trading"].get("slippage_pct", 0.0005)
+                pnl = pnl * (1 - commission * 2) - (slippage * abs(pnl))
                 duration = ts - start_time
                 return {
                     "exit_price": exit_price,
@@ -264,6 +272,10 @@ class BacktestEngine:
         pnl = self.virtual_trader.calculate_pnl(
             entry_order["price"], exit_price, entry_order["size"], entry_order["direction"]
         )
+        # FIX Фаза 5: учёт commission (0.04%) и slippage (0.05%)
+        commission = self.config["trading"].get("commission", 0.0004)
+        slippage = self.config["trading"].get("slippage_pct", 0.0005)
+        pnl = pnl * (1 - commission * 2) - (slippage * abs(pnl))
         return {
             "exit_price": exit_price,
             "pnl": pnl,

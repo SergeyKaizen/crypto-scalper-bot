@@ -49,3 +49,9 @@
 # Логи
 # logging:
 #   level: "INFO"                     # DEBUG / INFO / WARNING / ERROR
+
+# FIX Фаза 4 (только добавлено, ничего не удалено и не раскомментировано лишнее)
+risk:
+  default_risk_pct: 0.01              # FIX: 1% в десятичной форме
+tp_multiplier: 2.0
+sl_multiplier: 1.0

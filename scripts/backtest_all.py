@@ -115,7 +115,8 @@ def main():
     storage = Storage(config)
 
     # Получаем список монет для бэктеста
-    symbols = storage.get_whitelist()
+    # FIX Фаза 6: get_whitelist → get_whitelisted_symbols (согласование с Phase 1)
+    symbols = storage.get_whitelisted_symbols()
     if not symbols:
         logger.warning("Whitelist пуст → бэктест невозможен")
         return

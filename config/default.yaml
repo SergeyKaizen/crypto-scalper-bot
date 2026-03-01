@@ -27,11 +27,19 @@ trading:
   mode: "balanced"                     # aggressive / balanced / conservative / custom
   min_prob: 0.65                       # минимальная вероятность для обычных аномалий
   min_prob_q: 0.75                     # повышенный порог для Quiet (Q) — снижает ложняки в боковике
-  risk_pct: 1.0                        # % от депозита на сделку
+  risk_pct: 0.01                       # FIX: было 1.0 → теперь 1% от депозита (десятичная форма)
   commission: 0.0004                   # taker fee Binance Futures
   dropout: 0.3
   leverage: 20                         # базовое плечо
   max_open_time_hours: 2               # автозакрытие позиции
+
+  # FIX Фаза 4: добавлены параметры для работающего trailing stop
+  trailing_activation_pct: 0.015       # 1.5% профита → активировать trailing
+  trailing_distance_pct: 0.008         # 0.8% от максимума/минимума
+
+  # FIX Фаза 4: множители ATR для TP/SL (используются в tp_sl_manager)
+  tp_multiplier: 2.0
+  sl_multiplier: 1.0
 
 # Модель
 model:

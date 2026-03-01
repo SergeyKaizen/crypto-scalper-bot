@@ -36,6 +36,7 @@ from src.trading.position_manager import PositionManager
 from src.trading.risk_manager import RiskManager
 from src.trading.tp_sl_manager import TP_SL_Manager
 from src.model.scenario_tracker import ScenarioTracker
+from src.data.storage import Storage          # FIX Фаза 1: добавлен импорт
 from src.utils.logger import setup_logger
 
 logger = setup_logger('entry_manager', logging.INFO)
@@ -47,6 +48,7 @@ class EntryManager:
         self.tp_sl_manager = TP_SL_Manager()
         self.position_manager = PositionManager()  # централизованный менеджер
         self.scenario_tracker = scenario_tracker
+        self.storage = Storage()  # FIX Фаза 1: инициализация missing атрибута (используется в _resolve_mode)
 
         self.candle_close_flags = {}  # candle_ts → True (закрытие в свече)
 
@@ -167,7 +169,7 @@ class EntryManager:
 
     def _resolve_mode(self, symbol: str, anomaly_type: str, direction: str) -> str:
         """Real если match с PR config, иначе virtual"""
-        whitelist = self.storage.get_whitelist_config(symbol)
+        whitelist = self.storage.get_whitelist_settings(symbol)
         if not whitelist:
             return 'virtual'
 

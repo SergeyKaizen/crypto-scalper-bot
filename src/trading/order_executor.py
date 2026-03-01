@@ -30,6 +30,7 @@ src/trading/order_executor.py
 import ccxt
 import logging
 from typing import Dict, Optional
+import time  # FIX Фаза 1: отсутствовал → NameError в RateLimitExceeded
 
 from src.core.config import load_config
 from src.utils.logger import setup_logger

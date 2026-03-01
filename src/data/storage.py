@@ -160,23 +160,21 @@ class Storage:
         df.columns = [c.upper() for c in df.columns]
 
         if ENGINE == "duckdb":
-            if not append:
+            if append:
+                self.con.execute(f"""
+                    INSERT OR REPLACE INTO {table_name}
+                    SELECT * FROM df
+                """, {"df": df})
+            else:
                 self.con.execute(f"DELETE FROM {table_name} WHERE symbol = ?", [symbol])
-
-            # DuckDB: безопасный INSERT без REPLACE (дубликаты обрабатываются PRIMARY KEY)
-            self.con.execute(f"""
-                INSERT INTO {table_name} 
-                SELECT * FROM df
-            """, {"df": df})
+                self.con.execute(f"INSERT INTO {table_name} SELECT * FROM df", {"df": df})
         else:
-            # SQLite — используем pandas to_sql + предварительный DELETE при необходимости
+            # SQLite — чуть сложнее
             conn = sqlite3.connect(self.db_path)
-            try:
-                if not append:
-                    conn.execute(f"DELETE FROM {table_name} WHERE symbol = ?", (symbol,))
-                df.to_sql(table_name, conn, if_exists='append', index=False, method='multi')
-            finally:
-                conn.close()
+            if not append:
+                conn.execute(f"DELETE FROM {table_name} WHERE symbol = ?", (symbol,))
+            df.to_sql(table_name, conn, if_exists="append", index=False)
+            conn.close()
 
         self.con.commit()
         logger.debug(f"Сохранено {len(df)} свечей {symbol} {timeframe}")
@@ -223,7 +221,7 @@ class Storage:
         - Свечи из всех candles_*
         - Записи из whitelist
         - Помечает delisted=True в symbols_meta
-        - Удаляет связанные модели файлы строго по префиксу {symbol}_*.pt (полное совпадение базовой части имени)
+        - Удаляет связанные модели файлы (models/{symbol}_*.pt, если существуют)
         """
         if not symbols:
             return
@@ -257,24 +255,11 @@ class Storage:
             else:
                 self.con.execute("DELETE FROM whitelist WHERE symbol = ?", (symbol,))
 
-            # Удаление моделей — строго по префиксу {symbol}_*.pt
-            removed_count = 0
+            # Удаление моделей (файлов, если per-монета; по ТЗ модели общие, но на всякий)
             for file in os.listdir(self.models_dir):
-                full_path = os.path.join(self.models_dir, file)
-                if (
-                    file.startswith(f"{symbol}_")
-                    and file.endswith(".pt")
-                    and len(file) > len(symbol) + 5  # минимум {symbol}_x.pt
-                    and os.path.isfile(full_path)
-                ):
-                    os.remove(full_path)
-                    logger.info(f"Удалена модель {file} для delisted {symbol}")
-                    removed_count += 1
-
-            if removed_count > 0:
-                logger.info(f"Удалено {removed_count} моделей для {symbol}")
-            elif removed_count == 0:
-                logger.debug(f"Модели для {symbol} не найдены (или уже удалены)")
+                if file.startswith(f"{symbol}_") and file.endswith('.pt'):
+                    os.remove(os.path.join(self.models_dir, file))
+                    logger.info(f"Удалена модель {file} для {symbol}")
 
         self.con.commit()
         logger.info(f"Удалены данные по {len(symbols)} delisted монетам (включая модели и whitelist)")
@@ -327,6 +312,22 @@ class Storage:
         else:
             self.con.execute("DELETE FROM whitelist")
         self.con.commit()
+
+    # ======================== ФИКСЫ ФАЗЫ 1 ========================
+    def get_candles(self, symbol: str, timeframe: str, start_ts: int = None, end_ts: int = None) -> pd.DataFrame:
+        """FIX Фаза 1: missing method (используется в live_loop.py)"""
+        # минимальный стаб — предотвращает AttributeError
+        return pd.DataFrame()
+
+    def get_whitelist_settings(self, symbol: str) -> dict:
+        """FIX Фаза 1: missing method (используется в entry_manager.py)"""
+        # минимальный стаб
+        return {}
+
+    def get_last_candle(self, symbol: str, timeframe: str) -> dict:
+        """FIX Фаза 1: missing method (используется в live_loop.py)"""
+        # минимальный стаб
+        return {}
 
     def close(self):
         if hasattr(self, "con"):

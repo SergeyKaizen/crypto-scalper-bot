@@ -77,3 +77,7 @@ MAX_SCENARIOS_LIMIT = 10000                     # Максимум сценар�
 DEFAULT_MAX_WORKERS = 8
 DEFAULT_EPOCHS = 10
 DEFAULT_BATCH_SIZE = 32
+
+# FIX Фаза 7: добавлены константы для согласования с Phase 5 (backtest и live)
+DEFAULT_COMMISSION = 0.0004                     # taker fee Binance Futures
+SLIPPAGE_PCT = 0.0005                           # типичное проскальзывание на 15s–1m

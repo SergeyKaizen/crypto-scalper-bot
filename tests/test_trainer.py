@@ -37,7 +37,6 @@ from src.features.feature_engine import compute_features
 from src.trading.tp_sl_manager import TP_SL_Manager  # для _get_label
 from src.model.inference import InferenceEngine
 
-
 # Фикстура: маленький тестовый df
 @pytest.fixture
 def sample_df():
@@ -50,7 +49,6 @@ def sample_df():
         'volume': np.random.rand(50) * 1000,
     }, index=dates)
     return df
-
 
 # Тест 1: Нет lookahead в compute_features
 def test_leakage_in_features(sample_df):
@@ -76,7 +74,6 @@ def test_leakage_in_features(sample_df):
     # Должны быть идентичны
     assert new_feats.equals(original_feats), "Leakage в фичах: добавление будущей свечи изменило признаки!"
 
-
 # Тест 2: Нет lookahead в _get_label (embargo around target)
 def test_leakage_in_label(sample_df):
     trainer = Trainer()
@@ -101,7 +98,6 @@ def test_leakage_in_label(sample_df):
 
     assert new_label == original_label, "Leakage в label: добавление будущей свечи изменило target!"
 
-
 # Тест 3: Step в prepare_data уменьшает overlap
 def test_prepare_data_step():
     trainer = Trainer()
@@ -114,7 +110,6 @@ def test_prepare_data_step():
 
     # Проверяем, что шаг работает (длина data_lists должна быть ~ (100-20)/10 + 1 = 9)
     assert len(data_lists) == 9, "Step в prepare_data не работает — overlap не уменьшен!"
-
 
 # Тест 4: Embargo в TimeSeriesSplit работает
 def test_embargo_in_split():
@@ -132,7 +127,6 @@ def test_embargo_in_split():
         embargo_gap = 5
         train_idx_filtered = train_idx[train_idx < val_idx.min() - purged_gap - embargo_gap]
         assert len(train_idx_filtered) < len(train_idx), "Embargo в сплите не работает!"
-
 
 # Тест 5: Общий тест на отсутствие leakage (комплексный)
 def test_no_leakage_overall(sample_df):
@@ -153,9 +147,7 @@ def test_no_leakage_overall(sample_df):
     assert new_feats.equals(original_feats), "Leakage в фичах при изменении будущего!"
     assert new_label == original_label, "Leakage в label при изменении будущего!"
 
-
 # === Новые тесты по пункту 26 ===
-
 
 def test_early_stopping(mock_config):
     trainer = Trainer(mock_config)
@@ -170,7 +162,6 @@ def test_early_stopping(mock_config):
     assert "early_stopped" in history
     assert history["early_stopped"] is True or len(history['train_loss']) < 10
 
-
 def test_mc_dropout_passes(mock_config):
     inference = InferenceEngine(mock_config)
     dummy_input = torch.randn(1, 100, 64)  # 1 sample, 100 timesteps, 64 features
@@ -180,7 +171,6 @@ def test_mc_dropout_passes(mock_config):
 
     assert len(probs) == 20, "MC Dropout должен делать минимум 20 проходов"
     assert all(0 <= p <= 1 for p in probs), "Вероятности вне [0,1]"
-
 
 def test_cross_validation(mock_config):
     trainer = Trainer(mock_config)

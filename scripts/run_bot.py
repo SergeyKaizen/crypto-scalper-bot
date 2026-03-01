@@ -66,7 +66,9 @@ def run_training(config):
 
 def run_backtest_and_update_whitelist(config):
     logger.info("Шаг 4: Запуск полного бэктеста...")
-    os.system("python scripts/backtest_all.py")
+    # FIX Фаза 6: вместо os.system — прямой импорт и вызов (избегаем subprocess)
+    from scripts.backtest_all import main as backtest_main
+    backtest_main()
     logger.info("Бэктест завершён, whitelist обновлён.")
 
 def warmup(config):

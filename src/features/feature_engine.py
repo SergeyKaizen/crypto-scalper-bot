@@ -21,6 +21,8 @@ import polars as pl
 import numpy as np
 from typing import Dict, Any
 
+import torch  # FIX Фаза 7: добавлен для согласования с моделью
+
 from src.core.config import load_config
 from src.utils.logger import setup_logger
 
@@ -57,6 +59,9 @@ class FeatureEngine:
 
             features[window] = agg
             sequences[window] = seq
+
+        # FIX Фаза 7: преобразование в torch.tensor (согласованно с inference и моделью)
+        sequences = {k: torch.tensor(v, dtype=torch.float32) for k, v in sequences.items()}
 
         return {
             "sequences": sequences,

@@ -9,6 +9,10 @@ class PRCalculator:
 
     def update_after_trade(self, trade: TradeResult):
         """Обновляет PR после каждой закрытой виртуальной сделки."""
+        # FIX Фаза 5: PR теперь учитывает commission (реалистичный расчёт)
+        commission = 0.0004  # taker fee Binance (из config в Phase 4)
+        trade.pr_contribution = trade.pr_contribution * (1 - commission * 2)  # round-trip
+
         # trade содержит: coin, tf, period, anomaly_type, direction, is_tp, pr_contribution, winrate
         self.storage.execute("""
             INSERT INTO pr_snapshots 

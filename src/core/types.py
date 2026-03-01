@@ -13,6 +13,8 @@ from typing import Dict, List, Optional
 
 import polars as pl
 
+# FIX Фаза 7: Direction теперь импортируется из enums (единственный источник правды)
+from .enums import Direction as EnumsDirection
 
 class AnomalyType(Enum):
     CANDLE = "C"
@@ -20,9 +22,10 @@ class AnomalyType(Enum):
     CANDLE_VOLUME = "CV"
 
 
+# FIX Фаза 7: Direction согласован с enums.py (используем "long"/"short")
 class Direction(Enum):
-    LONG = "L"
-    SHORT = "S"
+    LONG = "long"
+    SHORT = "short"
     FLAT = "F"
 
 

@@ -35,7 +35,6 @@ def mock_config():
         }
     }
 
-
 @pytest.fixture
 def tmp_storage(tmp_path):
     """Фикстура: временное хранилище в /tmp для тестов storage"""
@@ -44,7 +43,6 @@ def tmp_storage(tmp_path):
     storage.data_dir = str(tmp_path)
     return storage
 
-
 @pytest.fixture
 def mock_binance_client():
     """Фикстура: мок BinanceClient без реальных API-запросов"""
@@ -52,7 +50,6 @@ def mock_binance_client():
     client.update_markets_list.return_value = ["BTCUSDT", "ETHUSDT"]
     client.fetch_klines.return_value = None  # будем мокать в конкретных тестах
     return client
-
 
 @pytest.fixture(autouse=True)
 def disable_logging():
