@@ -29,7 +29,7 @@ def test_storage_save_load(tmp_storage):
     }])
 
     tmp_storage.save_candles("BTCUSDT", "1m", df)
-    # FIX Фаза 6: обновлён вызов (get_candles теперь стаб из Phase 1)
+    # FIX Фаза 5: обновлён вызов (get_candles теперь реальный из Phase 4)
     loaded = tmp_storage.get_candles("BTCUSDT", "1m")
     
     assert len(loaded) == 1

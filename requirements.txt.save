@@ -1,10 +1,11 @@
-# requirements.txt
+
+xit# requirements.txt
 # Полный список зависимостей проекта (февраль 2026)
 # Устанавливай одной командой: pip install -r requirements.txt
 # Все версии — минимально необходимые и проверенные на совместимость с Python 3.10+
 
 ccxt>=4.3.0                 # Binance Futures API (klines, WebSocket, ордера, taker_buy_volume)
-pandas>=2.0.3,<2.1.4               # Работа со свечами, storage, feature_engine
+pandas>=2.2.0               # Работа со свечами, storage, feature_engine
 numpy>=1.26.0               # Математические расчёты (% изменений, volatility)
 polars>=0.20.0              # Ускоренная обработка данных (feature_engine, anomaly_detector)
 torch>=2.2.0                # Модель Conv1D + GRU, обучение, inference

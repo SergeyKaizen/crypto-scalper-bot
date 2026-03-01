@@ -66,28 +66,23 @@ def run_training(config):
 
 def run_backtest_and_update_whitelist(config):
     logger.info("Шаг 4: Запуск полного бэктеста...")
-    # FIX Фаза 6: вместо os.system — прямой импорт и вызов (избегаем subprocess)
     from scripts.backtest_all import main as backtest_main
     backtest_main()
     logger.info("Бэктест завершён, whitelist обновлён.")
 
 def warmup(config):
     logger.info("Шаг 6: Warm-up (прогрев кэша и модели)...")
-    # Здесь можно добавить скачивание свежих данных, прогон inference и т.д.
-    # Пока просто логируем (можно расширить)
     time.sleep(5)  # имитация прогрева
     logger.info("Warm-up завершён.")
 
 def start_trading(config):
     logger.info("Шаг 7: Запуск торговли...")
     
-    # Запускаем WebSocketManager в фоне
     from src.data.resampler import Resampler
     resampler = Resampler(config)
     ws_manager = WebSocketManager(config, resampler)
     asyncio.create_task(ws_manager.start())
     
-    # Запускаем основной цикл
     live_loop = LiveLoop(config)
     
     try:

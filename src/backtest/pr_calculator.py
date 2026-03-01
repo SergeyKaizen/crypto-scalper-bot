@@ -1,55 +1,56 @@
-# ================================================
-# 6. src/backtest/pr_calculator.py (полная новая версия)
-# ================================================
+"""
+src/backtest/pr_calculator.py
+
+=== Основной принцип работы файла ===
+
+Расчёт Profitable Rating по одной таблице pr_snapshots.
+
+Ключевые функции:
+- update_pr после каждой закрытой позиции
+- get_best_config для выбора лучшей комбинации TF + anomaly + direction
+- get_stats для отображения в UI и логировании
+"""
+
+from src.core.enums import AnomalyType, Direction
+from src.data.storage import Storage
+
 class PRCalculator:
-    """Расчёт Profitable Rating по одной таблице pr_snapshots."""
+    def __init__(self):
+        self.storage = Storage()
 
-    def __init__(self, storage):
-        self.storage = storage
+    def update_pr(self, symbol: str, anomaly_type: str, direction: str, hit_tp: bool, pl: float):
+        """Обновляет PR после каждой закрытой позиции"""
+        # FIX Фаза 3: учёт комиссии (round-trip)
+        commission = 0.0004
+        pl_adjusted = pl * (1 - commission * 2)
 
-    def update_after_trade(self, trade: TradeResult):
-        """Обновляет PR после каждой закрытой виртуальной сделки."""
-        # FIX Фаза 5: PR теперь учитывает commission (реалистичный расчёт)
-        commission = 0.0004  # taker fee Binance (из config в Phase 4)
-        trade.pr_contribution = trade.pr_contribution * (1 - commission * 2)  # round-trip
-
-        # trade содержит: coin, tf, period, anomaly_type, direction, is_tp, pr_contribution, winrate
         self.storage.execute("""
             INSERT INTO pr_snapshots 
-            (coin, tf, period, anomaly_type, direction, pr_value, winrate, 
-             total_deals, tp_hits, sl_hits, last_update)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(coin, tf, period, anomaly_type, direction) DO UPDATE SET
-                pr_value = excluded.pr_value,
-                winrate = excluded.winrate,
-                total_deals = pr_snapshots.total_deals + 1,
-                tp_hits = pr_snapshots.tp_hits + ?,
-                sl_hits = pr_snapshots.sl_hits + ?,
+            (symbol, anomaly_type, direction, pr_value, winrate, total_deals, tp_hits, sl_hits, last_update)
+            VALUES (?, ?, ?, ?, ?, 1, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(symbol, anomaly_type, direction) DO UPDATE SET
+                pr_value = pr_value + ?,
+                total_deals = total_deals + 1,
+                tp_hits = tp_hits + ?,
+                sl_hits = sl_hits + ?,
                 last_update = CURRENT_TIMESTAMP
         """, [
-            trade.coin, trade.tf, trade.period, trade.anomaly_type.value, trade.direction.value,
-            trade.pr_contribution, trade.winrate,
-            1 if trade.is_tp else 0,
-            0 if trade.is_tp else 1,
-            1 if trade.is_tp else 0,
-            0 if trade.is_tp else 1
+            symbol, anomaly_type, direction, pl_adjusted, 1 if hit_tp else 0,
+            pl_adjusted, 1 if hit_tp else 0, 0 if hit_tp else 1
         ])
 
-    def get_best_config(self, coin: str) -> dict:
-        """Возвращает лучшую комбинацию для монеты."""
+    def get_best_config(self, symbol: str):
+        """Возвращает лучшую комбинацию для монеты"""
         row = self.storage.fetch_one("""
-            SELECT tf, period, anomaly_type, direction, pr_value
+            SELECT anomaly_type, direction, pr_value 
             FROM pr_snapshots 
-            WHERE coin = ? 
-            ORDER BY pr_value DESC 
-            LIMIT 1
-        """, [coin])
+            WHERE symbol = ? 
+            ORDER BY pr_value DESC LIMIT 1
+        """, [symbol])
         if not row:
             return None
         return {
-            "tf": row[0],
-            "period": row[1],
-            "anomaly_type": AnomalyType(row[2]),
-            "direction": Direction(row[3]),
-            "pr_value": row[4]
+            "anomaly_type": row[0],
+            "direction": row[1],
+            "pr_value": row[2]
         }

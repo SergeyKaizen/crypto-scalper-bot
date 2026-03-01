@@ -29,7 +29,7 @@ def test_backtest_engine_basic(mock_config):
         "buy_volume": [600] * 200,
     }).set_index("timestamp")
 
-    # FIX Фаза 6: обновлён вызов (учёт commission/slippage из Phase 5)
+    # FIX Фаза 5: обновлён вызов (учёт commission/slippage из Phase 3)
     result = engine.run_full_backtest()
     
     assert isinstance(result, dict)

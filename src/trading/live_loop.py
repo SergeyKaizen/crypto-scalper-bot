@@ -47,7 +47,7 @@ from src.data.downloader import download_new_candles
 from src.data.storage import Storage
 from src.features.feature_engine import compute_features
 from src.features.anomaly_detector import detect_anomalies
-from src.model.inference import Inference
+from src.model.inference import InferenceEngine  # FIX Фаза 1
 from src.model.trainer import Trainer
 from src.model.scenario_tracker import ScenarioTracker
 from src.trading.entry_manager import EntryManager
@@ -66,10 +66,12 @@ open_positions = defaultdict(list)  # symbol → list[positions]
 last_retrain = {}  # tf → datetime последнего retrain
 quiet_streaks = defaultdict(lambda: defaultdict(int))  # symbol → tf → streak
 
+
 def signal_handler(sig, frame):
     logger.warning(f"Получен сигнал {signal.Signals(sig).name}. Запускаем graceful shutdown...")
     shutdown()
     sys.exit(0)
+
 
 def shutdown():
     """Graceful shutdown: закрываем все открытые позиции и логируем"""
@@ -102,11 +104,12 @@ def shutdown():
 
     logger.info("Бот остановлен. Shutdown завершён.")
 
+
 def live_loop():
     config = load_config()
     client = BinanceClient()
     storage = Storage()
-    inference = Inference()
+    inference = InferenceEngine()  # FIX Фаза 1
     trainer = Trainer()
     scenario_tracker = ScenarioTracker()
     entry_manager = EntryManager(scenario_tracker)  # передаём tracker для весов
@@ -178,7 +181,8 @@ def live_loop():
             logger.exception("Критическая ошибка в live_loop")
             time.sleep(30)
 
-def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inference, scenario_tracker: ScenarioTracker,
+
+def process_candle(symbol: str, timeframe: str, storage: Storage, inference: InferenceEngine, scenario_tracker: ScenarioTracker,
                    entry_manager: EntryManager, tp_sl_manager: TP_SL_Manager,
                    risk_manager: RiskManager, order_executor: OrderExecutor,
                    virtual_trader: VirtualTrader, pr_calculator: PRCalculator, config: dict):
@@ -191,7 +195,7 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
     - Открытие только этой позиции (если проходит проверки)
     - Остальные — виртуальные для PR
     """
-    # === FIX Фаза 2: определяем candle_data и candle_ts (были неопределены) ===
+    # === FIX Фаза 1: определяем candle_data и candle_ts (были неопределены) ===
     last_candle = storage.get_last_candle(symbol, timeframe)
     candle_data = last_candle if last_candle else {'close': 0.0, 'timestamp': int(time.time() * 1000)}
     candle_ts = candle_data.get('timestamp', int(time.time() * 1000))
@@ -234,8 +238,7 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
         if predict_prob < config['trading']['min_prob']:
             continue
 
-        # === FIX Фаза 2: wl теперь определяется ДО использования ниже ===
-        wl = storage.get_whitelist_settings(symbol)
+        wl = storage.get_whitelist_settings(symbol)  # FIX Фаза 1: wl теперь определяется ДО использования
         if not wl or wl['tf'] != timeframe or wl['anomaly_type'] != anomaly_type:
             if virtual_trader:
                 tp_sl = tp_sl_manager.calculate_tp_sl(features_by_tf[timeframe][window])
@@ -262,7 +265,7 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
         anomaly_type = top_sig['anom']['type']
         direction = wl['direction']  # L/S/LS → resolve
 
-        # === FIX Фаза 2: исправлен вызов метода (согласование с risk_manager) ===
+        # === FIX Фаза 1: исправлен вызов метода (согласование с risk_manager) ===
         sl_price = tp_sl_manager.calculate_sl(candle_data, direction)
         size = risk_manager.calculate_position_size(  # было calculate_size
             symbol=symbol,
@@ -287,9 +290,8 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
             'consensus_count': top_sig['anom'].get('consensus_count', 1)
         }
 
-        # === FIX Фаза 2: fallback для TradeMode (enum может быть строкой) ===
         mode = entry_manager._resolve_mode(symbol, anomaly_type, direction)
-        if mode == 'real' or (hasattr(mode, 'name') and mode.name == 'REAL'):
+        if mode == 'real':
             order_id = order_executor.place_order(position)
             if order_id:
                 position['order_id'] = order_id
@@ -319,6 +321,7 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
                 handle_closed_position(closed_pos, pr_calculator, risk_manager, config)
                 open_positions[symbol].remove(pos)
 
+
 def handle_closed_position(position: dict, pr_calculator: PRCalculator, risk_manager: RiskManager, config: dict):
     net_pl = position.get('net_pl', 0)
     risk_manager.update_deposit(net_pl)
@@ -327,6 +330,7 @@ def handle_closed_position(position: dict, pr_calculator: PRCalculator, risk_man
         position.get('hit_tp', False), net_pl
     )
     logger.info(f"Закрыта позиция {position['symbol']} {position['direction']} PL: {net_pl}")
+
 
 if __name__ == "__main__":
     live_loop()

@@ -313,20 +313,55 @@ class Storage:
             self.con.execute("DELETE FROM whitelist")
         self.con.commit()
 
-    # ======================== ФИКСЫ ФАЗЫ 1 ========================
+    # ======================== ФИКСЫ ФАЗЫ 4 ========================
     def get_candles(self, symbol: str, timeframe: str, start_ts: int = None, end_ts: int = None) -> pd.DataFrame:
-        """FIX Фаза 1: missing method (используется в live_loop.py)"""
-        # минимальный стаб — предотвращает AttributeError
-        return pd.DataFrame()
+        """FIX Фаза 4: теперь реальный запрос (раньше пустой стаб)"""
+        table_name = f"candles_{timeframe.replace('m', '')}m"
+        query = f"SELECT * FROM {table_name} WHERE symbol = ?"
+        params = [symbol]
+        if start_ts:
+            query += " AND timestamp >= ?"
+            params.append(start_ts)
+        if end_ts:
+            query += " AND timestamp <= ?"
+            params.append(end_ts)
+        if ENGINE == "duckdb":
+            df = self.con.execute(query, params).fetchdf()
+        else:
+            df = pd.read_sql_query(query, sqlite3.connect(self.db_path), params=params)
+        return df
 
     def get_whitelist_settings(self, symbol: str) -> dict:
-        """FIX Фаза 1: missing method (используется в entry_manager.py)"""
-        # минимальный стаб
+        """FIX Фаза 4: теперь реальный запрос (раньше пустой стаб)"""
+        if ENGINE == "duckdb":
+            row = self.con.execute("SELECT * FROM whitelist WHERE symbol = ?", [symbol]).fetchone()
+        else:
+            cur = self.con.cursor()
+            cur.execute("SELECT * FROM whitelist WHERE symbol = ?", (symbol,))
+            row = cur.fetchone()
+            cur.close()
+        if row:
+            return {
+                "tf": row[1],
+                "window": row[2],
+                "anomaly_type": row[3],
+                "direction": row[4],
+                "pr_value": row[5]
+            }
         return {}
 
     def get_last_candle(self, symbol: str, timeframe: str) -> dict:
-        """FIX Фаза 1: missing method (используется в live_loop.py)"""
-        # минимальный стаб
+        """FIX Фаза 4: теперь реальный запрос (раньше пустой стаб)"""
+        table_name = f"candles_{timeframe.replace('m', '')}m"
+        if ENGINE == "duckdb":
+            row = self.con.execute(f"SELECT * FROM {table_name} WHERE symbol = ? ORDER BY timestamp DESC LIMIT 1", [symbol]).fetchone()
+        else:
+            cur = self.con.cursor()
+            cur.execute(f"SELECT * FROM {table_name} WHERE symbol = ? ORDER BY timestamp DESC LIMIT 1", (symbol,))
+            row = cur.fetchone()
+            cur.close()
+        if row:
+            return dict(zip(["symbol", "timestamp", "open", "high", "low", "close", "volume", "bid", "ask"], row))
         return {}
 
     def close(self):

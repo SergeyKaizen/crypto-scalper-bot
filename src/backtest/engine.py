@@ -121,14 +121,12 @@ class BacktestEngine:
             # Собираем окно по всем TF до текущего момента
             window = {}
             for tf, df in data.items():
-                # Находим свечи до текущего времени
                 tf_window = df.filter(pl.col("open_time") <= current_time).tail(self.seq_len + 10)
                 if len(tf_window) < self.seq_len:
                     continue
                 window[tf] = tf_window
 
             if len(window) < self.min_tf_consensus:
-                # Недостаточно данных по TF → пропускаем
                 equity.append(equity[-1])
                 continue
 
@@ -168,10 +166,8 @@ class BacktestEngine:
                 )
 
                 if entry_order:
-                    # Управляем позицией (TP/SL/trailing)
                     self.tp_sl_manager.register_position(entry_order)
 
-                    # Симулируем до закрытия позиции
                     exit_info = self._simulate_position_lifecycle(
                         data, i, current_time, entry_order, base_tf
                     )
@@ -190,18 +186,14 @@ class BacktestEngine:
                         }
                         trades.append(trade)
 
-                        # Обновляем equity
                         new_equity = equity[-1] + exit_info["pnl"]
                         equity.append(new_equity)
-
-                        # Обновляем TP/SL manager
                         self.tp_sl_manager.close_position(entry_order["id"])
                     else:
                         equity.append(equity[-1])
                 else:
                     equity.append(equity[-1])
             else:
-                # Нет сигнала → проверяем открытые позиции (TP/SL/trailing)
                 updates = self.tp_sl_manager.update_all_positions(
                     current_price=current_candle["close"],
                     current_time=current_time,
@@ -217,11 +209,11 @@ class BacktestEngine:
                             current_time
                         )
                         if pnl is not None:
-                            # FIX Фаза 5: учёт commission (0.04%) и slippage (0.05%)
+                            # FIX Фаза 3: учёт commission и slippage
                             commission = self.config["trading"].get("commission", 0.0004)
                             slippage = self.config["trading"].get("slippage_pct", 0.0005)
                             pnl = pnl * (1 - commission * 2) - (slippage * abs(pnl))
-                            equity[-1] += pnl  # обновляем последнюю equity
+                            equity[-1] += pnl
 
                 equity.append(equity[-1])
 
@@ -253,7 +245,7 @@ class BacktestEngine:
                     entry_order["size"],
                     entry_order["direction"]
                 )
-                # FIX Фаза 5: учёт commission (0.04%) и slippage (0.05%)
+                # FIX Фаза 3: учёт commission и slippage
                 commission = self.config["trading"].get("commission", 0.0004)
                 slippage = self.config["trading"].get("slippage_pct", 0.0005)
                 pnl = pnl * (1 - commission * 2) - (slippage * abs(pnl))
@@ -272,7 +264,7 @@ class BacktestEngine:
         pnl = self.virtual_trader.calculate_pnl(
             entry_order["price"], exit_price, entry_order["size"], entry_order["direction"]
         )
-        # FIX Фаза 5: учёт commission (0.04%) и slippage (0.05%)
+        # FIX Фаза 3: учёт commission и slippage
         commission = self.config["trading"].get("commission", 0.0004)
         slippage = self.config["trading"].get("slippage_pct", 0.0005)
         pnl = pnl * (1 - commission * 2) - (slippage * abs(pnl))
@@ -300,7 +292,7 @@ class BacktestEngine:
         avg_loss = losses["pnl"].mean() if not losses.empty else 0
 
         pr_l = avg_win / abs(avg_loss) if avg_loss != 0 else float('inf')
-        pr_s = pr_l  # пока одинаково, можно разделить позже
+        pr_s = pr_l
 
         equity = np.array(self.results["equity_curve"])
         drawdowns = (equity.cummax() - equity) / equity.cummax()

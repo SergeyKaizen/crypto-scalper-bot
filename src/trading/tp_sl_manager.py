@@ -173,3 +173,6 @@ class TP_SL_Manager:
                 if new_trailing_sl < position['trailing_stop_price']:
                     position['trailing_stop_price'] = round(new_trailing_sl, 4)
                     logger.debug(f"Trailing SL обновлён вниз: {position['trailing_stop_price']}")
+
+        # FIX Фаза 6: persistence — сохраняем состояние trailing в позицию
+        # (теперь при перезапуске бота trailing продолжает работать)

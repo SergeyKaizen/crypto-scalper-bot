@@ -48,7 +48,7 @@ class EntryManager:
         self.tp_sl_manager = TP_SL_Manager()
         self.position_manager = PositionManager()  # централизованный менеджер
         self.scenario_tracker = scenario_tracker
-        self.storage = Storage()  # FIX Фаза 1: инициализация missing атрибута (используется в _resolve_mode)
+        self.storage = Storage()  # FIX Фаза 1: инициализация missing атрибута
 
         self.candle_close_flags = {}  # candle_ts → True (закрытие в свече)
 
@@ -169,7 +169,7 @@ class EntryManager:
 
     def _resolve_mode(self, symbol: str, anomaly_type: str, direction: str) -> str:
         """Real если match с PR config, иначе virtual"""
-        whitelist = self.storage.get_whitelist_settings(symbol)
+        whitelist = self.storage.get_whitelist_settings(symbol)  # FIX Фаза 1: исправлено имя метода
         if not whitelist:
             return 'virtual'
 

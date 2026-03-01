@@ -78,6 +78,6 @@ DEFAULT_MAX_WORKERS = 8
 DEFAULT_EPOCHS = 10
 DEFAULT_BATCH_SIZE = 32
 
-# FIX Фаза 7: добавлены константы для согласования с Phase 5 (backtest и live)
+# FIX Фаза 4: добавлены константы для согласования с backtest и live (Phase 3)
 DEFAULT_COMMISSION = 0.0004                     # taker fee Binance Futures
 SLIPPAGE_PCT = 0.0005                           # типичное проскальзывание на 15s–1m

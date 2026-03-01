@@ -19,7 +19,7 @@ def test_calculate_position_size():
     rm = RiskManager()
     rm.deposit = 10000.0
     
-    # FIX Фаза 6: обновлено имя метода
+    # FIX Фаза 5: обновлено имя метода
     size = rm.calculate_position_size(
         symbol="BTCUSDT",
         entry_price=60000.0,
@@ -35,7 +35,7 @@ def test_daily_loss_limit():
     rm.daily_loss_limit = 0.05  # 5%
     
     rm.update_deposit(-400)   # -4%
-    # FIX Фаза 6: обновлено имя метода
+    # FIX Фаза 5: обновлено имя метода
     assert rm.can_open_new_position() is True
     
     rm.update_deposit(-200)   # ещё -2% → всего -6%
@@ -45,7 +45,7 @@ def test_max_positions_limit():
     rm = RiskManager()
     rm.max_open_positions = 3
     
-    # FIX Фаза 6: обновлено имя метода
+    # FIX Фаза 5: обновлено имя метода
     assert rm.can_open_new_position() is True
     rm.open_positions_count = 3
     assert rm.can_open_new_position() is False

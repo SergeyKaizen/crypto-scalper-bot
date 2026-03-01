@@ -1,5 +1,6 @@
-""" 
-tests/test_live.py 
+"""
+tests/test_live.py
+
 === Основной принцип работы файла === 
 Тесты live-компонентов: live_loop, order_executor, tp_sl_manager. 
 Проверяет: 
@@ -10,7 +11,7 @@ tests/test_live.py
 
 import pytest
 from unittest.mock import patch
-from src.trading.live_loop import shutdown, open_positions  # FIX Фаза 6: обновлён импорт
+from src.trading.live_loop import shutdown, open_positions  # FIX Фаза 5: обновлён импорт
 
 def test_shutdown_closes_positions(monkeypatch):
     # Мокаем открытые позиции
@@ -19,7 +20,7 @@ def test_shutdown_closes_positions(monkeypatch):
     def mock_close(pos):
         closed.append(pos)
         return pos
-    # FIX Фаза 6: обновлён путь к методу
+    # FIX Фаза 5: обновлён путь к методу
     monkeypatch.setattr("src.trading.order_executor.OrderExecutor.close_position", mock_close)
     shutdown()
     assert len(closed) == 1

@@ -25,6 +25,7 @@ from src.utils.logger import setup_logger
 
 logger = setup_logger("risk_manager", logging.INFO)
 
+
 class RiskManager:
     def __init__(self, config=None):
         self.config = config or load_config()
@@ -71,7 +72,7 @@ class RiskManager:
 
     def can_open_new_position(self) -> bool:
         """Можно ли открыть новую позицию (по лимиту открытых)"""
-        # FIX Фаза 3: daily_loss_limit теперь реально блокирует новые позиции (раньше только warning)
+        # FIX Фаза 2: теперь daily_loss_limit реально блокирует новые позиции
         if self.current_daily_loss <= -self.deposit * self.daily_loss_limit:
             logger.warning(f"Достигнут дневной лимит убытка — новые позиции запрещены: {self.current_daily_loss:.2f} / {self.deposit * self.daily_loss_limit:.2f}")
             return False
