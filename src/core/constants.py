@@ -7,77 +7,59 @@ src/core/constants.py
 Он обеспечивает централизованное управление параметрами, которые используются 
 во всех модулях: периоды, пороги аномалий, размеры окон, лимиты, пути и т.д.
 
-Преимущества:
-- Легко менять значения без правки кода (например, lookback для аномалий, window_sizes).
-- Все параметры вынесены из конфигов в код для быстрого доступа (config.yaml — для динамических настроек).
-- Константы группированы по разделам (аномалии, окна, модель, бектест и т.д.) с комментариями.
-
 === Главные группы констант и за что отвечают ===
 
 - WINDOWS_SIZES: [24, 50, 74, 100] — окна анализа из ТЗ.
-- ANOMALY: lookback=25, percentile, dominance_threshold и т.д. — пороги для C/V/CV.
-- MODEL: seq_len, epochs, batch_size, hidden_size — базовые для Conv1D+GRU.
-- BACKTEST: min_trades_for_pr, min_pr_threshold — фильтры монет.
-- RISK: default_risk_pct, leverage_max — управление рисками.
-- PATHS: data_dir, logs_dir — директории хранения.
-- DATABASE: db_type по hardware, min_age_months для фильтра монет.
+- ANOMALY: lookback=25, percentile, dominance_threshold и т.д.
+- MODEL: seq_len, epochs, batch_size, hidden_size
+- BACKTEST: min_trades_for_pr, min_pr_threshold
+- RISK: default_risk_pct, leverage_max
+- PATHS: data_dir, logs_dir
+- DATABASE: db_type по hardware
 
 === Примечания ===
 - Все значения по ТЗ или здравому смыслу для интрадей скальпинга.
-- Нет динамических изменений — только константы.
-- Импортируется как from src.core.constants import WINDOWS_SIZES и т.д.
-- Легко расширяем при добавлении новых параметров.
 """
 
-# === Окна анализа (из ТЗ) ===
-WINDOWS_SIZES = [24, 50, 74, 100]               # Окна для мульти-окна анализа
+WINDOWS_SIZES = [24, 50, 74, 100]
 
-# === Параметры аномалий ===
-LOOKBACK_ANOMALY = 25                           # Lookback для свечной и объёмной аномалий (ТЗ)
-VOLUME_PERCENTILE_MIN = 0.94                    # Минимальный перцентиль для volume threshold
-VOLUME_PERCENTILE_MAX = 0.99                    # Максимальный перцентиль
-VOLUME_PERCENTILE_DEFAULT = 0.97                # По умолчанию
-DOMINANCE_THRESHOLD_PCT = 60.0                  # Порог доминирования ask/bid в % (если |dominance| > 60% — аномалия)
-MIN_VOLUME_FOR_ANOMALY = 1.0                    # Минимальный объём свечи для рассмотрения аномалии (в базовом активе)
+LOOKBACK_ANOMALY = 25
+VOLUME_PERCENTILE_MIN = 0.94
+VOLUME_PERCENTILE_MAX = 0.99
+VOLUME_PERCENTILE_DEFAULT = 0.97
+DOMINANCE_THRESHOLD_PCT = 60.0
+MIN_VOLUME_FOR_ANOMALY = 1.0
 
-# === Параметры Value Area ===
-VA_PERCENT = 0.70                               # Процент объёма для Value Area (стандарт 70%)
-VA_BIN_STEP_PCT = 0.001                         # Шаг биннинга = 0.1% от средней цены
+VA_PERCENT = 0.70
+VA_BIN_STEP_PCT = 0.001
 
-# === Параметры модели ===
-DEFAULT_SEQ_LEN = 100                           # Длина последовательности (ТЗ: 50–100, по умолчанию 100)
-MIN_PROB_ANOMALY = 0.60                         # Минимальная вероятность предикта для аномалий
-MIN_PROB_Q = 0.75                               # Выше для quiet режима (меньше ложных входов)
-RETRAIN_INTERVAL_CANDLES = 10000                # Переобучение каждые 10000 свечей (ТЗ)
-HIDDEN_SIZE_BASE = 128                          # Базовый размер скрытого слоя GRU/Conv1D (масштабируется по hardware)
+DEFAULT_SEQ_LEN = 100
+MIN_PROB_ANOMALY = 0.60
+MIN_PROB_Q = 0.75
+RETRAIN_INTERVAL_CANDLES = 10000
+HIDDEN_SIZE_BASE = 128
 
-# === Параметры бектеста и PR ===
-MIN_TRADES_FOR_PR = 10                          # Минимальное кол-во сделок для учёта монеты в PR (ТЗ)
-MIN_PR_THRESHOLD = 0.0                          # Минимальный PR для включения в whitelist (ТЗ: >0)
-PR_CALC_LOOKBACK_HOURS = 720                    # Период анализа для PR (30 дней по умолчанию)
+MIN_TRADES_FOR_PR = 10
+MIN_PR_THRESHOLD = 0.0
+PR_CALC_LOOKBACK_HOURS = 720
 
-# === Параметры риска и торговли ===
-DEFAULT_RISK_PCT = 1.0                          # Риск на сделку в % от депозита (авто-расчёт)
-MAX_LEVERAGE = 50                               # Максимальное плечо (проверяется по монете)
-MIN_ORDER_SIZE_USDT = 5.0                       # Минимальный размер ордера (фильтр)
+DEFAULT_RISK_PCT = 1.0
+MAX_LEVERAGE = 50
+MIN_ORDER_SIZE_USDT = 5.0
 
-# === Пути и директории ===
-DATA_DIR = "data"                               # Директория для БД и csv
-LOGS_DIR = "logs"                               # Директория логов
-MODELS_DIR = "models"                           # Директория сохранённых моделей
-CONFIG_DIR = "config"                           # Директория конфигов
+DATA_DIR = "data"
+LOGS_DIR = "logs"
+MODELS_DIR = "models"
+CONFIG_DIR = "config"
 
-# === Другие константы ===
-EPSILON = 1e-8                                  # Защита от деления на 0 во всех % расчётах
-MAX_HISTORY_CANDLES = 100000                    # Максимум свечей на монету при первой скачке
-MAX_SCENARIOS_LIMIT = 10000                     # Максимум сценариев в tracker (удаление старых)
+EPSILON = 1e-8
+MAX_HISTORY_CANDLES = 100000
+MAX_SCENARIOS_LIMIT = 10000
 
-# === Hardware-specific (переопределяется в hardware/*.yaml) ===
-# Эти значения — дефолтные, если yaml не задан
 DEFAULT_MAX_WORKERS = 8
 DEFAULT_EPOCHS = 10
 DEFAULT_BATCH_SIZE = 32
 
-# FIX Фаза 4: добавлены константы для согласования с backtest и live (Phase 3)
-DEFAULT_COMMISSION = 0.0004                     # taker fee Binance Futures
-SLIPPAGE_PCT = 0.0005                           # типичное проскальзывание на 15s–1m
+# FIX Фаза 7
+DEFAULT_COMMISSION = 0.0004
+SLIPPAGE_PCT = 0.0005

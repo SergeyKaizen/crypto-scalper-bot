@@ -52,10 +52,6 @@ def load_main_config(path: str):
         config = yaml.safe_load(f)
     
     logger.info(f"Загружен конфиг: {path}")
-    logger.info(f"Hardware: {config['hardware']['mode']} | "
-                f"Real trading: {config['trading_mode']['real_trading']} | "
-                f"TP/SL mode: {config['tp_sl']['mode']}")
-    
     return config
 
 def run_training(config):
@@ -72,7 +68,7 @@ def run_backtest_and_update_whitelist(config):
 
 def warmup(config):
     logger.info("Шаг 6: Warm-up (прогрев кэша и модели)...")
-    time.sleep(5)  # имитация прогрева
+    time.sleep(5)
     logger.info("Warm-up завершён.")
 
 def start_trading(config):

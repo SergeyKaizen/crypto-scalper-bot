@@ -34,29 +34,26 @@ from enum import Enum, auto
 
 class AnomalyType(str, Enum):
     """Типы аномалий и тихий режим."""
-    CANDLE = "C"        # Свечная аномалия
-    VOLUME = "V"        # Объёмная аномалия
-    CV = "CV"           # Комбинированная свечная + объёмная
-    QUIET = "Q"         # Тихий режим (нет аномалий, вход по паттернам)
+    CANDLE = "C"
+    VOLUME = "V"
+    CV = "CV"
+    QUIET = "Q"
 
 class Direction(str, Enum):
     """Направление позиции."""
-    LONG = "L"          # FIX Фаза 5: возвращено на "L" (полная совместимость с БД и whitelist)
-    SHORT = "S"         # FIX Фаза 5: возвращено на "S"
+    LONG = "L"          # FIX Фаза 7: "L"/"S" для полной совместимости с БД и whitelist
+    SHORT = "S"
 
 class TradeMode(str, Enum):
-    """Режим торговли."""
-    REAL = "real"       # Реальная торговля
-    VIRTUAL = "virtual" # Виртуальная симуляция
+    REAL = "real"
+    VIRTUAL = "virtual"
 
 class TpSlMode(str, Enum):
-    """Режимы расчёта TP/SL (dynamic удалён по ТЗ)."""
-    CLASSIC = "classic"             # Фиксированный TP/SL по среднему размеру / HH/LL
-    PARTIAL_TRAILING = "partial_trailing"  # Частичный трейлинг с порциями
-    CHANDELIER = "chandelier"       # Chandelier exit (ATR-based, если используется)
+    CLASSIC = "classic"
+    PARTIAL_TRAILING = "partial_trailing"
+    CHANDELIER = "chandelier"
 
 class Timeframe(str, Enum):
-    """Таймфреймы из ТЗ."""
     M1 = "1m"
     M3 = "3m"
     M5 = "5m"
@@ -65,17 +62,14 @@ class Timeframe(str, Enum):
 
     @property
     def minutes(self) -> int:
-        """Возвращает длительность TF в минутах."""
         return int(self.value[:-1])
 
 class HardwareType(str, Enum):
-    """Типы железа для адаптации параметров (БД, epochs, workers)."""
-    PHONE_TINY = "phone_tiny"   # Redmi Note 12 Pro — лёгкая БД, малые epochs
-    COLAB = "colab"             # Google Colab — средние параметры
-    SERVER = "server"           # Полный сервер — максимум
+    PHONE_TINY = "phone_tiny"
+    COLAB = "colab"
+    SERVER = "server"
 
 class PositionStatus(str, Enum):
-    """Статусы позиции в live/virtual."""
     OPEN = "open"
     CLOSED_TP = "closed_tp"
     CLOSED_SL = "closed_sl"
