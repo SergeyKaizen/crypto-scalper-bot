@@ -28,7 +28,7 @@ src/trading/live_loop.py
 - Только 1 позиция в live: top-1 по весу + глобальный lock
 - Если несколько сигналов — остальные виртуальные
 - retrain: last_retrain[tf] → проверка timedelta(days=7)
-- quiet_streak: per-symbol/per-TF в quiet_streaks dict
+- quiet_streak: теперь берётся только из anomaly_detector (дублирование удалено в Фазе 6)
 - consensus: только для младших TF требуют подтверждения старших
 - polling fallback (WS можно добавить позже)
 """
@@ -64,7 +64,6 @@ logger = setup_logger('live_loop', logging.INFO)
 last_markets_update = None
 open_positions = defaultdict(list)  # symbol → list[positions]
 last_retrain = {}  # tf → datetime последнего retrain
-quiet_streaks = defaultdict(lambda: defaultdict(int))  # symbol → tf → streak
 
 
 def signal_handler(sig, frame):
@@ -79,7 +78,7 @@ def shutdown():
 
     closed_count = 0
     for symbol, positions in list(open_positions.items()):
-        for pos in positions[:]:
+        for pos in positions[:]:  # копия списка
             try:
                 OrderExecutor.close_position(pos)
                 closed_count += 1
@@ -192,7 +191,7 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
     - Открытие только этой позиции (если проходит проверки)
     - Остальные — виртуальные для PR
     """
-    # FIX Фаза 7: реальные данные из storage
+    # FIX Фаза 7 + Фаза 4: реальные данные из storage
     last_candle = storage.get_last_candle(symbol, timeframe)
     candle_data = last_candle if last_candle else {'close': 0.0, 'timestamp': int(time.time() * 1000)}
     candle_ts = candle_data.get('timestamp', int(time.time() * 1000))
@@ -215,12 +214,8 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
             continue
 
         anomaly_type = anom['type']
-        quiet_streak = quiet_streaks[symbol][timeframe]
-        if anomaly_type != 'Q':
-            quiet_streaks[symbol][timeframe] = 0
-        else:
-            quiet_streaks[symbol][timeframe] += 1
-            quiet_streak = quiet_streaks[symbol][timeframe]
+        # FIX Фаза 6: quiet_streak теперь берётся только из anomaly_detector (дублирование удалено)
+        quiet_streak = anom.get('quiet_streak', 0)
 
         predict_prob = inference.predict(
             features_by_tf[timeframe][window],

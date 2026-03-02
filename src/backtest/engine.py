@@ -61,7 +61,7 @@ class BacktestEngine:
     def load_data(self) -> Dict[str, pl.DataFrame]:
         """Загружает последние N свечей по всем TF"""
         data = {}
-        limit = self.config.get("data", {}).get("backtest_candles", 1000) + self.seq_len + 50
+        limit = self.config["data"]["backtest_candles"] + self.seq_len + 50  # запас
         for tf in self.timeframes:
             df = self.storage.get_candles(self.symbol, tf, limit=limit)
             if df is None or len(df) < self.seq_len + 10:
@@ -77,6 +77,7 @@ class BacktestEngine:
             logger.error(f"Нет данных для {self.symbol}")
             return {"error": "no data"}
 
+        # Разбиваем на непересекающиеся сегменты (по 1000–2000 свечей)
         segments = self._split_into_segments(data)
 
         for segment_data in segments:
@@ -84,6 +85,7 @@ class BacktestEngine:
             self.results["trades"].extend(segment_results["trades"])
             self.results["equity_curve"].extend(segment_results["equity_curve"])
 
+        # Финальный расчёт метрик
         self.results["metrics"] = self._calculate_metrics()
         self.storage.save_backtest_results(self.symbol, self.results)
 
@@ -92,7 +94,7 @@ class BacktestEngine:
     def _split_into_segments(self, data: Dict[str, pl.DataFrame]) -> List[Dict[str, pl.DataFrame]]:
         """Разбивает данные на сегменты для экономии памяти"""
         min_len = min(len(df) for df in data.values())
-        segment_size = 1500
+        segment_size = 1500  # ~1–2 месяца на 1m
         segments = []
         for start in range(self.seq_len, min_len - 100, segment_size):
             end = min(start + segment_size, min_len)
@@ -101,10 +103,12 @@ class BacktestEngine:
         return segments
 
     def _simulate_segment(self, data: Dict[str, pl.DataFrame]) -> Dict:
-        """Реальная симуляция одного сегмента"""
+        """Реальная симуляция одного сегмента без рандома"""
         trades = []
-        equity = [self.config.get("initial_balance", 10000.0)]
+        equity = [self.config["initial_balance"]]
+        current_time = 0
 
+        # Идём по самой младшей TF (1m)
         base_tf = "1m"
         base_df = data.get(base_tf)
         if base_df is None:
@@ -114,8 +118,10 @@ class BacktestEngine:
             current_candle = base_df.row(i)
             current_time = current_candle["open_time"]
 
+            # Собираем окно по всем TF до текущего момента
             window = {}
             for tf, df in data.items():
+                # Находим свечи до текущего времени
                 tf_window = df.filter(pl.col("open_time") <= current_time).tail(self.seq_len + 10)
                 if len(tf_window) < self.seq_len:
                     continue
@@ -125,9 +131,13 @@ class BacktestEngine:
                 equity.append(equity[-1])
                 continue
 
+            # Генерируем признаки
             features = self.feature_engine.build_features(window)
+
+            # Inference модели
             prob_long, prob_short, uncertainty = self.inference.predict(features)
 
+            # Проверяем условие входа
             entry_signal = self.entry_manager.check_entry(
                 prob_long=prob_long,
                 prob_short=prob_short,
@@ -141,12 +151,14 @@ class BacktestEngine:
                 direction = entry_signal["direction"]
                 confidence = entry_signal["confidence"]
 
+                # Рассчитываем размер позиции
                 position_size = self.risk_manager.calculate_position_size(
                     current_price=current_candle["close"],
                     direction=direction,
                     confidence=confidence
                 )
 
+                # Открываем виртуальную позицию
                 entry_order = self.virtual_trader.open_position(
                     direction=direction,
                     price=current_candle["close"],
@@ -155,8 +167,10 @@ class BacktestEngine:
                 )
 
                 if entry_order:
+                    # Управляем позицией (TP/SL/trailing)
                     self.tp_sl_manager.register_position(entry_order)
 
+                    # Симулируем до закрытия позиции
                     exit_info = self._simulate_position_lifecycle(
                         data, i, current_time, entry_order, base_tf
                     )
@@ -175,14 +189,18 @@ class BacktestEngine:
                         }
                         trades.append(trade)
 
+                        # Обновляем equity
                         new_equity = equity[-1] + exit_info["pnl"]
                         equity.append(new_equity)
+
+                        # Обновляем TP/SL manager
                         self.tp_sl_manager.close_position(entry_order["id"])
                     else:
                         equity.append(equity[-1])
                 else:
                     equity.append(equity[-1])
             else:
+                # Нет сигнала → проверяем открытые позиции (TP/SL/trailing)
                 updates = self.tp_sl_manager.update_all_positions(
                     current_price=current_candle["close"],
                     current_time=current_time,
@@ -191,23 +209,25 @@ class BacktestEngine:
                 )
 
                 for update in updates:
-                    if update.get("closed"):
+                    if update["closed"]:
                         pnl = self.virtual_trader.close_position(
                             update["position_id"],
                             update["exit_price"],
                             current_time
                         )
                         if pnl is not None:
+                            # FIX Фаза 2: учёт commission (0.04%) и slippage (0.05%)
                             commission = self.config["trading"].get("commission", 0.0004)
                             slippage = self.config["trading"].get("slippage_pct", 0.0005)
                             pnl = pnl * (1 - commission * 2) - (slippage * abs(pnl))
-                            equity[-1] += pnl
+                            equity[-1] += pnl  # обновляем последнюю equity
 
                 equity.append(equity[-1])
 
         return {"trades": trades, "equity_curve": equity}
 
     def _simulate_position_lifecycle(self, data: Dict, start_idx: int, start_time: int, entry_order: Dict, base_tf: str) -> Optional[Dict]:
+        """Симулирует жизненный цикл одной позиции до её закрытия"""
         base_df = data[base_tf]
         for j in range(start_idx + 1, len(base_df)):
             candle = base_df.row(j)
@@ -224,7 +244,7 @@ class BacktestEngine:
                 timestamp=ts
             )
 
-            if updates and updates.get("closed"):
+            if updates and updates["closed"]:
                 exit_price = updates["exit_price"]
                 pnl = self.virtual_trader.calculate_pnl(
                     entry_order["price"],
@@ -232,6 +252,7 @@ class BacktestEngine:
                     entry_order["size"],
                     entry_order["direction"]
                 )
+                # FIX Фаза 2: учёт commission (0.04%) и slippage (0.05%)
                 commission = self.config["trading"].get("commission", 0.0004)
                 slippage = self.config["trading"].get("slippage_pct", 0.0005)
                 pnl = pnl * (1 - commission * 2) - (slippage * abs(pnl))
@@ -244,11 +265,13 @@ class BacktestEngine:
                     "reason": updates["reason"]
                 }
 
+        # Если дошли до конца сегмента — закрываем по рынку
         last_candle = base_df.row(-1)
         exit_price = last_candle["close"]
         pnl = self.virtual_trader.calculate_pnl(
             entry_order["price"], exit_price, entry_order["size"], entry_order["direction"]
         )
+        # FIX Фаза 2: учёт commission (0.04%) и slippage (0.05%)
         commission = self.config["trading"].get("commission", 0.0004)
         slippage = self.config["trading"].get("slippage_pct", 0.0005)
         pnl = pnl * (1 - commission * 2) - (slippage * abs(pnl))
@@ -261,7 +284,7 @@ class BacktestEngine:
         }
 
     def _calculate_metrics(self) -> Dict:
-        """Расчёт итоговых метрик"""
+        """Расчёт итоговых метрик (PR, winrate, drawdown и т.д.)"""
         trades = self.results["trades"]
         if not trades:
             return {"total_trades": 0, "winrate": 0, "pr_ls": 0}
@@ -276,6 +299,7 @@ class BacktestEngine:
         avg_loss = losses["pnl"].mean() if not losses.empty else 0
 
         pr_l = avg_win / abs(avg_loss) if avg_loss != 0 else float('inf')
+        pr_s = pr_l  # пока одинаково, можно разделить позже
 
         equity = np.array(self.results["equity_curve"])
         drawdowns = (equity.cummax() - equity) / equity.cummax()
@@ -288,5 +312,5 @@ class BacktestEngine:
             "avg_loss": avg_loss,
             "pr_ls": pr_l,
             "max_drawdown": max_dd,
-            "final_equity": equity[-1] if len(equity) > 0 else self.config.get("initial_balance", 10000.0)
+            "final_equity": equity[-1] if len(equity) > 0 else self.config["initial_balance"]
         }

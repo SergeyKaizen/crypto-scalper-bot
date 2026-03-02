@@ -20,7 +20,7 @@ class PRCalculator:
 
     def update_pr(self, symbol: str, anomaly_type: str, direction: str, hit_tp: bool, pl: float):
         """Обновляет PR после каждой закрытой позиции"""
-        # FIX Фаза 7: учёт комиссии (round-trip)
+        # FIX Фаза 2: учёт комиссии (round-trip)
         commission = 0.0004
         pl_adjusted = pl * (1 - commission * 2)
 
