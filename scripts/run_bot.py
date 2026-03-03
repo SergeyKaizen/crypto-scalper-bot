@@ -1,5 +1,6 @@
-# scripts/run_bot.py
 """
+scripts/run_bot.py
+
 Главный скрипт запуска бота по единому конфигу bot_config.yaml.
 
 Логика запуска (строго по твоим требованиям):
@@ -28,11 +29,11 @@ from src.core.config import load_config
 from src.model.trainer import Trainer
 from src.backtest.engine import BacktestEngine
 from src.data.storage import Storage
-from src.trading.live_loop import LiveLoop
+from src.trading.live_loop import live_loop
 from src.trading.websocket_manager import WebSocketManager
-from src.utils.logger import get_logger
+from src.utils.logger import setup_logger
 
-logger = get_logger(__name__)
+logger = setup_logger("run_bot", logging.INFO)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Запуск Scalper Bot по единому конфигу")
@@ -43,53 +44,6 @@ def parse_args():
     parser.add_argument("--only_warmup_trade", action="store_true", help="Только warm-up и торговля (для тестов)")
     return parser.parse_args()
 
-def load_main_config(path: str):
-    if not os.path.exists(path):
-        logger.error(f"Конфиг не найден: {path}")
-        sys.exit(1)
-    
-    with open(path, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-    
-    logger.info(f"Загружен конфиг: {path}")
-    return config
-
-def run_training(config):
-    logger.info("Шаг 3: Обучение модели...")
-    trainer = Trainer(config)
-    trainer.train()
-    logger.info("Обучение завершено.")
-
-def run_backtest_and_update_whitelist(config):
-    logger.info("Шаг 4: Запуск полного бэктеста...")
-    from scripts.backtest_all import main as backtest_main
-    backtest_main()
-    logger.info("Бэктест завершён, whitelist обновлён.")
-
-def warmup(config):
-    logger.info("Шаг 6: Warm-up (прогрев кэша и модели)...")
-    time.sleep(5)
-    logger.info("Warm-up завершён.")
-
-def start_trading(config):
-    logger.info("Шаг 7: Запуск торговли...")
-    
-    from src.data.resampler import Resampler
-    resampler = Resampler(config)
-    ws_manager = WebSocketManager(config, resampler)
-    asyncio.create_task(ws_manager.start())
-    
-    live_loop = LiveLoop(config)
-    
-    try:
-        asyncio.run(live_loop.start())
-    except KeyboardInterrupt:
-        logger.info("Остановка бота по запросу пользователя...")
-        live_loop.stop()
-    except Exception as e:
-        logger.error(f"Критическая ошибка в LiveLoop: {e}")
-        live_loop.stop()
-
 def main():
     args = parse_args()
     
@@ -97,17 +51,37 @@ def main():
     print("Scalper Bot Launcher (единый конфиг)")
     print("="*80)
     
-    config = load_main_config(args.config)
+    config = load_config()
     
     if not args.only_warmup_trade:
         if not args.skip_train:
-            run_training(config)
-        
+            logger.info("Шаг 3: Обучение модели...")
+            trainer = Trainer(config)
+            trainer.train()
+            logger.info("Обучение завершено.")
+
         if not args.skip_backtest:
-            run_backtest_and_update_whitelist(config)
+            logger.info("Шаг 4: Запуск полного бэктеста...")
+            from scripts.backtest_all import main as backtest_main
+            backtest_main()
+            logger.info("Бэктест завершён, whitelist обновлён.")
+
+    logger.info("Шаг 6: Warm-up (прогрев кэша и модели)...")
+    time.sleep(5)
+    logger.info("Warm-up завершён.")
+
+    logger.info("Шаг 7: Запуск торговли...")
+    from src.data.resampler import Resampler
+    resampler = Resampler(config)
+    ws_manager = WebSocketManager(config, resampler)
+    asyncio.create_task(ws_manager.start())
     
-    warmup(config)
-    start_trading(config)
+    try:
+        asyncio.run(live_loop())
+    except KeyboardInterrupt:
+        logger.info("Остановка бота по запросу пользователя...")
+    except Exception as e:
+        logger.error(f"Критическая ошибка в LiveLoop: {e}")
 
 if __name__ == "__main__":
     main()

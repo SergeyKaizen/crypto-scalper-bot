@@ -28,7 +28,7 @@ src/trading/live_loop.py
 - Только 1 позиция в live: top-1 по весу + глобальный lock
 - Если несколько сигналов — остальные виртуальные
 - retrain: last_retrain[tf] → проверка timedelta(days=7)
-- quiet_streak: теперь берётся только из anomaly_detector (дублирование удалено в Фазе 6)
+- quiet_streak: теперь берётся только из anomaly_detector (дублирование удалено в Фазе 2)
 - consensus: только для младших TF требуют подтверждения старших
 - polling fallback (WS можно добавить позже)
 """
@@ -62,8 +62,8 @@ logger = setup_logger('live_loop', logging.INFO)
 
 # State
 last_markets_update = None
-open_positions = defaultdict(list)
-last_retrain = {}
+open_positions = defaultdict(list)  # symbol → list[positions]
+last_retrain = {}  # tf → datetime последнего retrain
 
 
 def signal_handler(sig, frame):
@@ -78,7 +78,7 @@ def shutdown():
 
     closed_count = 0
     for symbol, positions in list(open_positions.items()):
-        for pos in positions[:]:
+        for pos in positions[:]:  # копия списка
             try:
                 OrderExecutor.close_position(pos)
                 closed_count += 1
@@ -132,17 +132,20 @@ def live_loop():
 
     while True:
         try:
+            # 1. Ежедневное обновление списка монет
             if (datetime.utcnow() - last_markets_update) > timedelta(days=1):
                 logger.info("Ежедневное обновление списка монет")
                 client.update_markets_list()
                 last_markets_update = datetime.utcnow()
                 symbols = storage.get_whitelisted_symbols()
 
+            # 2. Докачка новых свечей
             for symbol in symbols:
                 for tf in timeframes:
                     download_new_candles(symbol, tf)
                     time.sleep(0.1)
 
+            # 3. Еженедельный retrain per-TF
             now = datetime.utcnow()
             for tf in timeframes:
                 if (now - last_retrain[tf]) > timedelta(days=config.get('retrain_interval_days', 7)):
@@ -150,6 +153,7 @@ def live_loop():
                     trainer.retrain(timeframe=tf)
                     last_retrain[tf] = now
 
+            # 4. Обработка новых свечей
             with concurrent.futures.ThreadPoolExecutor(max_workers=config['hardware']['max_workers']) as executor:
                 futures = []
                 for symbol in symbols:
@@ -167,7 +171,7 @@ def live_loop():
                     except Exception as e:
                         logger.error(f"Ошибка обработки свечи: {e}")
 
-            time.sleep(60)
+            time.sleep(60)  # основной цикл ~1m
 
         except Exception as e:
             logger.exception("Критическая ошибка в live_loop")
@@ -187,6 +191,7 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
     - Открытие только этой позиции (если проходит проверки)
     - Остальные — виртуальные для PR
     """
+    # FIX Фаза 7 + Фаза 2: реальные данные из storage
     last_candle = storage.get_last_candle(symbol, timeframe)
     candle_data = last_candle if last_candle else {'close': 0.0, 'timestamp': int(time.time() * 1000)}
     candle_ts = candle_data.get('timestamp', int(time.time() * 1000))
@@ -209,6 +214,7 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
             continue
 
         anomaly_type = anom['type']
+        # FIX Фаза 2: quiet_streak теперь берётся только из anomaly_detector (дублирование полностью удалено)
         quiet_streak = anom.get('quiet_streak', 0)
 
         predict_prob = inference.predict(
@@ -288,6 +294,7 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
                     tp_sl_manager.calculate_tp_sl(sig['feats'], sig['anom']['type'])
                 )
 
+    # Мониторинг открытых позиций
     if symbol in open_positions:
         for pos in open_positions[symbol][:]:
             current_price = storage.get_last_candle(symbol, timeframe).get('close', 0)
