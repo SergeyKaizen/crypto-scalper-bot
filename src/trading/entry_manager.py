@@ -14,17 +14,9 @@ src/trading/entry_manager.py
 - Проверка whitelist, min_prob/min_prob_q, no open по типу
 - Рассчёт размера через risk_manager, открытие через order_executor/virtual_trader
 
-=== Главные функции ===
-- process_signals(symbol, signals, candle_data, candle_ts) — сбор сигналов → выбор top-1 → открытие
-- _can_open_position(symbol, anomaly_type, candle_ts) → bool — глобальный lock + проверка закрытия
-- update_candle_close_flag(candle_ts) — флаг закрытия в свече
-
-=== Примечания ===
-- Глобальный lock: position_manager.has_any_open_position(symbol)
-- Выбор max веса: только для live, фокус на лучших сигналах
-- Полностью соответствует ТЗ + улучшениям (централизация, state-machine)
-- Готов к интеграции в live_loop.py
-- Логи через setup_logger
+FIX Фаза 10:
+- Полностью удалены старые best_anomaly, best_direction, best_window
+- Переход на чистую динамическую логику top-1 по весу
 """
 
 from typing import List, Dict
@@ -36,7 +28,7 @@ from src.trading.position_manager import PositionManager
 from src.trading.risk_manager import RiskManager
 from src.trading.tp_sl_manager import TP_SL_Manager
 from src.model.scenario_tracker import ScenarioTracker
-from src.data.storage import Storage          # FIX Фаза 7
+from src.data.storage import Storage
 from src.utils.logger import setup_logger
 
 logger = setup_logger('entry_manager', logging.INFO)
@@ -48,9 +40,9 @@ class EntryManager:
         self.tp_sl_manager = TP_SL_Manager()
         self.position_manager = PositionManager()
         self.scenario_tracker = scenario_tracker
-        self.storage = Storage()  # FIX Фаза 7: инициализация
+        self.storage = Storage()
 
-        self.candle_close_flags = {}  # candle_ts → True (закрытие в свече)
+        self.candle_close_flags = {}
 
     def process_signals(
         self,
@@ -68,7 +60,7 @@ class EntryManager:
         if not signals:
             return
 
-        # FIX Фаза 7: динамический выбор top-1 по весу (старые best_anomaly, best_direction, best_window удалены)
+        # FIX Фаза 10: динамический выбор top-1 по весу
         scored_signals = []
         for sig in signals:
             feats = sig.get('feats', {})
@@ -129,7 +121,6 @@ class EntryManager:
             self._open_virtual_position(symbol, sig)
 
     def _can_open_position(self, symbol: str, anomaly_type: str, candle_ts: int) -> bool:
-        """Проверки перед открытием позиции"""
         if self.position_manager.has_any_open_position(symbol):
             logger.debug(f"Уже есть открытая позиция на {symbol}")
             return False
@@ -141,7 +132,6 @@ class EntryManager:
         return True
 
     def _resolve_mode(self, symbol: str, anomaly_type: str, direction: str) -> str:
-        """Real если совпадает с whitelist, иначе virtual"""
         wl = self.storage.get_whitelist_settings(symbol)
         if not wl:
             return 'virtual'
@@ -151,14 +141,12 @@ class EntryManager:
         return 'virtual'
 
     def _resolve_direction(self, feats: Dict) -> str:
-        """Определение направления сделки"""
         price_change = feats.get('price_change_pct', 0)
         if price_change > 0:
             return 'L'
         return 'S'
 
     def _open_virtual_position(self, symbol: str, sig: Dict):
-        """Открытие виртуальной позиции"""
         try:
             self.position_manager.virtual_trader.open_virtual_position(
                 symbol,
@@ -170,12 +158,10 @@ class EntryManager:
             logger.debug(f"Ошибка открытия виртуальной позиции: {e}")
 
     def update_candle_close_flag(self, candle_ts: int):
-        """Фиксирует, что в этой свече уже было закрытие позиции"""
         self.candle_close_flags[candle_ts] = True
         logger.debug(f"Установлен флаг закрытия позиции в свече {candle_ts}")
 
     def clear_old_flags(self, current_ts: int):
-        """Очистка старых флагов закрытия (экономия памяти)"""
         to_remove = [ts for ts in self.candle_close_flags if ts < current_ts - 3600000]
         for ts in to_remove:
             self.candle_close_flags.pop(ts, None)

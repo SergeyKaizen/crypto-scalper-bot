@@ -37,6 +37,9 @@ class RiskManager:
         self.current_daily_loss = 0.0
         self.open_positions_count = 0
 
+        # FIX Фаза 9: размер позиции теперь задаётся в USDT, а не в монете
+        self.min_position_size_usdt = self.config["trading"].get("min_position_size_usdt", 100.0)
+
     def calculate_position_size(self, symbol: str, entry_price: float, sl_price: float) -> float:
         """
         Расчёт размера позиции.
@@ -44,35 +47,39 @@ class RiskManager:
         Изменения по пункту 4:
         - Убрано любое умножение на regime_factor / regime_strength
         - Чистый расчёт: size = (deposit * risk_pct) / |entry - sl|
+
+        FIX Фаза 9:
+        - min_position_size теперь в USDT (абсолютная сумма риска)
+        - size = risk_amount_usdt / (price_diff * entry_price)
         """
         if entry_price <= 0 or sl_price <= 0:
             logger.warning(f"Некорректные цены для {symbol}: entry={entry_price}, sl={sl_price}")
             return 0.0
 
-        risk_amount = self.deposit * self.risk_pct
+        risk_amount_usdt = self.deposit * self.risk_pct
         price_diff = abs(entry_price - sl_price)
 
         if price_diff == 0:
             logger.warning(f"SL = entry для {symbol} — размер позиции = 0")
             return 0.0
 
-        size = risk_amount / price_diff
+        # FIX Фаза 9: USDT-based sizing
+        size = risk_amount_usdt / (price_diff * entry_price)
 
-        # Учёт минимального размера и шага лота (если есть в конфиге)
-        min_size = self.config["trading"].get("min_position_size", 0.001)
-        size = max(min_size, size)
+        # Применяем минимальный размер в USDT
+        min_size_coins = self.min_position_size_usdt / entry_price
+        size = max(min_size_coins, size)
 
-        # Учёт максимального leverage (не превышаем)
+        # Учёт максимального leverage
         max_size_by_leverage = (self.deposit * self.max_leverage) / entry_price
         size = min(size, max_size_by_leverage)
 
-        logger.debug(f"Размер позиции для {symbol}: {size:.6f} (risk {self.risk_pct*100}%, расстояние до SL {price_diff:.2f})")
+        logger.debug(f"Размер позиции для {symbol}: {size:.6f} монет (риск {risk_amount_usdt:.2f} USDT, расстояние до SL {price_diff:.6f})")
 
         return size
 
     def can_open_new_position(self) -> bool:
         """Можно ли открыть новую позицию (по лимиту открытых)"""
-        # FIX Фаза 4: daily_loss_limit реально блокирует новые позиции
         if self.current_daily_loss <= -self.deposit * self.daily_loss_limit:
             logger.warning(f"Достигнут дневной лимит убытка — новые позиции запрещены: {self.current_daily_loss:.2f} / {self.deposit * self.daily_loss_limit:.2f}")
             return False

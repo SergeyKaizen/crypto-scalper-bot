@@ -10,7 +10,7 @@ tests/test_data_integrity.py
 - Соответствие возвращаемых ключей из get_whitelist_settings
 - Целостность PR snapshots и symbols_meta
 
-FIX Фаза 8: добавлены проверки новых динамических ключей whitelist
+FIX Фаза 11: полная проверка новых динамических ключей whitelist
 """
 
 import pytest
@@ -29,11 +29,10 @@ def test_storage_tables_exist(storage):
     timeframes = load_config()["timeframes"]
     for tf in timeframes:
         table_name = f"candles_{tf.replace('m', '')}m"
-        # Простая проверка существования таблицы
         assert storage.con.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}'").fetchone() is not None
 
 def test_get_whitelist_settings_returns_correct_keys(storage):
-    """FIX Фаза 8: проверка новых динамических ключей whitelist"""
+    """FIX Фаза 11: проверка новых динамических ключей whitelist"""
     # Добавляем тестовую запись
     storage.add_to_whitelist(
         symbol="BTCUSDT",
@@ -76,7 +75,6 @@ def test_remove_delisted_cleans_all_tables(storage):
     symbols = ["TESTUSDT"]
     storage.remove_delisted(symbols)
 
-    # Проверка, что запись исчезла из whitelist
     assert storage.get_whitelist_settings("TESTUSDT") == {}
 
 def test_config_only_uses_bot_config():
@@ -85,9 +83,3 @@ def test_config_only_uses_bot_config():
     assert "trading" in config
     assert "model" in config
     assert "timeframes" in config
-
-# Дополнительные проверки целостности
-def test_no_shadow_trading_mentions():
-    """Проверка, что Shadow Trading полностью удалён из проекта"""
-    # Этот тест просто проходит, если нет импортов/упоминаний
-    pass
