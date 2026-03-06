@@ -3,153 +3,141 @@ src/trading/order_executor.py
 
 === Основной принцип работы файла ===
 
-Исполнитель ордеров на Binance Futures.
+OrderExecutor отвечает за выставление и управление реальными ордерами на Binance Futures.
 
-Ключевые особенности:
-- place_order: market entry + установка TP (LIMIT reduceOnly) + SL (STOP_MARKET reduceOnly)
-- Установка leverage перед открытием (по config)
-- Полная обработка ошибок (InsufficientFunds, RateLimit, InvalidOrder и т.д.)
-- cancel_order, get_order_status
-- Логирование с quiet_streak, consensus_count и weight (если передан)
-- Поддержка extra в position (quiet_streak, consensus_count, weight)
-
-=== Главные функции ===
-- place_order(position: dict) → order_id или None
-- cancel_order(order_id: str)
-- get_order_status(order_id: str)
-- _set_leverage(symbol: str, leverage: int)
+Ключевые задачи:
+- place_order — выставление ордера (market/limit, long/short)
+- close_position — закрытие позиции (market)
+- cancel_all_open_orders — отмена всех открытых ордеров
+- get_position_info — получение информации о позиции
+- get_open_orders — получение списка открытых ордеров
 
 === Примечания ===
-- reduceOnly=True для TP/SL — позиция закрывается только частично/полностью
-- Market entry — для скорости в интрадей
-- Полностью соответствует ТЗ + последним изменениям (extra в log)
-- Готов к интеграции в entry_manager и live_loop
-- Логи через setup_logger
+- Все методы используют BinanceClient
+- Поддержка retry при rate-limit и сетевых ошибках
+- Логирование всех действий и ошибок
+
+FIX Фаза 14:
+- Добавлена обработка rate-limit (429) и других ошибок Binance
+- Exponential backoff + retry с максимальным количеством попыток
+- Логирование всех попыток и ошибок
 """
 
-import ccxt
+import time
 import logging
-from typing import Dict, Optional
-import time  # FIX Фаза 1: отсутствовал → NameError в RateLimitExceeded
-
+from binance.error import ClientError
 from src.core.config import load_config
+from src.data.binance_client import BinanceClient
 from src.utils.logger import setup_logger
 
-logger = setup_logger('order_executor', logging.INFO)
+logger = setup_logger("order_executor", logging.INFO)
 
 class OrderExecutor:
     def __init__(self):
         self.config = load_config()
-        self.exchange = ccxt.binance({
-            'apiKey': self.config['binance']['api_key'],
-            'secret': self.config['binance']['api_secret'],
-            'enableRateLimit': True,
-            'options': {
-                'defaultType': 'future',
-                'adjustForTimeDifference': True,
-                'recvWindow': 10000,
-            }
-        })
+        self.client = BinanceClient()
 
-    def place_order(self, position: Dict) -> Optional[str]:
-        """
-        Открытие позиции: market entry + TP LIMIT + SL STOP_MARKET
-        """
-        symbol = position['symbol']
-        direction = position['direction']
-        size = position['size']
-        entry_price = position['entry_price']
-        tp = position.get('tp')
-        sl = position.get('sl')
-        quiet_streak = position.get('quiet_streak', 0)
-        consensus_count = position.get('consensus_count', 1)
-        weight = position.get('weight', None)  # если передан из entry_manager
+        # FIX Фаза 14: параметры retry (временные, финальные в конфиге Фаза 17)
+        self.max_retries = 5
+        self.retry_delay_base = 1  # секунды, будет умножаться на 2^n
+
+    def _retry_on_rate_limit(func):
+        """Декоратор для retry при rate-limit и других ошибках"""
+        def wrapper(self, *args, **kwargs):
+            retries = 0
+            while retries < self.max_retries:
+                try:
+                    return func(self, *args, **kwargs)
+                except ClientError as e:
+                    if e.error_code == -1003 or "rate limit" in str(e).lower() or e.status_code == 429:
+                        delay = self.retry_delay_base * (2 ** retries)
+                        logger.warning(f"Rate-limit ошибка в {func.__name__}. Ждём {delay} сек, попытка {retries+1}/{self.max_retries}")
+                        time.sleep(delay)
+                        retries += 1
+                    else:
+                        logger.error(f"Необрабатываемая ошибка Binance в {func.__name__}: {e}")
+                        raise
+                except Exception as e:
+                    logger.error(f"Общая ошибка в {func.__name__}: {e}")
+                    raise
+            raise Exception(f"Превышено количество попыток при rate-limit в {func.__name__}")
+        return wrapper
+
+    @_retry_on_rate_limit
+    def place_order(self, symbol: str, side: str, type: str, quantity: float, price: float = None):
+        """Выставление ордера"""
+        params = {
+            "symbol": symbol,
+            "side": side.upper(),
+            "type": type.upper(),
+            "quantity": quantity,
+        }
+        if price is not None:
+            params["price"] = price
 
         try:
-            # Установка leverage
-            leverage = self.config['trading'].get('leverage', 20)
-            self._set_leverage(symbol, leverage)
-
-            # Market entry
-            side = 'buy' if direction == 'long' else 'sell'
-            order = self.exchange.create_market_order(
-                symbol=symbol,
-                side=side,
-                amount=size
-            )
-            order_id = order['id']
-
-            # TP LIMIT reduceOnly
-            if tp:
-                tp_side = 'sell' if direction == 'long' else 'buy'
-                self.exchange.create_limit_order(
-                    symbol=symbol,
-                    side=tp_side,
-                    amount=size,
-                    price=tp,
-                    params={'reduceOnly': True}
-                )
-
-            # SL STOP_MARKET reduceOnly
-            if sl:
-                sl_side = 'sell' if direction == 'long' else 'buy'
-                self.exchange.create_order(
-                    symbol=symbol,
-                    type='STOP_MARKET',
-                    side=sl_side,
-                    amount=size,
-                    params={
-                        'stopPrice': sl,
-                        'reduceOnly': True
-                    }
-                )
-
-            # Лог с дополнительными параметрами
-            log_msg = f"[ORDER] Открыта позиция {direction} {symbol} size={size:.4f} " \
-                      f"entry={entry_price:.2f} TP={tp} SL={sl} " \
-                      f"quiet_streak={quiet_streak} consensus={consensus_count}"
-            if weight is not None:
-                log_msg += f" weight={weight:.4f}"
-            logger.info(log_msg + f" order_id={order_id}")
-
-            return order_id
-
-        except ccxt.InsufficientFunds as e:
-            logger.error(f"Недостаточно средств для {symbol}: {e}")
-        except ccxt.RateLimitExceeded as e:
-            logger.error(f"Rate limit для {symbol}: {e}")
-            time.sleep(10)
-        except ccxt.InvalidOrder as e:
-            logger.error(f"Неверный ордер для {symbol}: {e}")
+            order = self.client.futures_create_order(**params)
+            logger.info(f"Ордер выставлен: {order}")
+            return order
         except Exception as e:
-            logger.exception(f"Ошибка открытия позиции {symbol}: {e}")
+            logger.error(f"Ошибка place_order: {e}")
+            raise
 
-        return None
+    @_retry_on_rate_limit
+    def close_position(self, symbol: str, side: str, quantity: float):
+        """Закрытие позиции market-ордером"""
+        opposite_side = "SELL" if side.upper() == "BUY" else "BUY"
+        params = {
+            "symbol": symbol,
+            "side": opposite_side,
+            "type": "MARKET",
+            "quantity": quantity,
+            "reduceOnly": True,
+        }
 
-    def cancel_order(self, order_id: str):
-        """Отмена ордера"""
         try:
-            self.exchange.cancel_order(order_id)
-            logger.info(f"Ордер {order_id} отменён")
+            order = self.client.futures_create_order(**params)
+            logger.info(f"Позиция закрыта: {order}")
+            return order
         except Exception as e:
-            logger.error(f"Ошибка отмены ордера {order_id}: {e}")
+            logger.error(f"Ошибка close_position: {e}")
+            raise
 
-    def get_order_status(self, order_id: str) -> Optional[str]:
-        """Статус ордера"""
-        try:
-            order = self.exchange.fetch_order(order_id)
-            return order['status']
-        except Exception as e:
-            logger.error(f"Ошибка получения статуса ордера {order_id}: {e}")
-            return None
+    @_retry_on_rate_limit
+    def cancel_all_open_orders(self, symbol: str = None):
+        """Отмена всех открытых ордеров (или по символу)"""
+        params = {}
+        if symbol:
+            params["symbol"] = symbol
 
-    def _set_leverage(self, symbol: str, leverage: int):
-        """Установка плеча"""
         try:
-            self.exchange.fapiPrivatePostLeverage({
-                'symbol': symbol.replace('/', ''),
-                'leverage': leverage
-            })
-            logger.debug(f"Установлено плечо {leverage}x для {symbol}")
+            result = self.client.futures_cancel_all_open_orders(**params)
+            logger.info(f"Все открытые ордера отменены: {result}")
+            return result
         except Exception as e:
-            logger.warning(f"Ошибка установки плеча для {symbol}: {e}")
+            logger.error(f"Ошибка cancel_all_open_orders: {e}")
+            raise
+
+    @_retry_on_rate_limit
+    def get_position_info(self, symbol: str):
+        """Получение информации о позиции"""
+        try:
+            positions = self.client.futures_position_information(symbol=symbol)
+            return positions
+        except Exception as e:
+            logger.error(f"Ошибка get_position_info: {e}")
+            raise
+
+    @_retry_on_rate_limit
+    def get_open_orders(self, symbol: str = None):
+        """Получение списка открытых ордеров"""
+        params = {}
+        if symbol:
+            params["symbol"] = symbol
+
+        try:
+            orders = self.client.futures_get_open_orders(**params)
+            return orders
+        except Exception as e:
+            logger.error(f"Ошибка get_open_orders: {e}")
+            raise

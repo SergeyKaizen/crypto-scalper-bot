@@ -17,6 +17,9 @@ RiskManager — модуль управления рисками.
 - Размер позиции теперь считается строго по risk_pct без дополнительных множителей
 - Это снижает риск переоценки позиции в сильном режиме и делает расчёт более предсказуемым
 
+FIX Фаза 12:
+- Добавлена настройка min_equity_usdt
+- Если депозит <= min_equity_usdt — размер позиции = 0 (защита от слива)
 """
 
 import logging
@@ -37,8 +40,11 @@ class RiskManager:
         self.current_daily_loss = 0.0
         self.open_positions_count = 0
 
-        # FIX Фаза 9: размер позиции теперь задаётся в USDT, а не в монете
+        # FIX Фаза 9: размер позиции теперь в USDT
         self.min_position_size_usdt = self.config["trading"].get("min_position_size_usdt", 100.0)
+
+        # FIX Фаза 12: минимальный положительный депозит для торговли
+        self.min_equity_usdt = self.config["trading"].get("min_equity_usdt", 1000.0)
 
     def calculate_position_size(self, symbol: str, entry_price: float, sl_price: float) -> float:
         """
@@ -51,9 +57,17 @@ class RiskManager:
         FIX Фаза 9:
         - min_position_size теперь в USDT (абсолютная сумма риска)
         - size = risk_amount_usdt / (price_diff * entry_price)
+
+        FIX Фаза 12:
+        - Если депозит <= min_equity_usdt — возвращаем 0 (защита от слива)
         """
         if entry_price <= 0 or sl_price <= 0:
             logger.warning(f"Некорректные цены для {symbol}: entry={entry_price}, sl={sl_price}")
+            return 0.0
+
+        # FIX Фаза 12: защита депозита
+        if self.deposit <= self.min_equity_usdt:
+            logger.warning(f"Депозит {self.deposit:.2f} <= min_equity_usdt {self.min_equity_usdt:.2f} — новые позиции запрещены")
             return 0.0
 
         risk_amount_usdt = self.deposit * self.risk_pct
@@ -63,7 +77,7 @@ class RiskManager:
             logger.warning(f"SL = entry для {symbol} — размер позиции = 0")
             return 0.0
 
-        # FIX Фаза 9: USDT-based sizing
+        # Основной расчёт размера в монетах
         size = risk_amount_usdt / (price_diff * entry_price)
 
         # Применяем минимальный размер в USDT
@@ -79,7 +93,11 @@ class RiskManager:
         return size
 
     def can_open_new_position(self) -> bool:
-        """Можно ли открыть новую позицию (по лимиту открытых)"""
+        """Можно ли открыть новую позицию (по лимиту открытых и депозиту)"""
+        if self.deposit <= self.min_equity_usdt:
+            logger.warning(f"Депозит {self.deposit:.2f} <= min_equity_usdt {self.min_equity_usdt:.2f} — новые позиции запрещены")
+            return False
+
         if self.current_daily_loss <= -self.deposit * self.daily_loss_limit:
             logger.warning(f"Достигнут дневной лимит убытка — новые позиции запрещены: {self.current_daily_loss:.2f} / {self.deposit * self.daily_loss_limit:.2f}")
             return False
@@ -93,6 +111,9 @@ class RiskManager:
         """Обновление депозита после закрытия позиции"""
         self.deposit += pnl
         self.current_daily_loss += pnl if pnl < 0 else 0
+
+        if self.deposit <= self.min_equity_usdt:
+            logger.warning(f"Депозит упал до {self.deposit:.2f} <= min_equity_usdt — торговля остановлена")
 
         if self.current_daily_loss <= -self.deposit * self.daily_loss_limit:
             logger.warning(f"Достигнут дневной лимит убытка: {self.current_daily_loss:.2f} / {self.deposit * self.daily_loss_limit:.2f}")

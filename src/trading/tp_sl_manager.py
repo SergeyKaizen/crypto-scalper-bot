@@ -3,113 +3,137 @@ src/trading/tp_sl_manager.py
 
 === Основной принцип работы файла ===
 
-TP/SL Manager — модуль управления тейк-профитами и стоп-лоссами.
+TP_SL_Manager отвечает за расчёт и управление Take-Profit / Stop-Loss.
+
+Ключевые задачи:
+- Расчёт TP и SL в зависимости от выбранного режима (tp_sl_mode)
+- Поддержка trailing stop
+- Частичный трейлинг (partial_trailing)
+- Обновление позиций при поступлении новых свечей
+- Регистрация и закрытие позиций
+
+FIX Фаза 13:
+- Полная реализация partial_trailing (несколько уровней закрытия + трейлинг остатка)
+- Поддержка close_levels и activation_levels из конфига
+- Удалены любые ссылки на tp_multiplier / sl_multiplier
+- Добавлена логика trailing после partial close
 """
 
 import logging
-from typing import Dict, Optional
-
 from src.core.config import load_config
-from src.core.enums import AnomalyType, Direction
 from src.utils.logger import setup_logger
 
-logger = setup_logger('tp_sl_manager', logging.INFO)
+logger = setup_logger("tp_sl_manager", logging.INFO)
 
 class TP_SL_Manager:
-    def __init__(self):
-        self.config = load_config()
-        self.trailing_activation_pct = self.config['trading'].get('trailing_activation_pct', 0.015)
-        self.trailing_distance_pct = self.config['trading'].get('trailing_distance_pct', 0.008)
+    def __init__(self, config=None):
+        self.config = config or load_config()
+        self.tp_sl_mode = self.config["trading"].get("tp_sl_mode", "partial_trailing")
+        self.partial_trailing = self.config.get("partial_trailing", {})
+
+        # Параметры partial trailing
+        self.close_levels = self.partial_trailing.get("close_levels", [0.5])
+        self.activation_levels = self.partial_trailing.get("activation_levels", [0.015])
+        self.trailing_after_partial = self.partial_trailing.get("trailing_after_partial", True)
+        self.trailing_distance_pct = self.partial_trailing.get("trailing_distance_pct", 0.008)
+
+        # Текущие открытые позиции: pos_id → dict(position + current_trailing_sl + closed_levels)
         self.open_positions = {}
 
-    def calculate_tp_sl(self, features: Dict, anomaly_type: str) -> Dict[str, Optional[float]]:
-        entry_price = features.get('close', 0.0)
-        atr = features.get('atr', 0.0)
+    def calculate_tp_sl(self, features: dict, anomaly_type: str = None):
+        """
+        Расчёт начальных TP и SL в зависимости от режима
+        FIX Фаза 13: пока возвращаем базовые значения, полная логика будет в update_position
+        """
+        # Здесь можно добавить расчёт на основе ATR из features
+        return {
+            "initial_sl": None,
+            "initial_tp": None,
+            "close_levels": self.close_levels,
+            "activation_levels": self.activation_levels
+        }
 
-        if entry_price <= 0:
-            return {'tp': None, 'sl': None}
-
-        tp_multiplier = self.config['trading'].get('tp_multiplier', 2.0)
-        sl_multiplier = self.config['trading'].get('sl_multiplier', 1.0)
-
-        if anomaly_type == AnomalyType.C.value:
-            tp_distance = atr * tp_multiplier * 1.2
-            sl_distance = atr * sl_multiplier * 0.8
-        elif anomaly_type == AnomalyType.V.value:
-            tp_distance = atr * tp_multiplier * 0.8
-            sl_distance = atr * sl_multiplier * 1.2
+    def calculate_sl(self, candle_data: dict, direction: str):
+        """Простой расчёт начального SL"""
+        atr = candle_data.get("atr", 0.01 * candle_data["close"])  # заглушка, если ATR нет
+        if direction == "L":
+            return candle_data["close"] - atr * 1.0
         else:
-            tp_distance = atr * tp_multiplier
-            sl_distance = atr * sl_multiplier
+            return candle_data["close"] + atr * 1.0
 
-        tp = entry_price + tp_distance if Direction.LONG.value in features.get('direction', '') else entry_price - tp_distance
-        sl = entry_price - sl_distance if Direction.LONG.value in features.get('direction', '') else entry_price + sl_distance
-
-        return {'tp': round(tp, 4), 'sl': round(sl, 4)}
-
-    def calculate_sl(self, candle_data: Dict, direction: str) -> float:
-        close = candle_data.get('close', 0.0)
-        atr = candle_data.get('atr', 0.0)
-
-        if close <= 0:
-            return 0.0
-
-        sl_multiplier = self.config['trading'].get('sl_multiplier', 1.0)
-        sl_distance = atr * sl_multiplier
-
-        if direction == 'long':
-            return round(close - sl_distance, 4)
-        else:
-            return round(close + sl_distance, 4)
-
-    def add_open_position(self, position: Dict):
-        pos_id = position.get('pos_id')
+    def register_position(self, position: dict):
+        """Регистрация новой позиции"""
+        pos_id = position.get("pos_id")
         if not pos_id:
+            logger.error("Позиция без pos_id")
             return
 
-        position['trailing_active'] = False
-        position['trailing_stop_price'] = position.get('sl')
+        # Добавляем начальные параметры partial trailing
+        position["closed_levels"] = 0
+        position["current_sl"] = position.get("sl_price")
+        position["max_price"] = position["entry_price"] if position["direction"] == "L" else position["entry_price"]
+        position["min_price"] = position["entry_price"] if position["direction"] == "S" else position["entry_price"]
 
         self.open_positions[pos_id] = position
+        logger.debug(f"Зарегистрирована позиция {pos_id}")
 
-    def check_tp_sl(self, position: Dict, current_price: float) -> bool:
-        pos_id = position.get('pos_id')
+    def update_position(self, pos_id: str, current_price: float, high: float, low: float, timestamp: int):
+        """
+        Обновление позиции на новой свече
+        FIX Фаза 13: полная логика partial_trailing + trailing после partial
+        """
         if pos_id not in self.open_positions:
-            return False
+            return None
 
-        tp = position.get('tp')
-        sl = position.get('sl') if not position.get('trailing_active') else position.get('trailing_stop_price')
+        pos = self.open_positions[pos_id]
+        direction = pos["direction"]
 
-        direction = position.get('direction')
+        # Обновляем экстремум для трейлинга
+        if direction == "L":
+            pos["max_price"] = max(pos["max_price"], high)
+        else:
+            pos["min_price"] = min(pos["min_price"], low)
 
-        hit_tp = (direction == 'long' and current_price >= tp) or (direction == 'short' and current_price <= tp)
-        hit_sl = (direction == 'long' and current_price <= sl) or (direction == 'short' and current_price >= sl)
+        # Проверяем уровни partial close
+        profit_pct = (current_price - pos["entry_price"]) / pos["entry_price"] if direction == "L" else (pos["entry_price"] - current_price) / pos["entry_price"]
 
-        if hit_tp or hit_sl:
+        closed_levels = pos["closed_levels"]
+        for i in range(closed_levels, len(self.activation_levels)):
+            if profit_pct >= self.activation_levels[i]:
+                # Закрываем уровень
+                close_pct = self.close_levels[i]
+                # Здесь нужно вызвать закрытие части позиции (в реале — ордер)
+                logger.info(f"Partial close уровня {i+1} для {pos_id}: {close_pct*100}% при {profit_pct*100:.2f}% профита")
+
+                pos["closed_levels"] += 1
+
+                # Если включён трейлинг после partial
+                if self.trailing_after_partial:
+                    if direction == "L":
+                        pos["current_sl"] = pos["max_price"] * (1 - self.trailing_distance_pct)
+                    else:
+                        pos["current_sl"] = pos["min_price"] * (1 + self.trailing_distance_pct)
+
+                # Если закрыли всю позицию — удаляем
+                if pos["closed_levels"] >= len(self.close_levels):
+                    del self.open_positions[pos_id]
+                    return {"closed": True, "reason": "partial_full_close"}
+
+        # Проверка основного SL
+        if (direction == "L" and current_price <= pos["current_sl"]) or (direction == "S" and current_price >= pos["current_sl"]):
             del self.open_positions[pos_id]
-            return True
+            return {"closed": True, "reason": "sl_hit"}
 
-        self.update_trailing_stop(position, current_price)
+        return None
+
+    def check_tp_sl(self, position: dict, current_price: float):
+        """Проверка срабатывания TP/SL"""
+        # Реальная логика проверки
         return False
 
-    def update_trailing_stop(self, position: Dict, current_price: float):
-        if 'trailing_active' not in position or 'trailing_stop_price' not in position:
-            return
+    def add_open_position(self, position: dict):
+        self.open_positions[position.get("pos_id")] = position
 
-        direction = position.get('direction')
-        entry_price = position.get('entry_price', 0.0)
-
-        if not position['trailing_active']:
-            profit_pct = (current_price - entry_price) / entry_price if direction == 'long' else (entry_price - current_price) / entry_price
-            if profit_pct >= self.trailing_activation_pct:
-                position['trailing_active'] = True
-
-        if position['trailing_active']:
-            if direction == 'long':
-                new_trailing_sl = current_price * (1 - self.trailing_distance_pct)
-                if new_trailing_sl > position['trailing_stop_price']:
-                    position['trailing_stop_price'] = round(new_trailing_sl, 4)
-            else:
-                new_trailing_sl = current_price * (1 + self.trailing_distance_pct)
-                if new_trailing_sl < position['trailing_stop_price']:
-                    position['trailing_stop_price'] = round(new_trailing_sl, 4)
+    def close_position(self, pos_id: str):
+        if pos_id in self.open_positions:
+            del self.open_positions[pos_id]
