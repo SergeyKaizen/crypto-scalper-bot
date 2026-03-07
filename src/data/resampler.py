@@ -16,9 +16,9 @@ from collections import deque
 import polars as pl
 from typing import Dict, Optional
 from src.core.config import load_config
-from src.utils.logger import get_logger
+from src.utils.logger import setup_logger   # FIX: приведено к единому стилю проекта
 
-logger = get_logger(__name__)
+logger = setup_logger(__name__)
 
 class Resampler:
     def __init__(self, config: dict):
@@ -28,10 +28,10 @@ class Resampler:
         self.timeframes = ["1m", "3m", "5m", "10m", "15m"]
 
         # Максимальное количество свечей в памяти для каждого TF
-        hardware = config["hardware_mode"]
-        if hardware == "server":
-            self.max_cache_per_tf = 5000  # ~3–4 дня на 1m — комфортно
-        else:  # colab или любой другой → fallback на colab
+        hardware = config.get("hardware", {})  # FIX: ключ "hardware" из bot_config.yaml
+        if hardware.get("profile") == "server":
+            self.max_cache_per_tf = 5000
+        else:
             self.max_cache_per_tf = 2000
 
         # Кэш: {tf: deque[pl.DataFrame]} — последние свечи в памяти

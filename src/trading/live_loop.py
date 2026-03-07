@@ -4,33 +4,6 @@ src/trading/live_loop.py
 === Основной принцип работы файла ===
 
 Бесконечный цикл реальной/виртуальной торговли на Binance Futures.
-
-Ключевые задачи (по ТЗ + последние уточнения):
-- Докачка новых свечей по всем TF
-- Сбор признаков по всем TF и окнам
-- Детекция аномалий + мульти-TF consensus
-- Сбор всех потенциальных сигналов в свече
-- Выбор top-1 по весу из scenario_tracker (самый большой вес)
-- Открытие только 1 позиции (глобальный lock: нет открытой на монете)
-- Остальные сигналы — виртуальные для PR
-- Запрет новой позиции в свече после закрытия предыдущей
-- Retrain модели каждую неделю отдельно по каждому TF
-- Ежедневное обновление списка монет (auto delisted remove)
-- Graceful shutdown на сигналы
-
-=== Главные функции ===
-- live_loop() — основной цикл
-- process_candle(symbol, timeframe) — сбор сигналов → выбор top-1 → открытие
-- handle_closed_position(position) — PR и депозит update
-- shutdown() — закрытие позиций
-
-=== Примечания ===
-- Только 1 позиция в live: top-1 по весу + глобальный lock
-- Если несколько сигналов — остальные виртуальные
-- retrain: last_retrain[tf] → проверка timedelta(days=7)
-- quiet_streak: теперь берётся только из anomaly_detector (дублирование удалено в Фазе 2)
-- consensus: только для младших TF требуют подтверждения старших
-- polling fallback (WS можно добавить позже)
 """
 
 import time
@@ -60,10 +33,9 @@ from src.utils.logger import setup_logger
 
 logger = setup_logger('live_loop', logging.INFO)
 
-# State
+open_positions = defaultdict(list)
+last_retrain = {}
 last_markets_update = None
-open_positions = defaultdict(list)  # symbol → list[positions]
-last_retrain = {}  # tf → datetime последнего retrain
 
 
 def signal_handler(sig, frame):
@@ -73,40 +45,24 @@ def signal_handler(sig, frame):
 
 
 def shutdown():
-    """Graceful shutdown: закрываем все открытые позиции и логируем"""
     logger.info("Graceful shutdown запущен...")
-
     closed_count = 0
     for symbol, positions in list(open_positions.items()):
-        for pos in positions[:]:  # копия списка
+        for pos in positions[:]:
             try:
                 OrderExecutor.close_position(pos)
                 closed_count += 1
-                logger.info(f"Закрыта позиция {symbol} ({pos.get('direction', 'unknown')}) при остановке бота")
             except Exception as e:
                 logger.error(f"Ошибка закрытия позиции {symbol}: {e}")
-
-    if closed_count > 0:
-        logger.info(f"Закрыто {closed_count} позиций при shutdown")
-    else:
-        logger.info("Открытых позиций не было")
-
-    try:
-        OrderExecutor.cancel_all_open_orders()
-        logger.info("Все открытые ордера отменены")
-    except AttributeError:
-        logger.debug("Метод cancel_all_open_orders не реализован в OrderExecutor")
-    except Exception as e:
-        logger.error(f"Ошибка отмены ордеров при shutdown: {e}")
-
-    logger.info("Бот остановлен. Shutdown завершён.")
+    logger.info(f"Закрыто {closed_count} позиций при shutdown")
+    logger.info("Бот остановлен.")
 
 
 def live_loop():
     config = load_config()
     client = BinanceClient()
     storage = Storage()
-    inference = InferenceEngine()
+    inference = InferenceEngine(config)  # FIX: передаём config
     trainer = Trainer()
     scenario_tracker = ScenarioTracker()
     entry_manager = EntryManager(scenario_tracker)
@@ -132,20 +88,17 @@ def live_loop():
 
     while True:
         try:
-            # 1. Ежедневное обновление списка монет
             if (datetime.utcnow() - last_markets_update) > timedelta(days=1):
                 logger.info("Ежедневное обновление списка монет")
                 client.update_markets_list()
                 last_markets_update = datetime.utcnow()
                 symbols = storage.get_whitelisted_symbols()
 
-            # 2. Докачка новых свечей
             for symbol in symbols:
                 for tf in timeframes:
                     download_new_candles(symbol, tf)
                     time.sleep(0.1)
 
-            # 3. Еженедельный retrain per-TF
             now = datetime.utcnow()
             for tf in timeframes:
                 if (now - last_retrain[tf]) > timedelta(days=config.get('retrain_interval_days', 7)):
@@ -153,7 +106,6 @@ def live_loop():
                     trainer.retrain(timeframe=tf)
                     last_retrain[tf] = now
 
-            # 4. Обработка новых свечей
             with concurrent.futures.ThreadPoolExecutor(max_workers=config['hardware']['max_workers']) as executor:
                 futures = []
                 for symbol in symbols:
@@ -171,7 +123,7 @@ def live_loop():
                     except Exception as e:
                         logger.error(f"Ошибка обработки свечи: {e}")
 
-            time.sleep(60)  # основной цикл ~1m
+            time.sleep(60)
 
         except Exception as e:
             logger.exception("Критическая ошибка в live_loop")
@@ -182,16 +134,6 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
                    scenario_tracker: ScenarioTracker, entry_manager: EntryManager, 
                    tp_sl_manager: TP_SL_Manager, risk_manager: RiskManager, 
                    order_executor: OrderExecutor, virtual_trader, pr_calculator, config: dict):
-    """
-    Обработка новой свечи:
-    - Сбор признаков по всем TF
-    - Детекция аномалий + consensus
-    - Сбор всех potential сигналов в свече
-    - Выбор top-1 по весу (самый большой вес)
-    - Открытие только этой позиции (если проходит проверки)
-    - Остальные — виртуальные для PR
-    """
-    # FIX Фаза 7 + Фаза 2: реальные данные из storage
     last_candle = storage.get_last_candle(symbol, timeframe)
     candle_data = last_candle if last_candle else {'close': 0.0, 'timestamp': int(time.time() * 1000)}
     candle_ts = candle_data.get('timestamp', int(time.time() * 1000))
@@ -214,19 +156,16 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
             continue
 
         anomaly_type = anom['type']
-        # FIX Фаза 2: quiet_streak теперь берётся только из anomaly_detector (дублирование полностью удалено)
-        quiet_streak = anom.get('quiet_streak', 0)
+        features_input = features_by_tf[timeframe][window]
+        prob_long, prob_short, uncertainty = inference.predict(features_input)
 
-        predict_prob = inference.predict(
-            features_by_tf[timeframe][window],
-            anomaly_type,
-            extra_features={'quiet_streak': quiet_streak}
-        )
+        wl = storage.get_whitelist_settings(symbol)
+        direction = wl.get('direction', 'L')
+        predict_prob = prob_long if direction == 'L' else prob_short
 
         if predict_prob < config['trading'].get('min_prob', 0.65):
             continue
 
-        wl = storage.get_whitelist_settings(symbol)
         if not wl or wl.get('tf') != timeframe or wl.get('anomaly_type') != anomaly_type:
             if virtual_trader:
                 tp_sl = tp_sl_manager.calculate_tp_sl(features_by_tf[timeframe][window])
@@ -241,7 +180,6 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
             'window': window,
             'feats': feats,
             'prob': predict_prob,
-            'quiet_streak': quiet_streak,
             'weight': weight
         })
 
@@ -252,10 +190,22 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
         anomaly_type = top_sig['anom']['type']
         direction = wl.get('direction', 'L')
 
-        sl_price = tp_sl_manager.calculate_sl(candle_data, direction)
+        # FIX: получаем TP и SL из существующего метода (для новой формулы sizing)
+        tp_sl = tp_sl_manager.calculate_tp_sl(features_by_tf[timeframe][window], anomaly_type)
+        if isinstance(tp_sl, dict):
+            tp_price = tp_sl.get('tp') or tp_sl.get('tp_price', 0)
+            sl_price = tp_sl.get('sl') or tp_sl.get('sl_price', 0)
+        elif isinstance(tp_sl, (list, tuple)) and len(tp_sl) >= 2:
+            tp_price = tp_sl[0]
+            sl_price = tp_sl[1]
+        else:
+            tp_price = candle_data['close'] * (1.02 if direction == 'L' else 0.98)
+            sl_price = tp_sl_manager.calculate_sl(candle_data, direction)
+
         size = risk_manager.calculate_position_size(
             symbol=symbol,
             entry_price=candle_data['close'],
+            tp_price=tp_price,
             sl_price=sl_price
         )
 
@@ -270,7 +220,6 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
             'size': size,
             'open_ts': candle_ts,
             'prob': top_sig['prob'],
-            'quiet_streak': top_sig['quiet_streak'],
             'consensus_count': top_sig['anom'].get('consensus_count', 1)
         }
 
@@ -279,13 +228,14 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
             order_id = order_executor.place_order(position)
             if order_id:
                 position['order_id'] = order_id
-                logger.info(f"Открыта реальная позиция {anomaly_type} {direction} на {symbol}, size={size}, weight={top_sig['weight']:.4f}")
+                logger.info(f"Открыта реальная позиция {anomaly_type} {direction} на {symbol}, size={size}")
         else:
             if virtual_trader:
                 virtual_trader.open_position(position)
-                logger.debug(f"Открыта виртуальная позиция {anomaly_type} {direction} на {symbol}, size={size}, weight={top_sig['weight']:.4f}")
+                logger.debug(f"Открыта виртуальная позиция {anomaly_type} {direction} на {symbol}, size={size}")
 
         tp_sl_manager.add_open_position(position)
+        open_positions[symbol].append(position)  # FIX: теперь список заполняется
 
         for sig in signals[1:]:
             if virtual_trader:
@@ -294,7 +244,6 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
                     tp_sl_manager.calculate_tp_sl(sig['feats'], sig['anom']['type'])
                 )
 
-    # Мониторинг открытых позиций
     if symbol in open_positions:
         for pos in open_positions[symbol][:]:
             current_price = storage.get_last_candle(symbol, timeframe).get('close', 0)

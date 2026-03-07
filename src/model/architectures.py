@@ -30,6 +30,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from src.core.config import load_config
+from src.core.enums import Direction  # унификация L/S
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,6 @@ class ConvBranch(nn.Module):
         x = F.relu(self.bn2(self.conv2(x)))
         x = self.pool(x).squeeze(-1)  # (batch, hidden_size)
         return x
-
 
 class HybridMultiTFConvGRU(nn.Module):
     def __init__(self, n_features: int, num_tf: int = 5, seq_len: int = 100,
@@ -85,7 +85,7 @@ class HybridMultiTFConvGRU(nn.Module):
 
         # Bidirectional GRU
         self.gru = nn.GRU(
-            input_size=hidden_size * 2 + cluster_embedding_dim,  # + embedding dim
+            input_size=hidden_size * 2 + cluster_embedding_dim,
             hidden_size=hidden_size,
             num_layers=gru_layers,
             batch_first=True,
@@ -111,31 +111,26 @@ class HybridMultiTFConvGRU(nn.Module):
         for i, branch in enumerate(self.conv_branches):
             branch_outputs.append(branch(inputs[i]))
 
-        fused = torch.cat(branch_outputs, dim=1)  # (batch, hidden_size * num_tf)
+        fused = torch.cat(branch_outputs, dim=1)
 
-        fused = F.relu(self.bn_fusion(self.fusion_dense(fused)))  # (batch, hidden_size * 2)
+        fused = F.relu(self.bn_fusion(self.fusion_dense(fused)))
 
-        # Добавляем embedding кластера
-        cluster_emb = self.cluster_emb(cluster_id.long())  # (batch, embedding_dim)
-        fused = torch.cat([fused, cluster_emb], dim=1)  # (batch, hidden_size * 2 + embedding_dim)
+        cluster_emb = self.cluster_emb(cluster_id.long())
+        fused = torch.cat([fused, cluster_emb], dim=1)
 
-        fused = fused.unsqueeze(1)  # (batch, 1, hidden_size * 2 + embedding_dim)
+        fused = fused.unsqueeze(1)
 
         gru_out, _ = self.gru(fused)
-        gru_out = gru_out[:, -1, :]  # last hidden (batch, hidden_size * 2)
+        gru_out = gru_out[:, -1, :]
 
         out = self.dropout(gru_out)
 
-        prob = torch.sigmoid(self.fc_binary(out))             # да/нет (0-1)
-        expected_profit = self.fc_regression(out)             # ожидаемый профит (linear)
+        prob = torch.sigmoid(self.fc_binary(out))
+        expected_profit = self.fc_regression(out)
 
         return prob, expected_profit
 
-
 def build_model(config):
-    """
-    Фабрика модели под текущий config
-    """
     n_features = config.get('n_features', 128)
     seq_len = config.get('seq_len', 100)
     num_tf = len(config['timeframes'])
@@ -158,7 +153,7 @@ def build_model(config):
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
-    model.eval()  # inference mode
+    model.eval()
 
     logger.info(f"Модель построена: {model_size}, TF: {num_tf}, features: {n_features}, seq_len: {seq_len}, clusters: {num_clusters}")
     return model

@@ -24,15 +24,16 @@ except ImportError:
     ENGINE = "sqlite"
 
 from src.core.config import load_config
+from src.core.constants import DATA_DIR, MODELS_DIR
 from src.utils.logger import setup_logger
 
 logger = setup_logger("storage", logging.INFO)
 
 class Storage:
     def __init__(self):
-        config = load_config()
-        self.data_dir = config["paths"]["data_dir"]
-        self.models_dir = config["paths"].get("models_dir", os.path.join(self.data_dir, "models"))
+        # FIX: используем константы (paths в bot_config.yaml больше нет)
+        self.data_dir = DATA_DIR
+        self.models_dir = MODELS_DIR
         os.makedirs(self.data_dir, exist_ok=True)
         os.makedirs(self.models_dir, exist_ok=True)
 
@@ -47,6 +48,7 @@ class Storage:
 
         self._create_tables()
 
+    # ... (весь остальной код файла без изменений — _create_tables, save_candles, get_last_timestamp и т.д. до конца)
     def _create_tables(self):
         """Создаёт необходимые таблицы, если их нет"""
         timeframes = load_config()["timeframes"]
@@ -256,7 +258,6 @@ class Storage:
             self.con.execute("DELETE FROM whitelist")
         self.con.commit()
 
-    # ======================== ФИКСЫ ФАЗЫ 1 ========================
     def get_candles(self, symbol: str, timeframe: str, start_ts: int = None, end_ts: int = None) -> pd.DataFrame:
         """FIX Фаза 1: реальный запрос к БД"""
         table_name = f"candles_{timeframe.replace('m', '')}m"

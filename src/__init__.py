@@ -42,28 +42,29 @@ from .data.downloader import download_full_history, download_new_candles
 from .data.storage import Storage
 
 # Features
-from .features.feature_engine import prepare_sequence_features
-from .features.anomaly_detector import detect_anomalies
-from .features.channels import anomalous_surge_channel_feature, calculate_value_area
+from .features.feature_engine import FeatureEngine
+from .features.anomaly_detector import AnomalyDetector
+from .features.channels import calculate_value_area
 
 # Model
-from .model.architectures import MultiWindowHybrid
+from .model.architectures import HybridMultiTFConvGRU, build_model
 from .model.trainer import Trainer
-from .model.inference import Inference
+from .model.inference import InferenceEngine
 from .model.scenario_tracker import ScenarioTracker
 
 # Backtest
 from .backtest.engine import BacktestEngine
 from .backtest.pr_calculator import PRCalculator
 
-# Trading
-from .trading.live_loop import LiveLoop
+# Trading (фикс имён после всех групп)
+from .trading.live_loop import live_loop
 from .trading.entry_manager import EntryManager
-from .trading.tp_sl_manager import TPSLManager
+from .trading.tp_sl_manager import TP_SL_Manager
 from .trading.virtual_trader import VirtualTrader
 from .trading.order_executor import OrderExecutor
 from .trading.risk_manager import RiskManager
-from .trading.websocket_manager import WebsocketManager
+from .trading.position_manager import PositionManager   # ← добавлен
+from .trading.websocket_manager import WebSocketManager
 
 # Utils
 from .utils.logger import setup_logger
@@ -77,7 +78,6 @@ def init():
     """Автоматическая инициализация пакета при первом импорте."""
     logger = setup_logger('src_init')
     logger.info(f"Пакет src успешно инициализирован (версия {__version__})")
-
 
 # Выполняем инициализацию при импорте пакета
 init()

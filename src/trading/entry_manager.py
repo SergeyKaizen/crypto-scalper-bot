@@ -4,19 +4,6 @@ src/trading/entry_manager.py
 === Основной принцип работы файла ===
 
 Менеджер открытия позиций в live-режиме.
-
-Ключевые особенности (по ТЗ + улучшения):
-- Только 1 позиция на монету (глобальный lock через position_manager)
-- Если несколько сигналов в свече — выбирается top-1 по весу из scenario_tracker
-- Остальные сигналы — виртуальные для PR и статистики
-- Запрет новой позиции в свече, где предыдущая закрылась (через candle_close_flags)
-- Открытие через централизованный PositionManager
-- Проверка whitelist, min_prob/min_prob_q, no open по типу
-- Рассчёт размера через risk_manager, открытие через order_executor/virtual_trader
-
-FIX Фаза 10:
-- Полностью удалены старые best_anomaly, best_direction, best_window
-- Переход на чистую динамическую логику top-1 по весу
 """
 
 from typing import List, Dict
@@ -51,16 +38,9 @@ class EntryManager:
         candle_data: Dict,
         candle_ts: int
     ):
-        """
-        Обработка всех сигналов в свече:
-        - Выбор top-1 по весу из scenario_tracker
-        - Открытие только этой позиции через position_manager
-        - Остальные — виртуальные для PR
-        """
         if not signals:
             return
 
-        # FIX Фаза 10: динамический выбор top-1 по весу
         scored_signals = []
         for sig in signals:
             feats = sig.get('feats', {})
@@ -78,17 +58,20 @@ class EntryManager:
         anomaly_type = top_sig['anom']['type']
         direction = self._resolve_direction(top_sig['feats'])
         prob = top_sig.get('prob', 0.0)
-        quiet_streak = top_sig.get('quiet_streak', 0)
 
         if not self._can_open_position(symbol, anomaly_type, candle_ts):
             for sig, _ in scored_signals[1:]:
                 self._open_virtual_position(symbol, sig)
             return
 
-        sl_price = self.tp_sl_manager.calculate_sl(candle_data, direction)
+        tp_sl = self.tp_sl_manager.calculate_tp_sl(top_sig.get('feats', {}), anomaly_type)
+        tp_price = tp_sl.get('tp', candle_data['close'] * 1.02 if direction == 'L' else candle_data['close'] * 0.98)
+        sl_price = tp_sl.get('sl', self.tp_sl_manager.calculate_sl(candle_data, direction))
+
         size = self.risk_manager.calculate_position_size(
             symbol=symbol,
             entry_price=candle_data['close'],
+            tp_price=tp_price,
             sl_price=sl_price
         )
 
@@ -105,10 +88,11 @@ class EntryManager:
             'size': size,
             'open_ts': candle_ts,
             'prob': prob,
-            'quiet_streak': quiet_streak,
             'consensus_count': top_sig['anom'].get('consensus_count', 1),
             'feats': top_sig.get('feats', {}),
-            'mode': self._resolve_mode(symbol, anomaly_type, direction)
+            'mode': self._resolve_mode(symbol, anomaly_type, direction),
+            'tp': tp_price,
+            'sl': sl_price
         }
 
         success = self.position_manager.open_position(position_data)

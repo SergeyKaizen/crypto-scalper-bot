@@ -11,15 +11,6 @@ RiskManager — модуль управления рисками.
 - проверку максимального количества открытых позиций
 - контроль leverage (max 50x)
 - обновление депозита после закрытия позиции
-
-Изменения Этапа 2 (пункт 4):
-- Убрано любое умножение размера позиции на коэффициент режима (regime_factor, regime_strength и т.п.)
-- Размер позиции теперь считается строго по risk_pct без дополнительных множителей
-- Это снижает риск переоценки позиции в сильном режиме и делает расчёт более предсказуемым
-
-FIX Фаза 12:
-- Добавлена настройка min_equity_usdt
-- Если депозит <= min_equity_usdt — размер позиции = 0 (защита от слива)
 """
 
 import logging
@@ -40,64 +31,41 @@ class RiskManager:
         self.current_daily_loss = 0.0
         self.open_positions_count = 0
 
-        # FIX Фаза 9: размер позиции теперь в USDT
-        self.min_position_size_usdt = self.config["trading"].get("min_position_size_usdt", 100.0)
-
-        # FIX Фаза 12: минимальный положительный депозит для торговли
-        self.min_equity_usdt = self.config["trading"].get("min_equity_usdt", 1000.0)
-
-    def calculate_position_size(self, symbol: str, entry_price: float, sl_price: float) -> float:
+    def calculate_position_size(self, symbol: str, entry_price: float, tp_price: float, sl_price: float) -> float:
         """
-        Расчёт размера позиции.
-
-        Изменения по пункту 4:
-        - Убрано любое умножение на regime_factor / regime_strength
-        - Чистый расчёт: size = (deposit * risk_pct) / |entry - sl|
-
-        FIX Фаза 9:
-        - min_position_size теперь в USDT (абсолютная сумма риска)
-        - size = risk_amount_usdt / (price_diff * entry_price)
-
-        FIX Фаза 12:
-        - Если депозит <= min_equity_usdt — возвращаем 0 (защита от слива)
+        Расчёт размера позиции строго по ТЗ:
+        RR = TP/SL
+        Risk_BTC = RR
+        risk_usdt = deposit * RR
+        size_coins = risk_usdt / sl_pct
+        Чем длиннее SL — тем меньше объём
+        Плечо — только лимит
         """
-        if entry_price <= 0 or sl_price <= 0:
-            logger.warning(f"Некорректные цены для {symbol}: entry={entry_price}, sl={sl_price}")
+        if entry_price <= 0 or sl_price <= 0 or tp_price <= 0:
+            logger.warning(f"Некорректные цены для {symbol}: entry={entry_price}, tp={tp_price}, sl={sl_price}")
             return 0.0
 
-        # FIX Фаза 12: защита депозита
-        if self.deposit <= self.min_equity_usdt:
-            logger.warning(f"Депозит {self.deposit:.2f} <= min_equity_usdt {self.min_equity_usdt:.2f} — новые позиции запрещены")
-            return 0.0
-
-        risk_amount_usdt = self.deposit * self.risk_pct
-        price_diff = abs(entry_price - sl_price)
-
-        if price_diff == 0:
+        sl_pct = abs(entry_price - sl_price) / entry_price
+        if sl_pct == 0:
             logger.warning(f"SL = entry для {symbol} — размер позиции = 0")
             return 0.0
 
-        # Основной расчёт размера в монетах
-        size = risk_amount_usdt / (price_diff * entry_price)
+        tp_pct = abs(tp_price - entry_price) / entry_price
+        rr_ratio = tp_pct / sl_pct
+        risk_pct = rr_ratio
+        risk_usdt = self.deposit * risk_pct
 
-        # Применяем минимальный размер в USDT
-        min_size_coins = self.min_position_size_usdt / entry_price
-        size = max(min_size_coins, size)
+        position_value_usdt = risk_usdt / sl_pct
+        size_coins = position_value_usdt / entry_price
 
-        # Учёт максимального leverage
-        max_size_by_leverage = (self.deposit * self.max_leverage) / entry_price
-        size = min(size, max_size_by_leverage)
+        size_coins = min(size_coins, (self.deposit * self.max_leverage) / entry_price)
 
-        logger.debug(f"Размер позиции для {symbol}: {size:.6f} монет (риск {risk_amount_usdt:.2f} USDT, расстояние до SL {price_diff:.6f})")
+        logger.debug(f"Размер позиции для {symbol}: {size_coins:.6f} монет (RR={rr_ratio:.2f}, риск {risk_usdt:.2f} USDT, SL {sl_pct*100:.2f}%)")
 
-        return size
+        return size_coins
 
     def can_open_new_position(self) -> bool:
-        """Можно ли открыть новую позицию (по лимиту открытых и депозиту)"""
-        if self.deposit <= self.min_equity_usdt:
-            logger.warning(f"Депозит {self.deposit:.2f} <= min_equity_usdt {self.min_equity_usdt:.2f} — новые позиции запрещены")
-            return False
-
+        """Можно ли открыть новую позицию (по лимиту открытых)"""
         if self.current_daily_loss <= -self.deposit * self.daily_loss_limit:
             logger.warning(f"Достигнут дневной лимит убытка — новые позиции запрещены: {self.current_daily_loss:.2f} / {self.deposit * self.daily_loss_limit:.2f}")
             return False
@@ -111,9 +79,6 @@ class RiskManager:
         """Обновление депозита после закрытия позиции"""
         self.deposit += pnl
         self.current_daily_loss += pnl if pnl < 0 else 0
-
-        if self.deposit <= self.min_equity_usdt:
-            logger.warning(f"Депозит упал до {self.deposit:.2f} <= min_equity_usdt — торговля остановлена")
 
         if self.current_daily_loss <= -self.deposit * self.daily_loss_limit:
             logger.warning(f"Достигнут дневной лимит убытка: {self.current_daily_loss:.2f} / {self.deposit * self.daily_loss_limit:.2f}")

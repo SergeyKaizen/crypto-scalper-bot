@@ -9,86 +9,34 @@
 4. Для каждой монеты скачивает полную историю 1m свечей от даты листинга
 5. Догоняет live-свечи, если история уже есть
 6. Учитывает лимиты железа (max_history_candles из конфига)
-7. Работает асинхронно (asyncio) + retry при ошибках
-8. Поддерживает разные профили (phone_tiny / colab / server)
+7. Работает с функциями из downloader.py
 
 Запуск:
-    python scripts/download_full.py --hardware phone_tiny
-    python scripts/download_full.py --hardware server
-
-Рекомендуется запускать:
-- раз в сутки на сервере (обновление списка + догон новых свечей)
-- один раз при первом запуске на телефоне/colab
+    python scripts/download_full.py
+    python scripts/download_full.py --new-only
 """
 
-import asyncio
-import logging
-from datetime import datetime
-from typing import List
-
-import polars as pl
-
+import argparse
 from src.core.config import load_config
-from src.data.downloader import Downloader
-from src.data.storage import Storage
+from src.data.downloader import download_full_history, run_download
 from src.utils.logger import setup_logger
 
-setup_logger()  # Инициализация глобального логгера
-logger = logging.getLogger(__name__)
+logger = setup_logger("download_full", logging.INFO)
 
-
-async def main():
-    config = load_config(hardware_profile=args.hardware)  # ← ФИКС: передаём hardware_profile
-    downloader = Downloader(config)
-    storage = Storage(config)
-
-    logger.info("=== Начало полной загрузки данных ===")
-    logger.info("Hardware profile: %s", config.get("hardware_profile", "auto"))
-    logger.info("Max coins: %d, Max history candles: %d", 
-                config["max_coins"], config["data"]["max_history_candles"])
-
-    # 1. Обновляем список монет
-    logger.info("Обновление списка фьючерсных монет...")
-    current_coins = await downloader.update_markets_list()
-
-    # 2. Фильтруем только те, что разрешены в конфиге
-    allowed_coins = current_coins[:config["max_coins"]]
-    logger.info("Будет обработано монет: %d (из %d доступных)", len(allowed_coins), len(current_coins))
-
-    # 3. Скачиваем полную историю для каждой монеты
-    for symbol in allowed_coins:
-        logger.info("Обработка %s...", symbol)
-
-        # Проверяем, есть ли уже данные
-        last_ts = await storage.get_last_timestamp(symbol, "1m")
-        if last_ts:
-            logger.info("  Уже есть данные до %s, догоняем live...", datetime.fromtimestamp(last_ts / 1000))
-            await downloader.fetch_new_candles(symbol, "1m")
-        else:
-            logger.info("  Полная история отсутствует → скачиваем с листинга")
-            await downloader.download_full_history(symbol, "1m")
-
-        # Опционально — resample на higher TF
-        if config["data"]["resample_higher_tf"]:
-            logger.info("  Resampling на higher TF для %s...", symbol)
-            for tf in config["timeframes"][1:]:  # кроме 1m
-                await downloader.resampler.resample(symbol, tf)
-
-    logger.info("=== Полная загрузка данных завершена ===")
-    logger.info("Монет в базе: %d", len(await storage.get_current_coins()))
-
-    await downloader.close()
-    await storage.close()
-
-
-if __name__ == "__main__":
-    # Поддержка аргументов (можно расширить argparse)
-    import sys
-    import argparse
-
+def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--hardware", default="phone_tiny", choices=["phone_tiny", "colab", "server"])
+    parser.add_argument("--new-only", action="store_true", help="Только докачать новые свечи (live-режим)")
     args = parser.parse_args()
 
-    config = load_config(hardware_profile=args.hardware)  # ← ФИКС: используем argparse
-    asyncio.run(main())
+    config = load_config()
+    logger.info(f"=== Запуск скачивания данных (hardware: {config.get('hardware', {}).get('profile', 'default')}) ===")
+
+    if args.new_only:
+        run_download(new_only=True)
+    else:
+        download_full_history()
+
+    logger.info("=== Скачивание завершено ===")
+
+if __name__ == "__main__":
+    main()

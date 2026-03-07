@@ -4,23 +4,6 @@ src/trading/order_executor.py
 === Основной принцип работы файла ===
 
 OrderExecutor отвечает за выставление и управление реальными ордерами на Binance Futures.
-
-Ключевые задачи:
-- place_order — выставление ордера (market/limit, long/short)
-- close_position — закрытие позиции (market)
-- cancel_all_open_orders — отмена всех открытых ордеров
-- get_position_info — получение информации о позиции
-- get_open_orders — получение списка открытых ордеров
-
-=== Примечания ===
-- Все методы используют BinanceClient
-- Поддержка retry при rate-limit и сетевых ошибках
-- Логирование всех действий и ошибок
-
-FIX Фаза 14:
-- Добавлена обработка rate-limit (429) и других ошибок Binance
-- Exponential backoff + retry с максимальным количеством попыток
-- Логирование всех попыток и ошибок
 """
 
 import time
@@ -36,13 +19,10 @@ class OrderExecutor:
     def __init__(self):
         self.config = load_config()
         self.client = BinanceClient()
-
-        # FIX Фаза 14: параметры retry (временные, финальные в конфиге Фаза 17)
         self.max_retries = 5
-        self.retry_delay_base = 1  # секунды, будет умножаться на 2^n
+        self.retry_delay_base = 1
 
     def _retry_on_rate_limit(func):
-        """Декоратор для retry при rate-limit и других ошибках"""
         def wrapper(self, *args, **kwargs):
             retries = 0
             while retries < self.max_retries:
@@ -64,34 +44,41 @@ class OrderExecutor:
         return wrapper
 
     @_retry_on_rate_limit
-    def place_order(self, symbol: str, side: str, type: str, quantity: float, price: float = None):
-        """Выставление ордера"""
+    def place_order(self, position: Dict):
+        """Выставление ордера (принимает position dict)"""
+        symbol = position['symbol']
+        direction = position['direction']
+        size = position['size']
+        side = "BUY" if direction == 'L' else "SELL"
+
         params = {
             "symbol": symbol,
-            "side": side.upper(),
-            "type": type.upper(),
-            "quantity": quantity,
+            "side": side,
+            "type": "MARKET",
+            "quantity": size,
         }
-        if price is not None:
-            params["price"] = price
 
         try:
             order = self.client.futures_create_order(**params)
             logger.info(f"Ордер выставлен: {order}")
-            return order
+            return order.get('orderId')
         except Exception as e:
             logger.error(f"Ошибка place_order: {e}")
             raise
 
     @_retry_on_rate_limit
-    def close_position(self, symbol: str, side: str, quantity: float):
+    def close_position(self, position: Dict):
         """Закрытие позиции market-ордером"""
-        opposite_side = "SELL" if side.upper() == "BUY" else "BUY"
+        symbol = position['symbol']
+        direction = position['direction']
+        size = position['size']
+        opposite_side = "SELL" if direction == 'L' else "BUY"
+
         params = {
             "symbol": symbol,
             "side": opposite_side,
             "type": "MARKET",
-            "quantity": quantity,
+            "quantity": size,
             "reduceOnly": True,
         }
 
@@ -105,7 +92,6 @@ class OrderExecutor:
 
     @_retry_on_rate_limit
     def cancel_all_open_orders(self, symbol: str = None):
-        """Отмена всех открытых ордеров (или по символу)"""
         params = {}
         if symbol:
             params["symbol"] = symbol
@@ -116,28 +102,4 @@ class OrderExecutor:
             return result
         except Exception as e:
             logger.error(f"Ошибка cancel_all_open_orders: {e}")
-            raise
-
-    @_retry_on_rate_limit
-    def get_position_info(self, symbol: str):
-        """Получение информации о позиции"""
-        try:
-            positions = self.client.futures_position_information(symbol=symbol)
-            return positions
-        except Exception as e:
-            logger.error(f"Ошибка get_position_info: {e}")
-            raise
-
-    @_retry_on_rate_limit
-    def get_open_orders(self, symbol: str = None):
-        """Получение списка открытых ордеров"""
-        params = {}
-        if symbol:
-            params["symbol"] = symbol
-
-        try:
-            orders = self.client.futures_get_open_orders(**params)
-            return orders
-        except Exception as e:
-            logger.error(f"Ошибка get_open_orders: {e}")
             raise

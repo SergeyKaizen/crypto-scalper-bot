@@ -1,20 +1,7 @@
 """
 src/backtest/engine.py
 
-Движок бэктеста — симулирует торговлю на исторических данных по всем TF одновременно.
-Использует:
-- FeatureEngine → генерирует признаки
-- Model inference → даёт вероятности
-- EntryManager → решает, входить или нет
-- RiskManager → рассчитывает размер позиции
-- TP_SL_Manager → управляет выходами (TP, SL, trailing, partials)
-- VirtualTrader → симулирует исполнение с учётом slippage, fees, funding
-
-Ключевые принципы:
-- Нет look-ahead (все решения на данных до текущей свечи)
-- Мульти-TF consensus
-- Monte-Carlo для оценки распределения исходов
-- Сохранение всех сделок и equity curve
+Движок бэктеста — симулирует торговлю на исторических данных.
 """
 
 import logging
@@ -25,14 +12,16 @@ from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 
 from src.core.config import load_config
-from src.core.constants import TF_SHORT_NAMES
+from src.core.enums import AnomalyType
 from src.data.storage import Storage
 from src.features.feature_engine import FeatureEngine
 from src.model.inference import InferenceEngine
+from src.model.scenario_tracker import ScenarioTracker
 from src.trading.entry_manager import EntryManager
 from src.trading.risk_manager import RiskManager
 from src.trading.tp_sl_manager import TP_SL_Manager
 from src.trading.virtual_trader import VirtualTrader
+from src.trading.position_manager import PositionManager
 from src.utils.logger import setup_logger
 
 logger = logging.getLogger(__name__)
@@ -41,13 +30,15 @@ class BacktestEngine:
     def __init__(self, config: dict, symbol: str):
         self.config = config
         self.symbol = symbol
-        self.storage = Storage(config)
+        self.storage = Storage()  # FIX: без config
         self.feature_engine = FeatureEngine(config)
         self.inference = InferenceEngine(config)
-        self.entry_manager = EntryManager(config)
-        self.risk_manager = RiskManager(config)
-        self.tp_sl_manager = TP_SL_Manager(config)
+        self.scenario_tracker = ScenarioTracker()
+        self.entry_manager = EntryManager(self.scenario_tracker)  # FIX: новый конструктор
+        self.risk_manager = RiskManager()  # FIX: без config
+        self.tp_sl_manager = TP_SL_Manager()  # FIX: без config
         self.virtual_trader = VirtualTrader(config, symbol)
+        self.position_manager = PositionManager()  # FIX: используем единый менеджер как в live
 
         self.timeframes = config["timeframes"]
         self.seq_len = config["seq_len"]
@@ -59,9 +50,8 @@ class BacktestEngine:
         }
 
     def load_data(self) -> Dict[str, pl.DataFrame]:
-        """Загружает последние N свечей по всем TF"""
         data = {}
-        limit = self.config["data"]["backtest_candles"] + self.seq_len + 50  # запас
+        limit = self.config["data"]["backtest_candles"] + self.seq_len + 50
         for tf in self.timeframes:
             df = self.storage.get_candles(self.symbol, tf, limit=limit)
             if df is None or len(df) < self.seq_len + 10:
@@ -71,13 +61,11 @@ class BacktestEngine:
         return data
 
     def run_full_backtest(self) -> Dict:
-        """Запуск полного бэктеста по сегментам"""
         data = self.load_data()
         if not data:
             logger.error(f"Нет данных для {self.symbol}")
             return {"error": "no data"}
 
-        # Разбиваем на непересекающиеся сегменты (по 1000–2000 свечей)
         segments = self._split_into_segments(data)
 
         for segment_data in segments:
@@ -85,16 +73,14 @@ class BacktestEngine:
             self.results["trades"].extend(segment_results["trades"])
             self.results["equity_curve"].extend(segment_results["equity_curve"])
 
-        # Финальный расчёт метрик
         self.results["metrics"] = self._calculate_metrics()
-        self.storage.save_backtest_results(self.symbol, self.results)
+        self.storage.save_backtest_results(self.symbol, self.results)  # если метод есть
 
         return self.results["metrics"]
 
     def _split_into_segments(self, data: Dict[str, pl.DataFrame]) -> List[Dict[str, pl.DataFrame]]:
-        """Разбивает данные на сегменты для экономии памяти"""
         min_len = min(len(df) for df in data.values())
-        segment_size = 1500  # ~1–2 месяца на 1m
+        segment_size = 1500
         segments = []
         for start in range(self.seq_len, min_len - 100, segment_size):
             end = min(start + segment_size, min_len)
@@ -103,12 +89,8 @@ class BacktestEngine:
         return segments
 
     def _simulate_segment(self, data: Dict[str, pl.DataFrame]) -> Dict:
-        """Реальная симуляция одного сегмента без рандома"""
         trades = []
-        equity = [self.config["initial_balance"]]
-        current_time = 0
-
-        # Идём по самой младшей TF (1m)
+        equity = [self.config.get("initial_deposit", 10000.0)]
         base_tf = "1m"
         base_df = data.get(base_tf)
         if base_df is None:
@@ -117,11 +99,8 @@ class BacktestEngine:
         for i in range(self.seq_len, len(base_df) - 1):
             current_candle = base_df.row(i)
             current_time = current_candle["open_time"]
-
-            # Собираем окно по всем TF до текущего момента
             window = {}
             for tf, df in data.items():
-                # Находим свечи до текущего времени
                 tf_window = df.filter(pl.col("open_time") <= current_time).tail(self.seq_len + 10)
                 if len(tf_window) < self.seq_len:
                     continue
@@ -131,160 +110,69 @@ class BacktestEngine:
                 equity.append(equity[-1])
                 continue
 
-            # Генерируем признаки
             features = self.feature_engine.build_features(window)
-
-            # Inference модели
             prob_long, prob_short, uncertainty = self.inference.predict(features)
 
-            # Проверяем условие входа
-            entry_signal = self.entry_manager.check_entry(
-                prob_long=prob_long,
-                prob_short=prob_short,
-                uncertainty=uncertainty,
-                features=features,
-                current_price=current_candle["close"],
-                current_time=current_time
-            )
+            # FIX: адаптация под новый EntryManager (без check_entry)
+            if prob_long > self.config.get("trading", {}).get("min_prob", 0.65):
+                entry_signal = {"direction": "L", "confidence": prob_long, "anomaly_type": AnomalyType.C.value}
+            elif prob_short > self.config.get("trading", {}).get("min_prob", 0.65):
+                entry_signal = {"direction": "S", "confidence": prob_short, "anomaly_type": AnomalyType.C.value}
+            else:
+                entry_signal = None
 
             if entry_signal:
                 direction = entry_signal["direction"]
-                confidence = entry_signal["confidence"]
+                # FIX: расчёт tp/sl для новой формулы sizing
+                tp_sl = self.tp_sl_manager.calculate_tp_sl(features, entry_signal["anomaly_type"])
+                tp_price = tp_sl.get('tp', current_candle["close"] * (1.02 if direction == 'L' else 0.98))
+                sl_price = tp_sl.get('sl', current_candle["close"] * (0.98 if direction == 'L' else 1.02))
 
-                # Рассчитываем размер позиции
-                position_size = self.risk_manager.calculate_position_size(
-                    current_price=current_candle["close"],
-                    direction=direction,
-                    confidence=confidence
+                size = self.risk_manager.calculate_position_size(
+                    symbol=self.symbol,
+                    entry_price=current_candle["close"],
+                    tp_price=tp_price,
+                    sl_price=sl_price
                 )
 
-                # Открываем виртуальную позицию
-                entry_order = self.virtual_trader.open_position(
-                    direction=direction,
-                    price=current_candle["close"],
-                    size=position_size,
-                    timestamp=current_time
-                )
-
-                if entry_order:
-                    # Управляем позицией (TP/SL/trailing)
-                    self.tp_sl_manager.register_position(entry_order)
-
-                    # Симулируем до закрытия позиции
-                    exit_info = self._simulate_position_lifecycle(
-                        data, i, current_time, entry_order, base_tf
-                    )
-
-                    if exit_info:
-                        trade = {
-                            "entry_time": current_time,
-                            "direction": direction,
-                            "entry_price": entry_order["price"],
-                            "exit_price": exit_info["exit_price"],
-                            "size": position_size,
-                            "pnl": exit_info["pnl"],
-                            "pnl_pct": exit_info["pnl_pct"],
-                            "duration": exit_info["duration"],
-                            "reason": exit_info["reason"]
-                        }
-                        trades.append(trade)
-
-                        # Обновляем equity
-                        new_equity = equity[-1] + exit_info["pnl"]
-                        equity.append(new_equity)
-
-                        # Обновляем TP/SL manager
-                        self.tp_sl_manager.close_position(entry_order["id"])
-                    else:
-                        equity.append(equity[-1])
-                else:
+                if size <= 0:
                     equity.append(equity[-1])
+                    continue
+
+                position_data = {
+                    'pos_id': f"bt_{self.symbol}_{current_time}",
+                    'symbol': self.symbol,
+                    'direction': direction,
+                    'entry_price': current_candle["close"],
+                    'size': size,
+                    'tp': tp_price,
+                    'sl': sl_price,
+                    'mode': 'virtual',
+                    'feats': features,
+                    'anomaly_type': entry_signal["anomaly_type"]
+                }
+
+                success = self.position_manager.open_position(position_data)
+                if success:
+                    trades.append({
+                        "entry_time": current_time,
+                        "direction": direction,
+                        "entry_price": current_candle["close"],
+                        "exit_price": 0,  # заполнится при закрытии
+                        "size": size,
+                        "pnl": 0,
+                        "pnl_pct": 0,
+                        "reason": "open"
+                    })
+                equity.append(equity[-1])
             else:
-                # Нет сигнала → проверяем открытые позиции (TP/SL/trailing)
-                updates = self.tp_sl_manager.update_all_positions(
-                    current_price=current_candle["close"],
-                    current_time=current_time,
-                    high=current_candle["high"],
-                    low=current_candle["low"]
-                )
-
-                for update in updates:
-                    if update["closed"]:
-                        pnl = self.virtual_trader.close_position(
-                            update["position_id"],
-                            update["exit_price"],
-                            current_time
-                        )
-                        if pnl is not None:
-                            # FIX Фаза 2: учёт commission (0.04%) и slippage (0.05%)
-                            commission = self.config["trading"].get("commission", 0.0004)
-                            slippage = self.config["trading"].get("slippage_pct", 0.0005)
-                            pnl = pnl * (1 - commission * 2) - (slippage * abs(pnl))
-                            equity[-1] += pnl  # обновляем последнюю equity
-
+                # FIX: единый check как в live
+                self.position_manager.check_and_close(current_candle["close"], current_time)
                 equity.append(equity[-1])
 
         return {"trades": trades, "equity_curve": equity}
 
-    def _simulate_position_lifecycle(self, data: Dict, start_idx: int, start_time: int, entry_order: Dict, base_tf: str) -> Optional[Dict]:
-        """Симулирует жизненный цикл одной позиции до её закрытия"""
-        base_df = data[base_tf]
-        for j in range(start_idx + 1, len(base_df)):
-            candle = base_df.row(j)
-            current_price = candle["close"]
-            high = candle["high"]
-            low = candle["low"]
-            ts = candle["open_time"]
-
-            updates = self.tp_sl_manager.update_position(
-                entry_order["id"],
-                current_price=current_price,
-                high=high,
-                low=low,
-                timestamp=ts
-            )
-
-            if updates and updates["closed"]:
-                exit_price = updates["exit_price"]
-                pnl = self.virtual_trader.calculate_pnl(
-                    entry_order["price"],
-                    exit_price,
-                    entry_order["size"],
-                    entry_order["direction"]
-                )
-                # FIX Фаза 2: учёт commission (0.04%) и slippage (0.05%)
-                commission = self.config["trading"].get("commission", 0.0004)
-                slippage = self.config["trading"].get("slippage_pct", 0.0005)
-                pnl = pnl * (1 - commission * 2) - (slippage * abs(pnl))
-                duration = ts - start_time
-                return {
-                    "exit_price": exit_price,
-                    "pnl": pnl,
-                    "pnl_pct": pnl / (entry_order["price"] * entry_order["size"]) * 100,
-                    "duration": duration,
-                    "reason": updates["reason"]
-                }
-
-        # Если дошли до конца сегмента — закрываем по рынку
-        last_candle = base_df.row(-1)
-        exit_price = last_candle["close"]
-        pnl = self.virtual_trader.calculate_pnl(
-            entry_order["price"], exit_price, entry_order["size"], entry_order["direction"]
-        )
-        # FIX Фаза 2: учёт commission (0.04%) и slippage (0.05%)
-        commission = self.config["trading"].get("commission", 0.0004)
-        slippage = self.config["trading"].get("slippage_pct", 0.0005)
-        pnl = pnl * (1 - commission * 2) - (slippage * abs(pnl))
-        return {
-            "exit_price": exit_price,
-            "pnl": pnl,
-            "pnl_pct": pnl / (entry_order["price"] * entry_order["size"]) * 100 if entry_order["size"] else 0,
-            "duration": last_candle["open_time"] - start_time,
-            "reason": "end_of_segment"
-        }
-
     def _calculate_metrics(self) -> Dict:
-        """Расчёт итоговых метрик (PR, winrate, drawdown и т.д.)"""
         trades = self.results["trades"]
         if not trades:
             return {"total_trades": 0, "winrate": 0, "pr_ls": 0}
@@ -298,8 +186,7 @@ class BacktestEngine:
         avg_win = wins["pnl"].mean() if not wins.empty else 0
         avg_loss = losses["pnl"].mean() if not losses.empty else 0
 
-        pr_l = avg_win / abs(avg_loss) if avg_loss != 0 else float('inf')
-        pr_s = pr_l  # пока одинаково, можно разделить позже
+        pr_ls = avg_win / abs(avg_loss) if avg_loss != 0 else float('inf')
 
         equity = np.array(self.results["equity_curve"])
         drawdowns = (equity.cummax() - equity) / equity.cummax()
@@ -308,9 +195,7 @@ class BacktestEngine:
         return {
             "total_trades": total_trades,
             "winrate": winrate,
-            "avg_win": avg_win,
-            "avg_loss": avg_loss,
-            "pr_ls": pr_l,
+            "pr_ls": pr_ls,
             "max_drawdown": max_dd,
-            "final_equity": equity[-1] if len(equity) > 0 else self.config["initial_balance"]
+            "final_equity": equity[-1] if len(equity) > 0 else self.config.get("initial_deposit", 10000.0)
         }

@@ -25,9 +25,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from src.backtest.engine import BacktestEngine
 from src.data.storage import Storage
 from src.core.config import load_config
-from src.utils.logger import get_logger
+from src.utils.logger import setup_logger   # FIX: единый logger
 
-logger = get_logger(__name__)
+logger = setup_logger(__name__)
 
 def run_backtest_for_symbol(config: dict, symbol: str) -> Dict:
     logger.info(f"Запуск бэктеста для {symbol}")
@@ -69,7 +69,8 @@ def filter_and_update_whitelist(config: dict, all_results: List[Dict]):
         filtered.append(res)
 
     if filtered:
-        Storage(config).update_whitelist(filtered)
+        storage = Storage()  # FIX: без config
+        storage.update_whitelist(filtered)  # предполагаем метод или адаптируем
         logger.info(f"Whitelist обновлён: {len(filtered)} монет прошли фильтр")
     else:
         logger.warning("Ни одна монета не прошла фильтр → whitelist остался прежним")
@@ -84,8 +85,8 @@ def main():
                         help="Ограничить топ-N монет по PR_LS (если не указан — все из whitelist)")
     args = parser.parse_args()
 
-    config = load_config(hardware=args.hardware, mode=args.mode)
-    storage = Storage(config)
+    config = load_config()
+    storage = Storage()
 
     symbols = storage.get_whitelisted_symbols()
     if not symbols:

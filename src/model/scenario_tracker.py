@@ -34,6 +34,7 @@ import logging
 
 from src.core.config import load_config
 from src.utils.logger import setup_logger
+from src.core.enums import Direction  # ← ФИКС: унификация Direction
 
 logger = setup_logger('scenario_tracker', logging.INFO)
 
@@ -130,6 +131,10 @@ class ScenarioTracker:
         # Новое: Regime separation (2 бинарных признака)
         states.append(feats.get('regime_bull_strength', 0))
         states.append(feats.get('regime_bear_strength', 0))
+
+        # ← ФИКС: унификация Direction (если есть в фичах)
+        direction = feats.get('direction', 'L')
+        states.append(1 if direction == Direction.LONG.value else 0)
 
         return tuple(states)
 

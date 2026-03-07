@@ -2,8 +2,8 @@
 """
 Центральное место всех структур данных проекта.
 Обновлено 14 февраля 2026:
-- Добавлено поле тайм-аута в Position
-- Уточнены типы для PR-обновления
+- Удалена вся логика длительности сделок (max_hold_time_ms)
+- Direction теперь строго L/S из enums (единственный источник правды)
 """
 
 from dataclasses import dataclass, field
@@ -13,20 +13,14 @@ from typing import Dict, List, Optional
 
 import polars as pl
 
-# FIX Фаза 7: Direction теперь импортируется из enums (единственный источник правды)
+# FIX: Direction теперь строго из enums (L/S)
 from .enums import Direction as EnumsDirection
+Direction = EnumsDirection  # унификация во всём проекте
 
 class AnomalyType(Enum):
     CANDLE = "C"
     VOLUME = "V"
     CANDLE_VOLUME = "CV"
-
-
-# FIX Фаза 7: Direction согласован с enums.py (используем "long"/"short")
-class Direction(Enum):
-    LONG = "long"
-    SHORT = "short"
-    FLAT = "F"
 
 
 @dataclass
@@ -82,8 +76,6 @@ class Position:
     sl_price: float
     anomaly_signal: AnomalySignal
     
-    # === НОВОЕ: тайм-аут ===
-    max_hold_time_ms: Optional[int] = None   # None = выключен (по умолчанию)
     is_real: bool = False
     order_id: Optional[str] = None
-    close_reason: Optional[str] = None       # "tp", "sl", "timeout"
+    close_reason: Optional[str] = None       # "tp", "sl"

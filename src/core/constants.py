@@ -1,26 +1,3 @@
-"""
-src/core/constants.py
-
-=== Основной принцип работы файла ===
-
-Этот файл содержит все константы проекта в одном месте.
-Он обеспечивает централизованное управление параметрами, которые используются 
-во всех модулях: периоды, пороги аномалий, размеры окон, лимиты, пути и т.д.
-
-=== Главные группы констант и за что отвечают ===
-
-- WINDOWS_SIZES: [24, 50, 74, 100] — окна анализа из ТЗ.
-- ANOMALY: lookback=25, percentile, dominance_threshold и т.д.
-- MODEL: seq_len, epochs, batch_size, hidden_size
-- BACKTEST: min_trades_for_pr, min_pr_threshold
-- RISK: default_risk_pct, leverage_max
-- PATHS: data_dir, logs_dir
-- DATABASE: db_type по hardware
-
-=== Примечания ===
-- Все значения по ТЗ или здравому смыслу для интрадей скальпинга.
-"""
-
 WINDOWS_SIZES = [24, 50, 74, 100]
 
 LOOKBACK_ANOMALY = 25
