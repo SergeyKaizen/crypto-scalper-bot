@@ -12,17 +12,17 @@ from datetime import datetime, timedelta
 import logging
 import signal
 import sys
-import asyncio  # ← добавлено для retrain
+import asyncio  # для retrain
 from collections import defaultdict
 
 from src.core.config import load_config
 from src.data.binance_client import BinanceClient
 from src.data.downloader import download_new_candles
 from src.data.storage import Storage
-from src.features.feature_engine import FeatureEngine  # ← исправлено
+from src.features.feature_engine import FeatureEngine  # ← правка 2
 from src.features.anomaly_detector import detect_anomalies
 from src.model.inference import InferenceEngine
-from src.model.trainer import retrain  # ← исправлено (функция из Group 2)
+from src.model.trainer import retrain  # ← правка 2
 from src.model.scenario_tracker import ScenarioTracker
 from src.trading.entry_manager import EntryManager
 from src.trading.order_executor import OrderExecutor
@@ -72,15 +72,6 @@ def live_loop():
     virtual_trader = VirtualTrader() if config.get('trading', {}).get('mode') == 'virtual' else None
     pr_calculator = PRCalculator()
 
-    # === Warm-up: 1000 свечей при старте (восстановлено) ===
-    logger.info("Warm-up: прогрев на 1000 свечах для понимания состояния рынка...")
-    symbols = storage.get_whitelisted_symbols()[:3]  # первые 3 для скорости
-    for symbol in symbols:
-        for tf in config['timeframes']:
-            df = storage.get_candles(symbol, tf, limit=1000)
-            if not df.empty:
-                _ = FeatureEngine(config).build_features({tf: df})  # просто прогоняем
-
     global last_markets_update
     last_markets_update = datetime.utcnow() - timedelta(days=8)
 
@@ -112,7 +103,7 @@ def live_loop():
             for tf in timeframes:
                 if (now - last_retrain[tf]) > timedelta(days=config.get('retrain_interval_days', 7)):
                     logger.info(f"Еженедельное переобучение модели для {tf}")
-                    asyncio.run(retrain(config, timeframe=tf))  # ← исправлено
+                    asyncio.run(retrain(config, timeframe=tf))  # ← правка 2
                     last_retrain[tf] = now
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=config['hardware']['max_workers']) as executor:
@@ -148,11 +139,11 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
     candle_ts = candle_data.get('timestamp', int(time.time() * 1000))
 
     features_by_tf = {}
-    feature_engine = FeatureEngine(config)  # ← создан один раз
+    feature_engine = FeatureEngine(config)  # ← правка 2
     for tf in config['timeframes']:
         df = storage.get_candles(symbol, tf, limit=config.get('seq_len', 100))
         if not df.empty:
-            features_by_tf[tf] = feature_engine.build_features({tf: df})  # ← исправлено
+            features_by_tf[tf] = feature_engine.build_features({tf: df})  # ← правка 2
 
     if not features_by_tf:
         return
@@ -179,7 +170,7 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
         if not wl or wl.get('tf') != timeframe or wl.get('anomaly_type') != anomaly_type:
             if virtual_trader:
                 tp_sl = tp_sl_manager.calculate_tp_sl(features_by_tf[timeframe][window])
-                virtual_trader.open_position(symbol, anomaly_type, predict_prob, tp_sl)  # ← исправлено
+                virtual_trader.open_position(symbol, anomaly_type, predict_prob, tp_sl)  # ← правка 2
             continue
 
         feats = features_by_tf[timeframe][window]
@@ -240,7 +231,7 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
                 logger.info(f"Открыта реальная позиция {anomaly_type} {direction} на {symbol}, size={size}")
         else:
             if virtual_trader:
-                virtual_trader.open_position(symbol, anomaly_type, position['prob'], tp_sl)  # ← исправлено
+                virtual_trader.open_position(symbol, anomaly_type, position['prob'], tp_sl)  # ← правка 2
                 logger.debug(f"Открыта виртуальная позиция {anomaly_type} {direction} на {symbol}, size={size}")
 
         tp_sl_manager.add_open_position(position)
@@ -251,7 +242,7 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
                 virtual_trader.open_position(
                     symbol, sig['anom']['type'], sig['prob'],
                     tp_sl_manager.calculate_tp_sl(sig['feats'], sig['anom']['type'])
-                )  # ← исправлено
+                )  # ← правка 2
 
     if symbol in open_positions:
         for pos in open_positions[symbol][:]:

@@ -19,7 +19,7 @@ import os
 import numpy as np
 
 from src.core.config import load_config
-from src.model.architectures import HybridMultiTFConvGRU, build_model  # ← исправлено
+from src.model.architectures import HybridMultiTFConvGRU, build_model  # ← правка 1
 from src.utils.logger import setup_logger
 
 setup_logger()
@@ -44,7 +44,7 @@ class InferenceEngine:
         """Загрузка обученной модели из чекпоинта"""
         checkpoint_path = "models/best_model.pth"
 
-        model = build_model(self.config).to(self.device)  # ← исправлено
+        model = build_model(self.config).to(self.device)  # ← правка 1
 
         try:
             model.load_state_dict(torch.load(checkpoint_path, map_location=self.device))
@@ -61,7 +61,7 @@ class InferenceEngine:
         ensemble_paths = self.config.get("ensemble_models", [])
         for path in ensemble_paths:
             if os.path.exists(path):
-                model = build_model(self.config).to(self.device)  # ← исправлено
+                model = build_model(self.config).to(self.device)  # ← правка 1
                 model.load_state_dict(torch.load(path, map_location=self.device))
                 model.eval()
                 self.ensemble_models.append(model)
@@ -71,22 +71,19 @@ class InferenceEngine:
 
     def _prepare_inputs(self, features: Dict[str, Any]):
         """Вспомогательный метод: dict → list[5 tensors] + cluster_id"""
-        timeframes = self.config['timeframes']  # порядок строго по config
+        timeframes = self.config['timeframes']
         sequences = []
         for tf in timeframes:
             tensor = features.get("sequences", {}).get(tf)
             if tensor is None:
                 raise ValueError(f"Missing sequence for timeframe {tf}")
             sequences.append(tensor.to(self.device))
-
-        cluster_id = torch.zeros(sequences[0].shape[0], dtype=torch.long, device=self.device)  # fallback=0
+        cluster_id = torch.zeros(sequences[0].shape[0], dtype=torch.long, device=self.device)  # fallback
         return sequences, cluster_id
 
     def predict(self, features: Dict[str, Any]) -> Tuple[float, float, float]:
         """
         Основной метод предсказания.
-        features: {"sequences": {tf: tensor}, "features": tensor}
-        Возвращает prob_long, prob_short, uncertainty
         """
         sequences, cluster_id = self._prepare_inputs(features)
 
@@ -94,7 +91,7 @@ class InferenceEngine:
         probs = []
         with torch.no_grad():
             for _ in range(self.mc_passes):
-                prob, _ = self.model(sequences, cluster_id)  # ← исправлено
+                prob, _ = self.model(sequences, cluster_id)  # ← правка 1
                 probs.append(prob.squeeze())
         probs = torch.stack(probs)
 
@@ -103,7 +100,7 @@ class InferenceEngine:
             for model in self.ensemble_models:
                 model.train()
                 for _ in range(self.mc_passes):
-                    prob, _ = model(sequences, cluster_id)  # ← исправлено
+                    prob, _ = model(sequences, cluster_id)  # ← правка 1
                     ensemble_probs.append(prob.squeeze())
             ensemble_probs = torch.stack(ensemble_probs)
             probs = torch.cat([probs, ensemble_probs], dim=0)
@@ -130,7 +127,7 @@ class InferenceEngine:
         sequences, cluster_id = self._prepare_inputs(features)
 
         with torch.no_grad():
-            prob, _ = self.model(sequences, cluster_id)  # ← исправлено
+            prob, _ = self.model(sequences, cluster_id)  # ← правка 1
         return prob.squeeze().item()
 
     def calibrate(self, prob: float) -> float:
