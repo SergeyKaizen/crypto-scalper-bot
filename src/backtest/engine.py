@@ -30,15 +30,15 @@ class BacktestEngine:
     def __init__(self, config: dict, symbol: str):
         self.config = config
         self.symbol = symbol
-        self.storage = Storage()  # FIX: без config
+        self.storage = Storage()
         self.feature_engine = FeatureEngine(config)
         self.inference = InferenceEngine(config)
         self.scenario_tracker = ScenarioTracker()
-        self.entry_manager = EntryManager(self.scenario_tracker)  # FIX: новый конструктор
-        self.risk_manager = RiskManager()  # FIX: без config
-        self.tp_sl_manager = TP_SL_Manager()  # FIX: без config
+        self.entry_manager = EntryManager(self.scenario_tracker)
+        self.risk_manager = RiskManager()
+        self.tp_sl_manager = TP_SL_Manager()
         self.virtual_trader = VirtualTrader(config, symbol)
-        self.position_manager = PositionManager()  # FIX: используем единый менеджер как в live
+        self.position_manager = PositionManager()
 
         self.timeframes = config["timeframes"]
         self.seq_len = config["seq_len"]
@@ -74,7 +74,7 @@ class BacktestEngine:
             self.results["equity_curve"].extend(segment_results["equity_curve"])
 
         self.results["metrics"] = self._calculate_metrics()
-        self.storage.save_backtest_results(self.symbol, self.results)  # если метод есть
+        self.storage.save_backtest_results(self.symbol, self.results)
 
         return self.results["metrics"]
 
@@ -113,7 +113,6 @@ class BacktestEngine:
             features = self.feature_engine.build_features(window)
             prob_long, prob_short, uncertainty = self.inference.predict(features)
 
-            # FIX: адаптация под новый EntryManager (без check_entry)
             if prob_long > self.config.get("trading", {}).get("min_prob", 0.65):
                 entry_signal = {"direction": "L", "confidence": prob_long, "anomaly_type": AnomalyType.C.value}
             elif prob_short > self.config.get("trading", {}).get("min_prob", 0.65):
@@ -123,7 +122,6 @@ class BacktestEngine:
 
             if entry_signal:
                 direction = entry_signal["direction"]
-                # FIX: расчёт tp/sl для новой формулы sizing
                 tp_sl = self.tp_sl_manager.calculate_tp_sl(features, entry_signal["anomaly_type"])
                 tp_price = tp_sl.get('tp', current_candle["close"] * (1.02 if direction == 'L' else 0.98))
                 sl_price = tp_sl.get('sl', current_candle["close"] * (0.98 if direction == 'L' else 1.02))
@@ -158,7 +156,7 @@ class BacktestEngine:
                         "entry_time": current_time,
                         "direction": direction,
                         "entry_price": current_candle["close"],
-                        "exit_price": 0,  # заполнится при закрытии
+                        "exit_price": 0,
                         "size": size,
                         "pnl": 0,
                         "pnl_pct": 0,
@@ -166,7 +164,6 @@ class BacktestEngine:
                     })
                 equity.append(equity[-1])
             else:
-                # FIX: единый check как в live
                 self.position_manager.check_and_close(current_candle["close"], current_time)
                 equity.append(equity[-1])
 

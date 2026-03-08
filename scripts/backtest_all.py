@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from src.backtest.engine import BacktestEngine
 from src.data.storage import Storage
 from src.core.config import load_config
-from src.utils.logger import setup_logger   # FIX: единый logger
+from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
@@ -69,8 +69,8 @@ def filter_and_update_whitelist(config: dict, all_results: List[Dict]):
         filtered.append(res)
 
     if filtered:
-        storage = Storage()  # FIX: без config
-        storage.update_whitelist(filtered)  # предполагаем метод или адаптируем
+        storage = Storage()
+        storage.add_to_whitelist(filtered)  # исправлено на существующий метод
         logger.info(f"Whitelist обновлён: {len(filtered)} монет прошли фильтр")
     else:
         logger.warning("Ни одна монета не прошла фильтр → whitelist остался прежним")

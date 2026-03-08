@@ -15,27 +15,19 @@ import pytest
 import pandas as pd
 from src.backtest.engine import BacktestEngine
 from src.backtest.pr_calculator import PRCalculator
+from src.core.config import load_config
+from src.data.storage import Storage
 
-def test_backtest_engine_basic(mock_config):
-    engine = BacktestEngine(mock_config)
+def test_backtest_engine_basic():
+    config = load_config()
+    engine = BacktestEngine(config, "BTCUSDT")  # ← исправлено (добавлен symbol)
     
-    df = pd.DataFrame({
-        "timestamp": pd.date_range("2025-01-01", periods=200, freq="1min"),
-        "open": [50000 + i*10 for i in range(200)],
-        "high": [50100 + i*10 for i in range(200)],
-        "low": [49900 + i*10 for i in range(200)],
-        "close": [50050 + i*10 for i in range(200)],
-        "volume": [1000] * 200,
-        "buy_volume": [600] * 200,
-    }).set_index("timestamp")
-
-    # FIX Фаза 5: обновлён вызов (учёт commission/slippage из Phase 3)
     result = engine.run_full_backtest()
     
     assert isinstance(result, dict)
     assert "total_trades" in result
-    assert "net_profit" in result
-    assert "win_rate" in result
+    assert "pr_ls" in result
+    assert "max_drawdown" in result
 
 def test_pr_calculator_update_and_stats():
     calc = PRCalculator()

@@ -11,18 +11,19 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, random_split, Dataset
 from tqdm import tqdm
 from datetime import datetime
+import polars as pl  # ← добавлено
 
 from src.core.config import load_config
 from src.data.downloader import Downloader
 from src.data.storage import Storage
 from src.features.feature_engine import FeatureEngine
-from src.model.architectures import MultiTFHybrid, TinyHybrid
+from src.model.architectures import HybridMultiTFConvGRU, build_model  # ← исправлено
 from src.utils.logger import setup_logger
 
 setup_logger()
 logger = logging.getLogger(__name__)
 
-class TradingDataset(Dataset):  # FIX: добавлен класс (был сломан импорт)
+class TradingDataset(Dataset):
     def __init__(self, sequences, agg_features, labels):
         self.sequences = sequences
         self.agg_features = agg_features
@@ -90,10 +91,7 @@ def train_model(config, sequences, agg_features, labels):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Обучение на {device}")
 
-    if config.get("use_tiny_model", False):
-        model = TinyHybrid(config).to(device)
-    else:
-        model = MultiTFHybrid(config).to(device)
+    model = build_model(config).to(device)  # ← исправлено
 
     optimizer = optim.AdamW(model.parameters(), lr=config["model"]["learning_rate"])
     criterion = nn.BCEWithLogitsLoss()
@@ -104,8 +102,14 @@ def train_model(config, sequences, agg_features, labels):
         total_loss = 0
         for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}"):
             optimizer.zero_grad()
-            prob, _ = model(batch["sequences"], batch["agg_features"])
-            loss = criterion(prob.squeeze(), batch["label"])
+
+            # Адаптация под новую forward (list[5 tensors] + cluster_id) — минимальный фикс совместимости
+            seq = batch["sequences"].to(device)
+            sequences_input = [seq.clone() for _ in range(len(config["timeframes"]))]  # fallback для всех TF
+            cluster_id = torch.zeros(seq.shape[0], dtype=torch.long, device=device)
+
+            prob, _ = model(sequences_input, cluster_id)  # ← исправлено
+            loss = criterion(prob.squeeze(), batch["label"].to(device))
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
@@ -115,9 +119,12 @@ def train_model(config, sequences, agg_features, labels):
         total = 0
         with torch.no_grad():
             for batch in val_loader:
-                prob, _ = model(batch["sequences"], batch["agg_features"])
+                seq = batch["sequences"].to(device)
+                sequences_input = [seq.clone() for _ in range(len(config["timeframes"]))]
+                cluster_id = torch.zeros(seq.shape[0], dtype=torch.long, device=device)
+                prob, _ = model(sequences_input, cluster_id)
                 pred = (prob.squeeze() > 0.5).float()
-                correct += (pred == batch["label"]).sum().item()
+                correct += (pred == batch["label"].to(device)).sum().item()
                 total += len(batch["label"])
         accuracy = correct / total if total > 0 else 0
         logger.info(f"Epoch {epoch+1}, Loss: {total_loss / len(train_loader):.4f}, Val Acc: {accuracy:.4f}")
@@ -125,6 +132,19 @@ def train_model(config, sequences, agg_features, labels):
     path = f"models/model_{config.get('hardware_profile', 'unknown')}_{datetime.now().strftime('%Y%m%d_%H%M')}.pth"
     torch.save(model.state_dict(), path)
     logger.info(f"Модель сохранена: {path}")
+
+# === Восстановленный метод retrain (еженедельный fine-tune) ===
+async def retrain(config, symbol: str = "BTCUSDT", timeframe: str = "1m"):
+    """Еженедельный fine-tune на свежих данных (вызов существующих функций)"""
+    logger.info(f"Запуск retrain (fine-tune) для {symbol} {timeframe}")
+    sequences, agg_features, labels = await prepare_dataset(config, symbol, timeframe)
+    if not sequences:
+        logger.error("Датасет пустой")
+        return
+    # Fine-tune — меньше эпох
+    config["model"]["epochs"] = max(5, config["model"]["epochs"] // 5)
+    train_model(config, sequences, agg_features, labels)
+    logger.info("Retrain завершён")
 
 async def main():
     args = parse_args()

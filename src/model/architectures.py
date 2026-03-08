@@ -29,6 +29,8 @@ src/model/architectures.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import logging  # ← добавлено для logger
+
 from src.core.config import load_config
 from src.core.enums import Direction  # унификация L/S
 

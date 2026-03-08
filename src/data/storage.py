@@ -2,14 +2,7 @@
 src/data/storage.py
 
 Хранилище всех свечных данных + метаданных монет.
-Используем DuckDB как основное решение (быстрее SQLite на больших объёмах, columnar, легко аналитика).
-Fallback — SQLite, если DuckDB по каким-то причинам недоступен.
-
-Основные таблицы:
-- candles_{timeframe}     — отдельная таблица на каждый таймфрейм (1m, 3m, 5m, 10m, 15m)
-- symbols_meta            — метаданные монет (listed_at, delisted, last_update, etc.)
-- whitelist               — текущий список торгуемых монет + их лучшие настройки (tf, window, anomaly_type, direction)
-
+Используем DuckDB как основное решение.
 """
 
 import os
@@ -31,7 +24,6 @@ logger = setup_logger("storage", logging.INFO)
 
 class Storage:
     def __init__(self):
-        # FIX: используем константы (paths в bot_config.yaml больше нет)
         self.data_dir = DATA_DIR
         self.models_dir = MODELS_DIR
         os.makedirs(self.data_dir, exist_ok=True)
@@ -44,15 +36,12 @@ class Storage:
         else:
             self.db_path = os.path.join(self.data_dir, "candles.sqlite")
             self.con = sqlite3.connect(self.db_path)
-            logger.warning("DuckDB не найден → используется SQLite (медленнее на больших данных)")
+            logger.warning("DuckDB не найден → используется SQLite")
 
         self._create_tables()
 
-    # ... (весь остальной код файла без изменений — _create_tables, save_candles, get_last_timestamp и т.д. до конца)
     def _create_tables(self):
-        """Создаёт необходимые таблицы, если их нет"""
         timeframes = load_config()["timeframes"]
-
         for tf in timeframes:
             table_name = f"candles_{tf.replace('m', '')}m"
             if ENGINE == "duckdb":
@@ -126,17 +115,13 @@ class Storage:
                     updated_at      TEXT
                 )
             """)
-
         self.con.commit()
 
     def save_candles(self, symbol: str, timeframe: str, df: pd.DataFrame, append: bool = True):
-        """Сохраняет или добавляет свечи в соответствующую таблицу"""
         if df.empty:
             return
-
         table_name = f"candles_{timeframe.replace('m', '')}m"
         df.columns = [c.upper() for c in df.columns]
-
         if ENGINE == "duckdb":
             if append:
                 self.con.execute(f"INSERT OR REPLACE INTO {table_name} SELECT * FROM df", {"df": df})
@@ -149,12 +134,10 @@ class Storage:
                 conn.execute(f"DELETE FROM {table_name} WHERE symbol = ?", (symbol,))
             df.to_sql(table_name, conn, if_exists="append", index=False)
             conn.close()
-
         self.con.commit()
         logger.debug(f"Сохранено {len(df)} свечей {symbol} {timeframe}")
 
     def get_last_timestamp(self, symbol: str, timeframe: str) -> int | None:
-        """Возвращает timestamp последней свечи"""
         table_name = f"candles_{timeframe.replace('m', '')}m"
         if ENGINE == "duckdb":
             row = self.con.execute(f"SELECT MAX(timestamp) FROM {table_name} WHERE symbol = ?", [symbol]).fetchone()
@@ -163,7 +146,6 @@ class Storage:
             cur.execute(f"SELECT MAX(timestamp) FROM {table_name} WHERE symbol = ?", (symbol,))
             row = cur.fetchone()
             cur.close()
-
         if row and row[0] is not None:
             if isinstance(row[0], str):
                 dt = datetime.fromisoformat(row[0])
@@ -173,7 +155,6 @@ class Storage:
         return None
 
     def get_all_symbols(self) -> list[str]:
-        """Возвращает список всех уникальных символов"""
         timeframes = load_config()["timeframes"]
         symbols = set()
         for tf in timeframes:
@@ -189,10 +170,8 @@ class Storage:
         return list(symbols)
 
     def remove_delisted(self, symbols: list[str]):
-        """Автоматически удаляет все данные по delisted символам"""
         if not symbols:
             return
-
         timeframes = load_config()["timeframes"]
         for symbol in symbols:
             for tf in timeframes:
@@ -201,28 +180,22 @@ class Storage:
                     self.con.execute(f"DELETE FROM {table} WHERE symbol = ?", [symbol])
                 else:
                     self.con.execute(f"DELETE FROM {table} WHERE symbol = ?", (symbol,))
-
             now = datetime.utcnow()
             if ENGINE == "duckdb":
                 self.con.execute("INSERT OR REPLACE INTO symbols_meta (symbol, delisted, last_update) VALUES (?, TRUE, ?)", [symbol, now])
             else:
                 self.con.execute("INSERT OR REPLACE INTO symbols_meta (symbol, delisted, last_update) VALUES (?, 1, ?)", (symbol, now.isoformat()))
-
             if ENGINE == "duckdb":
                 self.con.execute("DELETE FROM whitelist WHERE symbol = ?", [symbol])
             else:
                 self.con.execute("DELETE FROM whitelist WHERE symbol = ?", (symbol,))
-
             for file in os.listdir(self.models_dir):
                 if file.startswith(f"{symbol}_") and file.endswith('.pt'):
                     os.remove(os.path.join(self.models_dir, file))
-                    logger.info(f"Удалена модель {file} для {symbol}")
-
         self.con.commit()
         logger.info(f"Удалены данные по {len(symbols)} delisted монетам")
 
     def update_symbol_meta(self, symbol: str, listed_at: datetime = None, delisted: bool = False):
-        """Обновляет метаданные символа"""
         now = datetime.utcnow()
         if ENGINE == "duckdb":
             self.con.execute("INSERT OR REPLACE INTO symbols_meta (symbol, listed_at, delisted, last_update) VALUES (?, ?, ?, ?)", [symbol, listed_at, delisted, now])
@@ -231,7 +204,6 @@ class Storage:
         self.con.commit()
 
     def get_whitelisted_symbols(self) -> list[str]:
-        """Возвращает список торгуемых монет из whitelist"""
         if ENGINE == "duckdb":
             rows = self.con.execute("SELECT symbol FROM whitelist").fetchall()
         else:
@@ -241,17 +213,40 @@ class Storage:
             cur.close()
         return [r[0] for r in rows]
 
-    def add_to_whitelist(self, symbol: str, tf: str, window: int, anomaly_type: str, direction: str, pr_value: float):
-        """Добавляет/обновляет запись в whitelist"""
+    def add_to_whitelist(self, items):
+        """Поддержка как одного символа, так и списка (из backtest_all)"""
+        if isinstance(items, dict):
+            items = [items]
+        elif not isinstance(items, list):
+            items = [items]
+
         now = datetime.utcnow()
-        if ENGINE == "duckdb":
-            self.con.execute("INSERT OR REPLACE INTO whitelist (symbol, tf, window, anomaly_type, direction, pr_value, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)", [symbol, tf, window, anomaly_type, direction, pr_value, now])
-        else:
-            self.con.execute("INSERT OR REPLACE INTO whitelist (symbol, tf, window, anomaly_type, direction, pr_value, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (symbol, tf, window, anomaly_type, direction, pr_value, now.isoformat()))
+        for item in items:
+            if isinstance(item, dict):
+                symbol = item["symbol"]
+                tf = item.get("tf", "1m")
+                window = item.get("window", 100)
+                anomaly_type = item.get("anomaly_type", "C")
+                direction = item.get("direction", "L")
+                pr_value = item.get("pr_ls", item.get("pr_value", 0.0))
+            else:
+                symbol = item
+                tf = "1m"
+                window = 100
+                anomaly_type = "C"
+                direction = "L"
+                pr_value = 0.0
+
+            if ENGINE == "duckdb":
+                self.con.execute("INSERT OR REPLACE INTO whitelist (symbol, tf, window, anomaly_type, direction, pr_value, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                 [symbol, tf, window, anomaly_type, direction, pr_value, now])
+            else:
+                self.con.execute("INSERT OR REPLACE INTO whitelist (symbol, tf, window, anomaly_type, direction, pr_value, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                 (symbol, tf, window, anomaly_type, direction, pr_value, now.isoformat()))
         self.con.commit()
+        logger.info(f"Добавлено/обновлено {len(items)} записей в whitelist")
 
     def clear_whitelist(self):
-        """Очищает whitelist"""
         if ENGINE == "duckdb":
             self.con.execute("DELETE FROM whitelist")
         else:
@@ -259,7 +254,6 @@ class Storage:
         self.con.commit()
 
     def get_candles(self, symbol: str, timeframe: str, start_ts: int = None, end_ts: int = None) -> pd.DataFrame:
-        """FIX Фаза 1: реальный запрос к БД"""
         table_name = f"candles_{timeframe.replace('m', '')}m"
         query = f"SELECT * FROM {table_name} WHERE symbol = ?"
         params = [symbol]
@@ -276,7 +270,6 @@ class Storage:
         return df
 
     def get_whitelist_settings(self, symbol: str) -> dict:
-        """FIX Фаза 1: реальный запрос к БД (согласован с текущим bot_config.yaml)"""
         if ENGINE == "duckdb":
             row = self.con.execute("SELECT * FROM whitelist WHERE symbol = ?", [symbol]).fetchone()
         else:
@@ -295,7 +288,6 @@ class Storage:
         return {}
 
     def get_last_candle(self, symbol: str, timeframe: str) -> dict:
-        """FIX Фаза 1: реальный запрос к БД"""
         table_name = f"candles_{timeframe.replace('m', '')}m"
         if ENGINE == "duckdb":
             row = self.con.execute(f"SELECT * FROM {table_name} WHERE symbol = ? ORDER BY timestamp DESC LIMIT 1", [symbol]).fetchone()

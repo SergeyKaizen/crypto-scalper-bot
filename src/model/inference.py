@@ -19,7 +19,7 @@ import os
 import numpy as np
 
 from src.core.config import load_config
-from src.model.architectures import MultiTFHybrid, TinyHybrid
+from src.model.architectures import HybridMultiTFConvGRU, build_model  # ← исправлено
 from src.utils.logger import setup_logger
 
 setup_logger()
@@ -43,10 +43,8 @@ class InferenceEngine:
     def _load_model(self):
         """Загрузка обученной модели из чекпоинта"""
         checkpoint_path = "models/best_model.pth"
-        if self.config.get("use_tiny_model", False):
-            model = TinyHybrid(self.config).to(self.device)
-        else:
-            model = MultiTFHybrid(self.config).to(self.device)
+
+        model = build_model(self.config).to(self.device)  # ← исправлено
 
         try:
             model.load_state_dict(torch.load(checkpoint_path, map_location=self.device))
@@ -63,7 +61,7 @@ class InferenceEngine:
         ensemble_paths = self.config.get("ensemble_models", [])
         for path in ensemble_paths:
             if os.path.exists(path):
-                model = self._load_model()
+                model = build_model(self.config).to(self.device)  # ← исправлено
                 model.load_state_dict(torch.load(path, map_location=self.device))
                 model.eval()
                 self.ensemble_models.append(model)
@@ -71,22 +69,32 @@ class InferenceEngine:
         if self.ensemble_models:
             logger.info(f"Ensemble enabled: {len(self.ensemble_models)} models")
 
+    def _prepare_inputs(self, features: Dict[str, Any]):
+        """Вспомогательный метод: dict → list[5 tensors] + cluster_id"""
+        timeframes = self.config['timeframes']  # порядок строго по config
+        sequences = []
+        for tf in timeframes:
+            tensor = features.get("sequences", {}).get(tf)
+            if tensor is None:
+                raise ValueError(f"Missing sequence for timeframe {tf}")
+            sequences.append(tensor.to(self.device))
+
+        cluster_id = torch.zeros(sequences[0].shape[0], dtype=torch.long, device=self.device)  # fallback=0
+        return sequences, cluster_id
+
     def predict(self, features: Dict[str, Any]) -> Tuple[float, float, float]:
         """
         Основной метод предсказания.
         features: {"sequences": {tf: tensor}, "features": tensor}
         Возвращает prob_long, prob_short, uncertainty
         """
-        sequences = {tf: t.to(self.device) for tf, t in features.get("sequences", {}).items()}
-        agg_features = features.get("features")
-        if agg_features is not None:
-            agg_features = agg_features.to(self.device)
+        sequences, cluster_id = self._prepare_inputs(features)
 
         self.model.train()
         probs = []
         with torch.no_grad():
             for _ in range(self.mc_passes):
-                prob, _ = self.model(sequences, agg_features)
+                prob, _ = self.model(sequences, cluster_id)  # ← исправлено
                 probs.append(prob.squeeze())
         probs = torch.stack(probs)
 
@@ -95,7 +103,7 @@ class InferenceEngine:
             for model in self.ensemble_models:
                 model.train()
                 for _ in range(self.mc_passes):
-                    prob, _ = model(sequences, agg_features)
+                    prob, _ = model(sequences, cluster_id)  # ← исправлено
                     ensemble_probs.append(prob.squeeze())
             ensemble_probs = torch.stack(ensemble_probs)
             probs = torch.cat([probs, ensemble_probs], dim=0)
@@ -103,12 +111,8 @@ class InferenceEngine:
         mean_prob = probs.mean(dim=0)
         uncertainty = probs.std(dim=0).mean().item()
 
-        if mean_prob.shape[0] > 1:
-            prob_long = mean_prob[0].item()
-            prob_short = mean_prob[1].item()
-        else:
-            prob_long = mean_prob.item()
-            prob_short = 1.0 - prob_long
+        prob_long = mean_prob.item()
+        prob_short = 1.0 - prob_long
 
         if self.calibration_enabled:
             prob_long = self._calibrate(prob_long)
@@ -123,13 +127,10 @@ class InferenceEngine:
 
     def predict_single(self, features: Dict[str, Any]) -> float:
         self.model.eval()
-        sequences = {tf: t.to(self.device) for tf, t in features.get("sequences", {}).items()}
-        agg_features = features.get("features")
-        if agg_features is not None:
-            agg_features = agg_features.to(self.device)
+        sequences, cluster_id = self._prepare_inputs(features)
 
         with torch.no_grad():
-            prob, _ = self.model(sequences, agg_features)
+            prob, _ = self.model(sequences, cluster_id)  # ← исправлено
         return prob.squeeze().item()
 
     def calibrate(self, prob: float) -> float:

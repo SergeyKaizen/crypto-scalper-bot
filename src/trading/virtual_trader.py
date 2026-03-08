@@ -8,6 +8,7 @@ src/trading/virtual_trader.py
 
 import logging
 import uuid
+import time  # ← добавлено для timestamp
 from typing import Dict, Optional, List
 
 from src.core.config import load_config
