@@ -101,8 +101,8 @@ class FeatureEngine:
         price_min = df["low"].min()
         price_max = df["high"].max()
         price_range = price_max - price_min
-        vah = poc + 0.35 * price_range
-        val = poc - 0.35 * price_range
+        vah = poc + 0.30 * price_range  # ← строго 60%
+        val = poc - 0.30 * price_range
 
         return {"VAH": vah, "VAL": val, "POC": poc}
 

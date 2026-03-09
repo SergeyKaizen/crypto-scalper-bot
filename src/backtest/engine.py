@@ -164,7 +164,16 @@ class BacktestEngine:
                     })
                 equity.append(equity[-1])
             else:
-                self.position_manager.check_and_close(current_candle["close"], current_time)
+                # Закрытие позиций в бэктесте (исправлено)
+                closed = self.position_manager.check_and_close(current_candle["close"], current_time)
+                if closed:
+                    for c in closed:
+                        pnl = c.get("pnl", 0)
+                        exit_price = c.get("exit_price", current_candle["close"])
+                        trades[-1]["exit_price"] = exit_price if trades else 0
+                        trades[-1]["pnl"] = pnl
+                        trades[-1]["pnl_pct"] = (pnl / trades[-1]["size"]) * 100 if trades and trades[-1]["size"] else 0
+                        trades[-1]["reason"] = "tp" if c.get("hit_tp") else "sl"
                 equity.append(equity[-1])
 
         return {"trades": trades, "equity_curve": equity}

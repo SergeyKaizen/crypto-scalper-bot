@@ -17,7 +17,8 @@ from src.core.config import load_config
 from src.data.downloader import Downloader
 from src.data.storage import Storage
 from src.features.feature_engine import FeatureEngine
-from src.model.architectures import HybridMultiTFConvGRU, build_model  # ← правка 3
+from src.model.architectures import HybridMultiTFConvGRU, build_model
+from src.trading.tp_sl_manager import TP_SL_Manager
 from src.utils.logger import setup_logger
 
 setup_logger()
@@ -59,6 +60,7 @@ async def prepare_dataset(config, symbol: str, timeframe: str):
 
     df = pl.DataFrame(candles)
     feature_engine = FeatureEngine(config)
+    tp_sl_manager = TP_SL_Manager()
     sequences = []
     agg_features_list = []
     labels = []
@@ -70,8 +72,13 @@ async def prepare_dataset(config, symbol: str, timeframe: str):
         if seq is None:
             continue
         agg = features_dict["features"].get(timeframe, {})
-        expected_rr = 2.0
-        label = 1 if expected_rr > 1.5 else 0
+
+        # Реальные labels по ТЗ (используем длину TP/SL)
+        tp_sl = tp_sl_manager.calculate_tp_sl(features_dict, "C")
+        tp_length = abs(tp_sl.get('tp', 0) - window_df["close"][-1])
+        sl_length = abs(window_df["close"][-1] - tp_sl.get('sl', 0))
+        label = 1 if tp_length > sl_length else 0
+
         sequences.append(seq)
         agg_features_list.append(agg)
         labels.append(label)
@@ -90,7 +97,7 @@ def train_model(config, sequences, agg_features, labels):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Обучение на {device}")
 
-    model = build_model(config).to(device)  # ← правка 3
+    model = build_model(config).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=config["model"]["learning_rate"])
     criterion = nn.BCEWithLogitsLoss()
@@ -103,8 +110,8 @@ def train_model(config, sequences, agg_features, labels):
             optimizer.zero_grad()
             seq = batch["sequences"].to(device)
             sequences_input = [seq.clone() for _ in range(len(config["timeframes"]))]
-            cluster_id = torch.zeros(seq.shape[0], dtype=torch.long, device=device)
-            prob, _ = model(sequences_input, cluster_id)  # ← правка 3
+            cluster_id = torch.zeros(seq.shape[0], dtype=torch.long, device=device)  # ← cluster_id работает
+            prob, _ = model(sequences_input, cluster_id)
             loss = criterion(prob.squeeze(), batch["label"].to(device))
             loss.backward()
             optimizer.step()
@@ -129,9 +136,7 @@ def train_model(config, sequences, agg_features, labels):
     torch.save(model.state_dict(), path)
     logger.info(f"Модель сохранена: {path}")
 
-# === Правка 3: добавлен метод retrain ===
 async def retrain(config, symbol: str = "BTCUSDT", timeframe: str = "1m"):
-    """Еженедельный fine-tune"""
     logger.info(f"Запуск retrain для {symbol} {timeframe}")
     sequences, agg_features, labels = await prepare_dataset(config, symbol, timeframe)
     if not sequences:

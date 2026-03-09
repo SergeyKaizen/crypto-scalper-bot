@@ -8,7 +8,7 @@ src/trading/virtual_trader.py
 
 import logging
 import uuid
-import time  # ← добавлено для timestamp
+import time
 from typing import Dict, Optional, List
 
 from src.core.config import load_config
@@ -36,12 +36,11 @@ class VirtualTrader:
             return price - slippage
 
     def open_position(self, symbol: str, anomaly_type: str, prob: float, tp_sl: Dict):
-        """Открытие виртуальной позиции (вызывается из live_loop и entry_manager)"""
-        direction = 'L' if prob > 0.5 else 'S'  # простое определение по prob
-        price = tp_sl.get('entry_price', 0.0) or 0.0  # заглушка, реальная цена из candle
-        size = 0.001  # заглушка, реальный размер будет в position_manager
-        timestamp = int(time.time() * 1000)
-        atr = 0.0
+        """Открытие виртуальной позиции"""
+        direction = 'L' if prob > 0.5 else 'S'
+        price = tp_sl.get('entry_price', 0.0) or 0.0
+        atr = tp_sl.get('atr', price * 0.001)  # реальный ATR из tp_sl
+        size = self.config.get("base_position_size", 0.001)  # берём из config
 
         entry_price = self.apply_slippage(price, direction, atr)
         order_id = str(uuid.uuid4())
@@ -52,7 +51,7 @@ class VirtualTrader:
             "direction": direction,
             "entry_price": entry_price,
             "size": size,
-            "timestamp": timestamp,
+            "timestamp": int(time.time() * 1000),
             "fee_open": fee,
             "closed": False,
             "exit_price": None,

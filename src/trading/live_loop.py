@@ -4,6 +4,7 @@ src/trading/live_loop.py
 === Основной принцип работы файла ===
 
 Бесконечный цикл реальной/виртуальной торговли на Binance Futures.
+Теперь использует реальный WebSocket + resampler вместо polling.
 """
 
 import time
@@ -12,17 +13,16 @@ from datetime import datetime, timedelta
 import logging
 import signal
 import sys
-import asyncio  # для retrain
+import asyncio
 from collections import defaultdict
 
 from src.core.config import load_config
 from src.data.binance_client import BinanceClient
-from src.data.downloader import download_new_candles
 from src.data.storage import Storage
-from src.features.feature_engine import FeatureEngine  # ← правка 2
+from src.features.feature_engine import FeatureEngine
 from src.features.anomaly_detector import detect_anomalies
 from src.model.inference import InferenceEngine
-from src.model.trainer import retrain  # ← правка 2
+from src.model.trainer import retrain
 from src.model.scenario_tracker import ScenarioTracker
 from src.trading.entry_manager import EntryManager
 from src.trading.order_executor import OrderExecutor
@@ -30,6 +30,8 @@ from src.trading.tp_sl_manager import TP_SL_Manager
 from src.trading.risk_manager import RiskManager
 from src.trading.virtual_trader import VirtualTrader
 from src.backtest.pr_calculator import PRCalculator
+from src.trading.websocket_manager import WebSocketManager
+from src.data.resampler import Resampler
 from src.utils.logger import setup_logger
 
 logger = setup_logger('live_loop', logging.INFO)
@@ -72,6 +74,20 @@ def live_loop():
     virtual_trader = VirtualTrader() if config.get('trading', {}).get('mode') == 'virtual' else None
     pr_calculator = PRCalculator()
 
+    # === Подключение resampler и websocket_manager (Этап 1) ===
+    resampler = Resampler(config)
+    websocket_manager = WebSocketManager(config, storage, resampler)
+    websocket_manager.start()
+
+    # === Warm-up: 1000 свечей при старте (возвращено по ТЗ) ===
+    logger.info("Warm-up: прогрев на 1000 свечах для понимания состояния рынка...")
+    symbols = storage.get_whitelisted_symbols()[:3]
+    for symbol in symbols:
+        for tf in config['timeframes']:
+            df = resampler.get_window(tf, 1000)
+            if not df.empty:
+                _ = FeatureEngine(config).build_features({tf: df})
+
     global last_markets_update
     last_markets_update = datetime.utcnow() - timedelta(days=8)
 
@@ -84,7 +100,7 @@ def live_loop():
 
     symbols = storage.get_whitelisted_symbols()
 
-    logger.info(f"Запуск live_loop. Монеты: {len(symbols)}, TF: {timeframes}")
+    logger.info(f"Запуск live_loop на WebSocket + resampler. Монеты: {len(symbols)}, TF: {timeframes}")
 
     while True:
         try:
@@ -94,16 +110,11 @@ def live_loop():
                 last_markets_update = datetime.utcnow()
                 symbols = storage.get_whitelisted_symbols()
 
-            for symbol in symbols:
-                for tf in timeframes:
-                    download_new_candles(symbol, tf)
-                    time.sleep(0.1)
-
             now = datetime.utcnow()
             for tf in timeframes:
                 if (now - last_retrain[tf]) > timedelta(days=config.get('retrain_interval_days', 7)):
                     logger.info(f"Еженедельное переобучение модели для {tf}")
-                    asyncio.run(retrain(config, timeframe=tf))  # ← правка 2
+                    asyncio.run(retrain(config, timeframe=tf))
                     last_retrain[tf] = now
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=config['hardware']['max_workers']) as executor:
@@ -114,7 +125,7 @@ def live_loop():
                             process_candle,
                             symbol, tf, storage, inference, scenario_tracker, entry_manager,
                             tp_sl_manager, risk_manager, order_executor,
-                            virtual_trader, pr_calculator, config
+                            virtual_trader, pr_calculator, config, resampler
                         ))
 
                 for future in concurrent.futures.as_completed(futures):
@@ -123,7 +134,7 @@ def live_loop():
                     except Exception as e:
                         logger.error(f"Ошибка обработки свечи: {e}")
 
-            time.sleep(60)
+            time.sleep(0.1)
 
         except Exception as e:
             logger.exception("Критическая ошибка в live_loop")
@@ -133,17 +144,21 @@ def live_loop():
 def process_candle(symbol: str, timeframe: str, storage: Storage, inference: InferenceEngine, 
                    scenario_tracker: ScenarioTracker, entry_manager: EntryManager, 
                    tp_sl_manager: TP_SL_Manager, risk_manager: RiskManager, 
-                   order_executor: OrderExecutor, virtual_trader, pr_calculator, config: dict):
-    last_candle = storage.get_last_candle(symbol, timeframe)
-    candle_data = last_candle if last_candle else {'close': 0.0, 'timestamp': int(time.time() * 1000)}
+                   order_executor: OrderExecutor, virtual_trader, pr_calculator, config: dict, resampler: Resampler):
+    window_df = resampler.get_window(timeframe, config.get('seq_len', 100))
+    if window_df.empty:
+        return
+
+    last_candle = window_df.row(-1)
+    candle_data = {'close': last_candle['close'], 'timestamp': last_candle['open_time']}
     candle_ts = candle_data.get('timestamp', int(time.time() * 1000))
 
     features_by_tf = {}
-    feature_engine = FeatureEngine(config)  # ← правка 2
+    feature_engine = FeatureEngine(config)
     for tf in config['timeframes']:
-        df = storage.get_candles(symbol, tf, limit=config.get('seq_len', 100))
+        df = resampler.get_window(tf, config.get('seq_len', 100))
         if not df.empty:
-            features_by_tf[tf] = feature_engine.build_features({tf: df})  # ← правка 2
+            features_by_tf[tf] = feature_engine.build_features({tf: df})
 
     if not features_by_tf:
         return
@@ -170,7 +185,7 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
         if not wl or wl.get('tf') != timeframe or wl.get('anomaly_type') != anomaly_type:
             if virtual_trader:
                 tp_sl = tp_sl_manager.calculate_tp_sl(features_by_tf[timeframe][window])
-                virtual_trader.open_position(symbol, anomaly_type, predict_prob, tp_sl)  # ← правка 2
+                virtual_trader.open_position(symbol, anomaly_type, predict_prob, tp_sl)
             continue
 
         feats = features_by_tf[timeframe][window]
@@ -231,7 +246,7 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
                 logger.info(f"Открыта реальная позиция {anomaly_type} {direction} на {symbol}, size={size}")
         else:
             if virtual_trader:
-                virtual_trader.open_position(symbol, anomaly_type, position['prob'], tp_sl)  # ← правка 2
+                virtual_trader.open_position(symbol, anomaly_type, position['prob'], tp_sl)
                 logger.debug(f"Открыта виртуальная позиция {anomaly_type} {direction} на {symbol}, size={size}")
 
         tp_sl_manager.add_open_position(position)
@@ -242,11 +257,11 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
                 virtual_trader.open_position(
                     symbol, sig['anom']['type'], sig['prob'],
                     tp_sl_manager.calculate_tp_sl(sig['feats'], sig['anom']['type'])
-                )  # ← правка 2
+                )
 
     if symbol in open_positions:
         for pos in open_positions[symbol][:]:
-            current_price = storage.get_last_candle(symbol, timeframe).get('close', 0)
+            current_price = resampler.get_window(timeframe, 1).row(-1)['close']
             if tp_sl_manager.check_tp_sl(pos, current_price):
                 closed_pos = order_executor.close_position(pos, virtual_trader)
                 handle_closed_position(closed_pos, pr_calculator, risk_manager, config)
