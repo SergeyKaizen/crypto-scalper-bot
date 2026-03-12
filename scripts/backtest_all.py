@@ -98,14 +98,17 @@ def main():
 
     logger.info(f"Запуск параллельного бэктеста по {len(symbols)} монетам")
 
-    results = []
-    max_workers = config.get("hardware", {}).get("max_workers", 8)
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_symbol = {executor.submit(run_backtest_for_symbol, config, sym): sym for sym in symbols}
-        for future in as_completed(future_to_symbol):
-            results.append(future.result())
-
-    filter_and_update_whitelist(config, results)
+    # Walk-forward (rolling train/test) — только согласованная правка
+    windows = config["backtest"].get("walk_forward_windows", 5)
+    for window in range(windows):
+        logger.info(f"Walk-forward окно {window+1}/{windows}")
+        results = []
+        max_workers = config.get("hardware", {}).get("max_workers", 8)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_symbol = {executor.submit(run_backtest_for_symbol, config, sym): sym for sym in symbols}
+            for future in as_completed(future_to_symbol):
+                results.append(future.result())
+        filter_and_update_whitelist(config, results)
 
     passed = len([r for r in results if "error" not in r and r.get("pr_ls", 0) >= config["filters"].get("min_pr", 1.3)])
     logger.info(f"Бэктест завершён | Прошли фильтр: {passed}/{len(results)} монет")

@@ -128,6 +128,7 @@ class Resampler:
         if not rule:
             return
 
+        # Правильная агрегация (open/first, high/max, low/min, close/last, volume/sum) + устранение data leakage (closed="right")
         resampled = new_1m.group_by_dynamic(
             "timestamp",
             every=rule,

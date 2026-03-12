@@ -26,7 +26,6 @@ logger = setup_logger("config", logging.INFO)
 
 DEFAULT_CONFIG_PATH = "config/bot_config.yaml"
 
-
 def load_config() -> Dict[str, Any]:
     """
     Загружает конфигурацию только из bot_config.yaml (единственный основной файл).
@@ -37,6 +36,13 @@ def load_config() -> Dict[str, Any]:
 
     with open(DEFAULT_CONFIG_PATH, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
+
+    # === Валидация параметров (подтверждено) ===
+    trading = config.get("trading", {})
+    if trading.get("risk_per_trade", 0) <= 0:
+        raise ValueError("risk_per_trade должен быть > 0")
+    if trading.get("position_size", 0) <= 0:
+        raise ValueError("position_size должен быть > 0")
 
     logger.info(f"Загружен основной конфиг: {DEFAULT_CONFIG_PATH}")
     return config

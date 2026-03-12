@@ -87,6 +87,10 @@ def _download_symbol_tfs(symbol: str, timeframes: list, client: BinanceClient, s
 
             if all_df:
                 full_df = pd.concat(all_df)
+                # Проверка и заполнение пропущенных свечей + удаление дубликатов + исправление timezone (согласованная правка)
+                full_df.index = pd.to_datetime(full_df.index, utc=True)
+                full_df = full_df[~full_df.index.duplicated(keep='first')]  # удаление дубликатов
+                full_df = full_df.asfreq('1min').ffill() if tf == '1m' else full_df  # заполнение пропусков
                 storage.save_candles(symbol, tf, full_df)
                 logger.info(f"Скачано {len(full_df)} свечей {symbol} {tf}")
             else:

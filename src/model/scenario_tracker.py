@@ -34,7 +34,7 @@ import logging
 
 from src.core.config import load_config
 from src.utils.logger import setup_logger
-from src.core.enums import Direction  # ← ФИКС: унификация Direction
+from src.core.enums import Direction
 
 logger = setup_logger('scenario_tracker', logging.INFO)
 
@@ -56,12 +56,9 @@ class ScenarioTracker:
         # Параметры из конфига
         self.prior_w = self.config['scenario_tracker']['bayesian_prior_wins']
         self.prior_l = self.config['scenario_tracker']['bayesian_prior_losses']
-        self.half_life = self.config['scenario_tracker']['decay_half_life_days']  # ← ФИКС пункта 16
+        self.half_life = self.config['scenario_tracker']['decay_half_life_days']
         self.decay_enabled = self.config['scenario_tracker'].get('decay_enabled', True)
         self.delta_threshold = self.config['scenario_tracker']['regime']['delta_norm_threshold']
-
-        # ← ФИКС пункта 16: уменьшаем half-life до 30 дней (интрадей: сценарии живут 2–8 недель)
-        self.half_life = 30.0
 
         self._load_from_pickle()
 
@@ -92,10 +89,8 @@ class ScenarioTracker:
             logger.warning(f"Ошибка сохранения pickle: {e}")
 
     def _binarize_features(self, feats: Dict) -> tuple:
-        """Бинаризация всех признаков + regime признаки в конце"""
         states = []
 
-        # Базовые признаки (как раньше)
         for key in ['volume', 'bid', 'ask', 'delta', 'mid_price_left', 'mid_price_right',
                     'price_change', 'volatility', 'price_channel_position', 'va_position',
                     'delta_mid_dist', 'delta_means']:
@@ -104,14 +99,12 @@ class ScenarioTracker:
             states.append(1 if change > 5 else 0)
             states.append(1 if change < 0 else 0)
 
-        # Delta VA
         states.append(feats.get('delta_positive', 0))
         states.append(feats.get('delta_increased', 0))
         states.append(1 if abs(feats.get('delta_change_pct', 0)) > 10 else 0)
         states.append(1 if feats.get('norm_dist_to_delta_vah', 0) > 0 else 0)
         states.append(1 if feats.get('norm_dist_to_delta_val', 0) < 0 else 0)
 
-        # Sequential паттерны
         seq_keys = [
             'sequential_delta_positive_count', 'sequential_delta_increased_count',
             'sequential_volume_increased_count', 'sequential_bid_increased_count',
@@ -124,24 +117,18 @@ class ScenarioTracker:
             states.append(1 if count >= 2 else 0)
             states.append(1 if count >= 4 else 0)
 
-        # Quiet streak
         states.append(1 if feats.get('quiet_streak', 0) >= 3 else 0)
         states.append(1 if feats.get('quiet_streak', 0) >= 5 else 0)
 
-        # Новое: Regime separation (2 бинарных признака)
         states.append(feats.get('regime_bull_strength', 0))
         states.append(feats.get('regime_bear_strength', 0))
 
-        # ← ФИКС: унификация Direction (если есть в фичах)
         direction = feats.get('direction', 'L')
         states.append(1 if direction == Direction.LONG.value else 0)
 
         return tuple(states)
 
     def add_scenario(self, pred_features: Dict, outcome: int, pnl: float = 0.0):
-        """
-        Добавление сценария после закрытия сделки
-        """
         key = self._binarize_features(pred_features)
 
         if key not in self.scenario_dict:
@@ -160,7 +147,6 @@ class ScenarioTracker:
         entry['total_pnl'] += pnl
         entry['last_update'] = datetime.utcnow()
 
-        # Авто-экспорт и сохранение
         total = sum(e['count'] for e in self.scenario_dict.values())
         if total % 1000 == 0:
             self.export_statistics()
@@ -168,7 +154,6 @@ class ScenarioTracker:
             self._save_to_pickle()
 
     def get_weight(self, scenario):
-        """Вес с Bayesian smoothing + time-decay"""
         if scenario not in self.scenario_dict:
             return 0.0
 
@@ -177,13 +162,9 @@ class ScenarioTracker:
         if count == 0:
             return 0.0
 
-        # Bayesian smoothing
         smoothed_winrate = (entry['wins'] + self.prior_w) / (count + self.prior_w + self.prior_l)
-
-        # Raw вес
         raw_weight = smoothed_winrate * np.log(count + 1)
 
-        # Time-decay
         if self.decay_enabled:
             days_since = (datetime.utcnow() - entry['last_update']).days
             decay = np.exp(-days_since / self.half_life)

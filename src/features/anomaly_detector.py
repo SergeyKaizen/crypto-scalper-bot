@@ -5,7 +5,7 @@ src/features/anomaly_detector.py
 
 Детекция аномалий по ТЗ:
 - C — свечная (размер свечи > средний + отклонение, но < 2× среднего)
-- V — объёмная (объём > средний × 1.5)
+- V — объёмная (объём > 95-й перцентиль за текущее окно)
 - CV — оба условия
 - Q — отсутствие аномалий (quiet)
 
@@ -120,24 +120,43 @@ class AnomalyDetector:
         return anomalies
 
     def _check_candle_anomaly(self, w_feats: dict, half_feats: dict) -> bool:
-        """Свечная аномалия по ТЗ (без жёсткого VA)"""
-        volatility_mean = w_feats.get('volatility_mean', 0)
-        candle_size_pct = (w_feats['high'].iloc[-1] - w_feats['low'].iloc[-1]) / w_feats['close'].iloc[-1] * 100
+        """Свечная аномалия СТРОГО по ТЗ (половина окна)"""
+        # Размер каждой свечи в % = (high - low) / high * 100
+        candle_sizes_pct = ((w_feats['high'] - w_feats['low']) / w_feats['high'] * 100).to_numpy()
 
-        is_anom_size = candle_size_pct > volatility_mean * 1.0
+        # Средний размер свечи
+        avg_size = np.mean(candle_sizes_pct)
+
+        # Отклонение каждой свечи
+        deviations = candle_sizes_pct - avg_size
+
+        # Среднее отклонение
+        avg_dev = np.mean(deviations)
+
+        # Аномальность = средний размер + среднее отклонение
+        anomaly_threshold = avg_size + avg_dev
+
+        # Последняя свеча
+        last_candle_size = candle_sizes_pct[-1]
+
+        is_anom_size = last_candle_size > anomaly_threshold
 
         # Игнор сверхбольших свечей (по ТЗ)
-        if candle_size_pct > volatility_mean * 2.0:
+        if last_candle_size > avg_size * 2.0:
             return False
 
         return is_anom_size
 
     def _check_volume_anomaly(self, w_feats: dict, half_feats: dict) -> bool:
-        """Объёмная аномалия по ТЗ"""
-        volume_mean = w_feats.get('volume_mean', 0)
-        last_volume = w_feats['volume'].iloc[-1]
-
-        return last_volume > volume_mean * 1.5
+        """Объёмная аномалия строго по ТЗ — 95-й перцентиль для КАЖДОГО окна"""
+        volumes = w_feats.get('volume', [])
+        if len(volumes) < 10:
+            return False
+        
+        percentile_95 = np.percentile(volumes, 95)
+        last_volume = volumes[-1]
+        
+        return last_volume > percentile_95
 
     def _get_consensus_score(self, anomaly_type: str, tf_anomalies: dict, current_tf: str) -> int:
         """
@@ -157,7 +176,7 @@ class AnomalyDetector:
             for other_anom in tf_anomalies[other_tf].values():
                 if other_anom['type'] == anomaly_type:
                     consensus += 1
-                    break  # достаточно одной аномалии на TF
+                    break
 
         return consensus
 

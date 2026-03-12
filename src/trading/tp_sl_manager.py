@@ -77,7 +77,8 @@ class TP_SL_Manager:
 
         self.open_positions[pos_id] = position
 
-    def check_tp_sl(self, position: Dict, current_price: float) -> bool:
+    def check_tp_sl(self, position: Dict, candle_data: Dict) -> bool:
+        """Проверяет TP/SL с учётом high/low свечи для определения порядка срабатывания"""
         pos_id = position.get('pos_id')
         if pos_id not in self.open_positions:
             return False
@@ -87,8 +88,19 @@ class TP_SL_Manager:
 
         direction = position.get('direction')
 
-        hit_tp = (direction == 'L' and current_price >= tp) or (direction == 'S' and current_price <= tp)
-        hit_sl = (direction == 'L' and current_price <= sl) or (direction == 'S' and current_price >= sl)
+        current_price = candle_data.get('close', 0.0)
+        high = candle_data.get('high', current_price)
+        low = candle_data.get('low', current_price)
+
+        hit_tp = (direction == 'L' and high >= tp) or (direction == 'S' and low <= tp)
+        hit_sl = (direction == 'L' and low <= sl) or (direction == 'S' and high >= sl)
+
+        # Если оба условия сработали в одной свече — определяем, что произошло первым
+        if hit_tp and hit_sl:
+            if direction == 'L':
+                hit_tp = (high - tp) < (sl - low)  # TP сработал раньше SL
+            else:
+                hit_tp = (tp - low) < (high - sl)
 
         if hit_tp or hit_sl:
             del self.open_positions[pos_id]

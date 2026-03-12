@@ -51,6 +51,9 @@ class OrderExecutor:
         size = position['size']
         side = "BUY" if direction == 'L' else "SELL"
 
+        # Округление размера под stepSize/minQty (подтверждено)
+        size = self._round_to_step_size(symbol, size)
+
         params = {
             "symbol": symbol,
             "side": side,
@@ -65,6 +68,19 @@ class OrderExecutor:
         except Exception as e:
             logger.error(f"Ошибка place_order: {e}")
             raise
+
+    def _round_to_step_size(self, symbol: str, size: float) -> float:
+        # Получаем stepSize от Binance
+        info = self.client.futures_exchange_info()
+        for s in info['symbols']:
+            if s['symbol'] == symbol:
+                step_size = float(s['filters'][1]['stepSize'])
+                min_qty = float(s['filters'][1]['minQty'])
+                size = round(size / step_size) * step_size
+                if size < min_qty:
+                    return 0.0
+                return size
+        return size
 
     @_retry_on_rate_limit
     def close_position(self, position: Dict):

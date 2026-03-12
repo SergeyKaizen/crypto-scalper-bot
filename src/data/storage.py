@@ -118,10 +118,20 @@ class Storage:
         self.con.commit()
 
     def save_candles(self, symbol: str, timeframe: str, df: pd.DataFrame, append: bool = True):
+        """Сохранение с transaction + проверкой целостности (NaN/inf/пустые)"""
         if df.empty:
             return
+
+        # Проверка целостности (согласованная правка)
+        df = df.dropna(subset=['open', 'high', 'low', 'close', 'volume'])
+        df = df.replace([float('inf'), float('-inf')], float('nan')).dropna()
+        if df.empty:
+            logger.warning(f"После очистки NaN/inf данные для {symbol} пусты")
+            return
+
         table_name = f"candles_{timeframe.replace('m', '')}m"
         df.columns = [c.upper() for c in df.columns]
+
         if ENGINE == "duckdb":
             if append:
                 self.con.execute(f"INSERT OR REPLACE INTO {table_name} SELECT * FROM df", {"df": df})
@@ -134,7 +144,8 @@ class Storage:
                 conn.execute(f"DELETE FROM {table_name} WHERE symbol = ?", (symbol,))
             df.to_sql(table_name, conn, if_exists="append", index=False)
             conn.close()
-        self.con.commit()
+
+        self.con.commit()  # transaction
         logger.debug(f"Сохранено {len(df)} свечей {symbol} {timeframe}")
 
     def get_last_timestamp(self, symbol: str, timeframe: str) -> int | None:

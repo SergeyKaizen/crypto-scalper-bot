@@ -39,8 +39,8 @@ class VirtualTrader:
         """Открытие виртуальной позиции"""
         direction = 'L' if prob > 0.5 else 'S'
         price = tp_sl.get('entry_price', 0.0) or 0.0
-        atr = tp_sl.get('atr', price * 0.001)  # реальный ATR из tp_sl
-        size = self.config.get("base_position_size", 0.001)  # берём из config
+        atr = tp_sl.get('atr', price * 0.001)
+        size = self.config.get("base_position_size", 0.001)
 
         entry_price = self.apply_slippage(price, direction, atr)
         order_id = str(uuid.uuid4())

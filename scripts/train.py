@@ -25,6 +25,18 @@ from src.utils.logger import setup_logger
 setup_logger()
 logger = logging.getLogger(__name__)
 
+def set_seed(seed=42):
+    """Reproducibility seed — только согласованная правка"""
+    import random
+    import numpy as np
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Обучение модели Crypto Scalper Bot")
     parser.add_argument("--hardware", default="phone_tiny", choices=["phone_tiny", "colab", "server"])
@@ -79,9 +91,10 @@ def train_model(config, sequences, agg_features, labels):
     """Обучение модели"""
     dataset = TradingDataset(sequences, agg_features, labels)
 
+    # Временной split вместо random_split — только согласованная правка
     train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+    train_dataset = dataset[:train_size]
+    val_dataset = dataset[train_size:]
 
     train_loader = DataLoader(train_dataset, batch_size=config["model"]["batch_size"], shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=config["model"]["batch_size"])
@@ -140,6 +153,7 @@ def train_model(config, sequences, agg_features, labels):
 async def main():
     global args
     args = parse_args()
+    set_seed()  # reproducibility seed — только согласованная правка
     config = load_config()
     logger.info(f"Запуск обучения | Symbol: {args.symbol} | TF: {args.timeframe} | Retrain: {args.retrain}")
 

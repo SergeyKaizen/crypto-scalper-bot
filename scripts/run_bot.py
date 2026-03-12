@@ -12,6 +12,8 @@
 import argparse
 import asyncio
 import logging
+import signal
+import sys
 
 from src.core.config import load_config
 from src.trading.live_loop import live_loop
@@ -27,9 +29,18 @@ def parse_args():
                         help="Путь к конфигу (по умолчанию bot_config.yaml)")
     return parser.parse_args()
 
-def main():
+def signal_handler(sig, frame):
+    """Graceful shutdown — только лог, позиции НЕ закрываются"""
+    logger.info("Получен сигнал остановки. Graceful shutdown...")
+    # State persistence вызывается внутри live_loop
+    sys.exit(0)
+
+async def main():
     args = parse_args()
     config = load_config()
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
     if not args.skip_backtest:
         logger.info("Запуск предварительного бэктеста (можно пропустить через --skip_backtest)...")
@@ -41,7 +52,7 @@ def main():
 
     logger.info("Запуск live-торговли (интрадей-режим)...")
     try:
-        asyncio.run(live_loop())
+        asyncio.run(live_loop())  # watchdog и state persistence уже внутри live_loop
     except KeyboardInterrupt:
         logger.info("Бот остановлен пользователем.")
     except Exception as e:

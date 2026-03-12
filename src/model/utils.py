@@ -1,4 +1,4 @@
-# src/model/scenario_tracker.py
+# src/model/utils.py
 """
 Модуль отслеживания и кластеризации бинарных сценариев.
 
