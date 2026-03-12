@@ -29,7 +29,7 @@ class PRCalculator:
         """)
 
     def update_pr(self, symbol: str, anomaly_type: str, direction: str, tf: str, window: int, hit_tp: bool, tp_length: float, sl_length: float):
-        """Обновление PR строго по ТЗ с учётом длины TP/SL"""
+        """Обновление PR строго по ТЗ: pr_value = (tp_count * tp_length_sum) - (sl_count * sl_length_sum)"""
         tp_count = 1 if hit_tp else 0
         sl_count = 0 if hit_tp else 1
         tp_length_sum = tp_length if hit_tp else 0
@@ -49,7 +49,7 @@ class PRCalculator:
         self.con.commit()
 
     def get_best_config(self, symbol: str):
-        """Выбор лучшего условия и направления по формуле ТЗ"""
+        """Выбор лучшего условия и направления по формуле ТЗ (PR_L, PR_S, PR_LS)"""
         row = self.con.execute("""
             SELECT anomaly_type, direction, tf, window,
                    (tp_count * tp_length_sum - sl_count * sl_length_sum) as pr_value

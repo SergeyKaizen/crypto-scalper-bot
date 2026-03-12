@@ -15,6 +15,8 @@ import signal
 import sys
 import asyncio
 from collections import defaultdict
+import pickle
+import os
 
 from src.core.config import load_config
 from src.data.binance_client import BinanceClient
@@ -39,27 +41,38 @@ logger = setup_logger('live_loop', logging.INFO)
 open_positions = defaultdict(list)
 last_retrain = {}
 last_markets_update = None
-
+STATE_FILE = "live_state.pkl"   # ← добавлено для state persistence
 
 def signal_handler(sig, frame):
     logger.warning(f"Получен сигнал {signal.Signals(sig).name}. Запускаем graceful shutdown...")
     shutdown()
     sys.exit(0)
 
+def save_state():
+    """State persistence — сохраняем открытые позиции"""
+    try:
+        with open(STATE_FILE, "wb") as f:
+            pickle.dump(dict(open_positions), f)
+        logger.info(f"Состояние сохранено ({len(open_positions)} позиций)")
+    except Exception as e:
+        logger.error(f"Ошибка сохранения state: {e}")
+
+def load_state():
+    """Загрузка открытых позиций при старте"""
+    global open_positions
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "rb") as f:
+                open_positions = defaultdict(list, pickle.load(f))
+            logger.info(f"Загружено {len(open_positions)} открытых позиций из state")
+        except Exception as e:
+            logger.error(f"Ошибка загрузки state: {e}")
 
 def shutdown():
-    logger.info("Graceful shutdown запущен...")
-    closed_count = 0
-    for symbol, positions in list(open_positions.items()):
-        for pos in positions[:]:
-            try:
-                OrderExecutor.close_position(pos)
-                closed_count += 1
-            except Exception as e:
-                logger.error(f"Ошибка закрытия позиции {symbol}: {e}")
-    logger.info(f"Закрыто {closed_count} позиций при shutdown")
+    """Graceful shutdown — ПОЗИЦИИ НЕ ЗАКРЫВАЕМ (ордера остаются на бирже)"""
+    logger.info("Graceful shutdown: позиции НЕ закрываются — ордера на бирже остаются активны")
+    save_state()
     logger.info("Бот остановлен.")
-
 
 def live_loop():
     config = load_config()
@@ -88,6 +101,8 @@ def live_loop():
             if not df.empty:
                 _ = FeatureEngine(config).build_features({tf: df})
 
+    load_state()  # ← state persistence
+
     global last_markets_update
     last_markets_update = datetime.utcnow() - timedelta(days=8)
 
@@ -101,6 +116,9 @@ def live_loop():
     symbols = storage.get_whitelisted_symbols()
 
     logger.info(f"Запуск live_loop на WebSocket + resampler. Монеты: {len(symbols)}, TF: {timeframes}")
+
+    # Watchdog (heartbeat)
+    last_heartbeat = datetime.utcnow()
 
     while True:
         try:
@@ -116,6 +134,11 @@ def live_loop():
                     logger.info(f"Еженедельное переобучение модели для {tf}")
                     asyncio.run(retrain(config, timeframe=tf))
                     last_retrain[tf] = now
+
+            # Watchdog heartbeat — проверка каждые 5 минут
+            if (now - last_heartbeat) > timedelta(minutes=5):
+                logger.info("Heartbeat OK")
+                last_heartbeat = now
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=config['hardware']['max_workers']) as executor:
                 futures = []

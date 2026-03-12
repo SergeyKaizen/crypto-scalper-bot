@@ -97,6 +97,8 @@ class BacktestEngine:
             return {"trades": [], "equity_curve": []}
 
         for i in range(self.seq_len, len(base_df) - 1):
+            # ← ТВОЯ ПРАВКА: entry_price берём из PREVIOUS candle (i-1) — lookahead bias устранён
+            previous_candle = base_df.row(i-1)
             current_candle = base_df.row(i)
             current_time = current_candle["open_time"]
             window = {}
@@ -128,7 +130,7 @@ class BacktestEngine:
 
                 size = self.risk_manager.calculate_position_size(
                     symbol=self.symbol,
-                    entry_price=current_candle["close"],
+                    entry_price=previous_candle["close"],  # ← исправлено на previous
                     tp_price=tp_price,
                     sl_price=sl_price
                 )
@@ -141,7 +143,7 @@ class BacktestEngine:
                     'pos_id': f"bt_{self.symbol}_{current_time}",
                     'symbol': self.symbol,
                     'direction': direction,
-                    'entry_price': current_candle["close"],
+                    'entry_price': previous_candle["close"],  # ← исправлено
                     'size': size,
                     'tp': tp_price,
                     'sl': sl_price,
@@ -155,7 +157,7 @@ class BacktestEngine:
                     trades.append({
                         "entry_time": current_time,
                         "direction": direction,
-                        "entry_price": current_candle["close"],
+                        "entry_price": previous_candle["close"],  # ← исправлено
                         "exit_price": 0,
                         "size": size,
                         "pnl": 0,
@@ -164,7 +166,6 @@ class BacktestEngine:
                     })
                 equity.append(equity[-1])
             else:
-                # Закрытие позиций в бэктесте (исправлено)
                 closed = self.position_manager.check_and_close(current_candle["close"], current_time)
                 if closed:
                     for c in closed:

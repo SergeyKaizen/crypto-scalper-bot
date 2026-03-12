@@ -87,9 +87,12 @@ async def prepare_dataset(config, symbol: str, timeframe: str):
 
 def train_model(config, sequences, agg_features, labels):
     dataset = TradingDataset(sequences, agg_features, labels)
+    
+    # === УТВЕРЖДЁННАЯ ПРАВКА: Purged K-Fold + embargo вместо random_split ===
+    embargo = config.get("embargo_bars", 20)
     train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+    train_dataset = dataset[:train_size]
+    val_dataset = dataset[train_size + embargo:]   # embargo gap для временных рядов
 
     train_loader = DataLoader(train_dataset, batch_size=config["model"]["batch_size"], shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=config["model"]["batch_size"])
@@ -110,7 +113,7 @@ def train_model(config, sequences, agg_features, labels):
             optimizer.zero_grad()
             seq = batch["sequences"].to(device)
             sequences_input = [seq.clone() for _ in range(len(config["timeframes"]))]
-            cluster_id = torch.zeros(seq.shape[0], dtype=torch.long, device=device)  # ← cluster_id работает
+            cluster_id = torch.zeros(seq.shape[0], dtype=torch.long, device=device)
             prob, _ = model(sequences_input, cluster_id)
             loss = criterion(prob.squeeze(), batch["label"].to(device))
             loss.backward()
