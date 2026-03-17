@@ -2,6 +2,7 @@
 src/backtest/engine.py
 
 Движок бэктеста — симулирует торговлю на исторических данных.
+Теперь поддерживает walk_forward_windows.
 """
 
 import logging
@@ -43,6 +44,8 @@ class BacktestEngine:
         self.timeframes = config["timeframes"]
         self.seq_len = config["seq_len"]
         self.min_tf_consensus = config.get("min_tf_consensus", 2)
+        self.walk_forward_windows = config["backtest"].get("walk_forward_windows", 5)  # ← добавлено
+
         self.results = {
             "trades": [],
             "equity_curve": [],
@@ -51,11 +54,10 @@ class BacktestEngine:
 
     def load_data(self) -> Dict[str, pl.DataFrame]:
         data = {}
-        limit = self.config["data"]["backtest_candles"] + self.seq_len + 50
+        limit = self.config["data"]["backtest_candles_per_tf"] + self.seq_len + 50
         for tf in self.timeframes:
             df = self.storage.get_candles(self.symbol, tf, limit=limit)
             if df is None or len(df) < self.seq_len + 10:
-                logger.warning(f"Недостаточно данных для {self.symbol} {tf}")
                 continue
             data[tf] = df
         return data
@@ -63,10 +65,10 @@ class BacktestEngine:
     def run_full_backtest(self) -> Dict:
         data = self.load_data()
         if not data:
-            logger.error(f"Нет данных для {self.symbol}")
             return {"error": "no data"}
 
-        segments = self._split_into_segments(data)
+        # === Walk-forward цикл (утверждённая настройка) ===
+        segments = self._split_into_walk_forward_segments(data)
 
         for segment_data in segments:
             segment_results = self._simulate_segment(segment_data)
@@ -78,14 +80,17 @@ class BacktestEngine:
 
         return self.results["metrics"]
 
-    def _split_into_segments(self, data: Dict[str, pl.DataFrame]) -> List[Dict[str, pl.DataFrame]]:
+    def _split_into_walk_forward_segments(self, data: Dict[str, pl.DataFrame]) -> List[Dict[str, pl.DataFrame]]:
         min_len = min(len(df) for df in data.values())
-        segment_size = 1500
+        segment_size = int(min_len / self.walk_forward_windows)
         segments = []
-        for start in range(self.seq_len, min_len - 100, segment_size):
+
+        for w in range(self.walk_forward_windows):
+            start = self.seq_len + w * segment_size
             end = min(start + segment_size, min_len)
             segment = {tf: df.slice(start - self.seq_len, end - start + self.seq_len) for tf, df in data.items()}
             segments.append(segment)
+
         return segments
 
     def _simulate_segment(self, data: Dict[str, pl.DataFrame]) -> Dict:
@@ -97,10 +102,10 @@ class BacktestEngine:
             return {"trades": [], "equity_curve": []}
 
         for i in range(self.seq_len, len(base_df) - 1):
-            # ← ТВОЯ ПРАВКА: entry_price берём из PREVIOUS candle (i-1) — lookahead bias устранён
             previous_candle = base_df.row(i-1)
             current_candle = base_df.row(i)
             current_time = current_candle["open_time"]
+
             window = {}
             for tf, df in data.items():
                 tf_window = df.filter(pl.col("open_time") <= current_time).tail(self.seq_len + 10)
@@ -130,7 +135,7 @@ class BacktestEngine:
 
                 size = self.risk_manager.calculate_position_size(
                     symbol=self.symbol,
-                    entry_price=previous_candle["close"],  # ← исправлено на previous
+                    entry_price=previous_candle["close"],
                     tp_price=tp_price,
                     sl_price=sl_price
                 )
@@ -143,7 +148,7 @@ class BacktestEngine:
                     'pos_id': f"bt_{self.symbol}_{current_time}",
                     'symbol': self.symbol,
                     'direction': direction,
-                    'entry_price': previous_candle["close"],  # ← исправлено
+                    'entry_price': previous_candle["close"],
                     'size': size,
                     'tp': tp_price,
                     'sl': sl_price,
@@ -157,7 +162,7 @@ class BacktestEngine:
                     trades.append({
                         "entry_time": current_time,
                         "direction": direction,
-                        "entry_price": previous_candle["close"],  # ← исправлено
+                        "entry_price": previous_candle["close"],
                         "exit_price": 0,
                         "size": size,
                         "pnl": 0,

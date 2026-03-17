@@ -8,7 +8,7 @@ src/data/downloader.py
 поддерживает многопоточность (ThreadPoolExecutor) для ускорения скачки большого количества монет.
 
 Ключевые задачи:
-- Скачать полную историю для новых монет (с момента листинга или max_history_candles).
+- Скачать полную историю для новых монет (с момента листинга или max_history_months).
 - Докачивать новые свечи после закрытия каждой свечи (live-режим).
 - Обеспечить устойчивость: retry на ошибки, rate-limit handling через client, многопоточный режим с ограничением workers.
 - Параллельная скачка по символам (chunks), но последовательная по TF внутри символа.
@@ -34,7 +34,7 @@ src/data/downloader.py
 
 - _download_symbol_tfs(symbol, timeframes, client) — внутренняя функция для одного символа:
   - Последовательно по TF скачивает историю.
-  - Вычисляет since из БД или config.max_history_days.
+  - Вычисляет since из БД или config.max_history_months.
   - Логирует прогресс.
 
 - run_download() — entry-point для скрипта:
@@ -87,7 +87,7 @@ def _download_symbol_tfs(symbol: str, timeframes: list, client: BinanceClient, s
 
             if all_df:
                 full_df = pd.concat(all_df)
-                # Проверка и заполнение пропущенных свечей + удаление дубликатов + исправление timezone (согласованная правка)
+                # Проверка и заполнение пропущенных свечей + удаление дубликатов + исправление timezone
                 full_df.index = pd.to_datetime(full_df.index, utc=True)
                 full_df = full_df[~full_df.index.duplicated(keep='first')]  # удаление дубликатов
                 full_df = full_df.asfreq('1min').ffill() if tf == '1m' else full_df  # заполнение пропусков
@@ -120,9 +120,13 @@ def download_full_history():
     symbols = main_client.update_markets_list()
     timeframes = config['timeframes']  # ['1m', '3m', '5m', '10m', '15m']
 
+    # === НОВАЯ НАСТРОЙКА: max_history_months (утверждённая) ===
+    months = config["data"].get("max_history_months", 3)
+    since = int((datetime.utcnow() - timedelta(days=months*30)).timestamp() * 1000)
+
     max_workers = config['hardware']['max_workers']  # из phone/colab/server.yaml
 
-    logger.info(f"Скачивание полной истории: {len(symbols)} монет, {len(timeframes)} TF, workers={max_workers}, proxies={len(clients)}")
+    logger.info(f"Скачивание полной истории: {len(symbols)} монет, {len(timeframes)} TF, workers={max_workers}, proxies={len(clients)}, месяцев={months}")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = []
@@ -144,10 +148,9 @@ def download_new_candles(symbol: str, timeframe: str):
     """
     Докачивает только новые свечи после последней в БД.
     Используется в live-режиме после закрытия свечи.
-    Для простоты использует основной клиент; ротацию можно добавить аналогично full_history, если нужно.
     """
     config = load_config()
-    client = BinanceClient()  # Здесь без ротации, чтобы не усложнять single-call; если нужно — добавить pool
+    client = BinanceClient()
     storage = Storage()
 
     try:

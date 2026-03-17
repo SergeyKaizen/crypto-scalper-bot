@@ -17,6 +17,7 @@ import asyncio
 from collections import defaultdict
 import pickle
 import os
+import threading   # ← добавлено для Lock
 
 from src.core.config import load_config
 from src.data.binance_client import BinanceClient
@@ -39,9 +40,11 @@ from src.utils.logger import setup_logger
 logger = setup_logger('live_loop', logging.INFO)
 
 open_positions = defaultdict(list)
+open_positions_lock = threading.Lock()   # ← Lock для защиты от race condition
+
 last_retrain = {}
 last_markets_update = None
-STATE_FILE = "live_state.pkl"   # ← добавлено для state persistence
+STATE_FILE = "live_state.pkl"
 
 def signal_handler(sig, frame):
     logger.warning(f"Получен сигнал {signal.Signals(sig).name}. Запускаем graceful shutdown...")
@@ -87,12 +90,10 @@ def live_loop():
     virtual_trader = VirtualTrader() if config.get('trading', {}).get('mode') == 'virtual' else None
     pr_calculator = PRCalculator()
 
-    # === Подключение resampler и websocket_manager (Этап 1) ===
     resampler = Resampler(config)
     websocket_manager = WebSocketManager(config, storage, resampler)
     websocket_manager.start()
 
-    # === Warm-up: 1000 свечей при старте (возвращено по ТЗ) ===
     logger.info("Warm-up: прогрев на 1000 свечах для понимания состояния рынка...")
     symbols = storage.get_whitelisted_symbols()[:3]
     for symbol in symbols:
@@ -101,7 +102,7 @@ def live_loop():
             if not df.empty:
                 _ = FeatureEngine(config).build_features({tf: df})
 
-    load_state()  # ← state persistence
+    load_state()
 
     global last_markets_update
     last_markets_update = datetime.utcnow() - timedelta(days=8)
@@ -117,7 +118,6 @@ def live_loop():
 
     logger.info(f"Запуск live_loop на WebSocket + resampler. Монеты: {len(symbols)}, TF: {timeframes}")
 
-    # Watchdog (heartbeat)
     last_heartbeat = datetime.utcnow()
 
     while True:
@@ -135,7 +135,6 @@ def live_loop():
                     asyncio.run(retrain(config, timeframe=tf))
                     last_retrain[tf] = now
 
-            # Watchdog heartbeat — проверка каждые 5 минут
             if (now - last_heartbeat) > timedelta(minutes=5):
                 logger.info("Heartbeat OK")
                 last_heartbeat = now
@@ -273,7 +272,8 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
                 logger.debug(f"Открыта виртуальная позиция {anomaly_type} {direction} на {symbol}, size={size}")
 
         tp_sl_manager.add_open_position(position)
-        open_positions[symbol].append(position)
+        with open_positions_lock:   # ← Lock
+            open_positions[symbol].append(position)
 
         for sig in signals[1:]:
             if virtual_trader:
@@ -283,12 +283,13 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
                 )
 
     if symbol in open_positions:
-        for pos in open_positions[symbol][:]:
-            current_price = resampler.get_window(timeframe, 1).row(-1)['close']
-            if tp_sl_manager.check_tp_sl(pos, current_price):
-                closed_pos = order_executor.close_position(pos, virtual_trader)
-                handle_closed_position(closed_pos, pr_calculator, risk_manager, config)
-                open_positions[symbol].remove(pos)
+        with open_positions_lock:   # ← Lock
+            for pos in open_positions[symbol][:]:
+                current_price = resampler.get_window(timeframe, 1).row(-1)['close']
+                if tp_sl_manager.check_tp_sl(pos, current_price):
+                    closed_pos = order_executor.close_position(pos, virtual_trader)
+                    handle_closed_position(closed_pos, pr_calculator, risk_manager, config)
+                    open_positions[symbol].remove(pos)
 
 
 def handle_closed_position(position: dict, pr_calculator: PRCalculator, risk_manager: RiskManager, config: dict):

@@ -3,43 +3,47 @@ src/features/feature_engine.py
 
 === Основной принцип работы файла ===
 
-Центральный модуль генерации признаков для модели.
-
-Ключевые задачи:
-- build_features(data) → основной метод для live/backtest (принимает dict {tf: df})
-- compute_features(df) → внутренний для одного таймфрейма
-- _aggregate_features(df) → агрегация по окнам (24, 50, 74, 100)
-- VA_position, quiet_streak — без look-ahead bias
+FeatureEngine — основной модуль генерации признаков для модели.
+Теперь поддерживает feature_selection из конфига + все окна, VA, volume_percentile.
 """
 
 import polars as pl
 import numpy as np
-from typing import Dict, Any
-import torch
-
+from typing import Dict, Optional
 from src.core.config import load_config
+from src.features.anomaly_detector import AnomalyDetector
+from src.features.channels import PriceChannel
+from src.features.half_comparator import HalfComparator
 from src.utils.logger import setup_logger
 
-logger = setup_logger("feature_engine", logging.INFO)
-
+logger = setup_logger('feature_engine', logging.INFO)
 
 class FeatureEngine:
-    def __init__(self, config: dict = None):
-        self.config = config or load_config()
-        self.windows = self.config.get("windows", [24, 50, 74, 100])
-        self.quiet_window = 20
-        self.quiet_threshold = 0.4
+    def __init__(self, config: dict):
+        self.config = config
+        self.anomaly_detector = AnomalyDetector(config)
+        self.channel = PriceChannel(config)
+        self.half_comparator = HalfComparator(config)
 
-    def build_features(self, data: Dict[str, pl.DataFrame]) -> Dict[str, Any]:
+        # === НОВАЯ НАСТРОЙКА: feature_selection ===
+        self.feature_selection = config["features"].get("selection", "all")
+        self.windows_list = config["features"].get("windows_list", [24, 50, 74, 100])
+        self.timeframes_list = config["features"].get("timeframes_list", ["1m", "3m", "5m", "10m", "15m"])
+        self.va_percentage = config["features"].get("va_percentage", 60)
+        self.volume_percentile = config["features"].get("volume_percentile", 95)
+        self.half_comparison_period = config["features"].get("half_comparison_period", 100)
+
+    async def build_features(self, windows: Dict[str, pl.DataFrame]) -> Dict:
         """
         Основной метод (вызывается из live_loop и engine).
         data = {tf: df}
         Возвращает агрегированные sequences + features по всем TF
         """
         result = {"sequences": {}, "features": {}}
-        for tf, df in data.items():
+        for tf, df in windows.items():
             if df is None or df.is_empty():
                 continue
+
             single_result = self.compute_features(df)
             result["sequences"].update(single_result["sequences"])
             result["features"][tf] = single_result["features"]
@@ -55,7 +59,7 @@ class FeatureEngine:
         features = {}
         sequences = {}
 
-        for window in self.windows:
+        for window in self.windows_list:
             if len(df) < window:
                 continue
 
@@ -101,8 +105,8 @@ class FeatureEngine:
         price_min = df["low"].min()
         price_max = df["high"].max()
         price_range = price_max - price_min
-        vah = poc + 0.30 * price_range  # ← строго 60%
-        val = poc - 0.30 * price_range
+        vah = poc + (self.va_percentage / 100) * price_range
+        val = poc - (self.va_percentage / 100) * price_range
 
         return {"VAH": vah, "VAL": val, "POC": poc}
 

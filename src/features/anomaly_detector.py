@@ -149,6 +149,7 @@ class AnomalyDetector:
 
     def _check_volume_anomaly(self, w_feats: dict, half_feats: dict) -> bool:
         """Объёмная аномалия строго по ТЗ — 95-й перцентиль для КАЖДОГО окна"""
+        config = load_config()
         volumes = w_feats.get('volume', [])
         if len(volumes) < 10:
             return False

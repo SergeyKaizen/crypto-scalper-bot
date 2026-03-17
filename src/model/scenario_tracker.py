@@ -60,6 +60,8 @@ class ScenarioTracker:
         self.decay_enabled = self.config['scenario_tracker'].get('decay_enabled', True)
         self.delta_threshold = self.config['scenario_tracker']['regime']['delta_norm_threshold']
 
+        self.weight_cache = {}   # ← кэш весов HDBSCAN (добавлено)
+
         self._load_from_pickle()
 
     def _load_from_pickle(self):
@@ -154,24 +156,30 @@ class ScenarioTracker:
             self._save_to_pickle()
 
     def get_weight(self, scenario):
+        """Вес с Bayesian smoothing + time-decay + кэш"""
+        if scenario in self.weight_cache:   # ← кэш HDBSCAN
+            return self.weight_cache[scenario]
+
         if scenario not in self.scenario_dict:
-            return 0.0
-
-        entry = self.scenario_dict[scenario]
-        count = entry['count']
-        if count == 0:
-            return 0.0
-
-        smoothed_winrate = (entry['wins'] + self.prior_w) / (count + self.prior_w + self.prior_l)
-        raw_weight = smoothed_winrate * np.log(count + 1)
-
-        if self.decay_enabled:
-            days_since = (datetime.utcnow() - entry['last_update']).days
-            decay = np.exp(-days_since / self.half_life)
+            weight = 0.0
         else:
-            decay = 1.0
+            entry = self.scenario_dict[scenario]
+            count = entry['count']
+            if count == 0:
+                weight = 0.0
+            else:
+                smoothed_winrate = (entry['wins'] + self.prior_w) / (count + self.prior_w + self.prior_l)
+                raw_weight = smoothed_winrate * np.log(count + 1)
 
-        return raw_weight * decay
+                if self.decay_enabled:
+                    days_since = (datetime.utcnow() - entry['last_update']).days
+                    decay = np.exp(-days_since / self.half_life)
+                else:
+                    decay = 1.0
+                weight = raw_weight * decay
+
+        self.weight_cache[scenario] = weight   # ← сохраняем в кэш
+        return weight
 
     def export_statistics(self):
         data = []

@@ -145,18 +145,45 @@ def _compute_delta_va_changes(va_left: dict, va_right: dict, current_price: floa
     changes['delta_vah_shift_pct'] = vah_shift / va_left['vah'] * 100 if va_left['vah'] != 0 else 0
     changes['delta_val_shift_pct'] = val_shift / va_left['val'] * 100 if va_left['val'] != 0 else 0
 
-    # Width change (расширение/сужение delta VA)
+    # VA width change
     left_width = va_left['vah'] - va_left['val']
     right_width = va_right['vah'] - va_right['val']
     changes['delta_va_width_change_pct'] = (right_width - left_width) / left_width * 100 if left_width != 0 else 0
-    changes['delta_va_expanded'] = 1 if changes['delta_va_width_change_pct'] > 0 else 0
 
-    # Пересечения в правой половине
-    changes['current_crossed_delta_vah'] = 1 if current_price > va_right['vah'] else 0
-    changes['current_crossed_delta_val'] = 1 if current_price < va_right['val'] else 0
+    # Expanded / contracted
+    changes['delta_va_expanded'] = 1 if right_width > left_width else 0
 
-    # Общее расстояние до delta VAH/VAL в правой половине
-    changes['norm_dist_to_delta_vah_right'] = (current_price - va_right['vah']) / va_right['vah'] * 100 if va_right['vah'] != 0 else 0
-    changes['norm_dist_to_delta_val_right'] = (current_price - va_right['val']) / va_right['val'] * 100 if va_right['val'] != 0 else 0
+    # Crossed delta VAH/VAL
+    changes['crossed_delta_vah'] = 1 if current_price > va_right['vah'] and current_price < va_left['vah'] else 0
+    changes['crossed_delta_val'] = 1 if current_price < va_right['val'] and current_price > va_left['val'] else 0
 
     return changes
+
+
+def calculate_volume_profile_va(df: pd.DataFrame, window: int = None, use_delta: bool = False) -> dict:
+    """Вспомогательная функция для расчёта VA (вызывается из half_comparator)"""
+    if window is None:
+        window = len(df)
+    if len(df) == 0:
+        return {"poc_price": np.nan, "vah": np.nan, "val": np.nan}
+
+    price_col = "delta_price" if use_delta else "close"
+    prices = df[price_col].values
+    volumes = df["volume"].values if not use_delta else df["delta_volume"].values
+
+    bins = np.linspace(prices.min(), prices.max(), 100)
+    hist, bin_edges = np.histogram(prices, bins=bins, weights=volumes)
+    poc_idx = np.argmax(hist)
+    poc_price = (bin_edges[poc_idx] + bin_edges[poc_idx + 1]) / 2
+
+    total_vol = hist.sum()
+    target_vol = total_vol * 0.7  # 70% volume for VA (стандарт)
+    cum_vol = np.cumsum(hist)
+
+    vah_idx = np.searchsorted(cum_vol, target_vol)
+    val_idx = np.searchsorted(cum_vol, total_vol - target_vol)
+
+    vah = (bin_edges[vah_idx] + bin_edges[vah_idx + 1]) / 2
+    val = (bin_edges[val_idx] + bin_edges[val_idx + 1]) / 2
+
+    return {"poc_price": poc_price, "vah": vah, "val": val}

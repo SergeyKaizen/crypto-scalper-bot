@@ -35,8 +35,9 @@ src/features/channels.py
 
 import numpy as np
 import pandas as pd
+from src.core.config import load_config
 
-def anomalous_surge_channel_feature(df: pd.DataFrame, period: int = 100) -> pd.DataFrame:
+def anomalous_surge_channel_feature(df: pd.DataFrame, period: int = None) -> pd.DataFrame:
     """
     Вычисляет признак Anomalous Price Channel для использования в машинном обучении / нейронной сети.
     
@@ -46,7 +47,7 @@ def anomalous_surge_channel_feature(df: pd.DataFrame, period: int = 100) -> pd.D
         Должен содержать хотя бы колонки 'open' и 'close'.
         Индекс может быть любым (timestamp, integer и т.д.).
     
-    period : int, default=100
+    period : int, default из конфига
         Размер окна для поиска максимума и минимума середины тела свечи.
     
     Возвращает:
@@ -67,6 +68,10 @@ def anomalous_surge_channel_feature(df: pd.DataFrame, period: int = 100) -> pd.D
     • NaN в исходных данных обрабатываются корректно (rolling использует nanmax/nanmin)
     • Все вычисления векторизованы — очень быстро даже на миллионах строк
     """
+    if period is None:
+        config = load_config()
+        period = config["features"].get("price_channel_period", 100)
+
     if not isinstance(df, pd.DataFrame):
         raise TypeError("Ожидается pandas DataFrame")
 
