@@ -122,7 +122,7 @@ def anomalous_surge_channel_feature(df: pd.DataFrame, period: int = None) -> pd.
 def calculate_volume_profile_va(
     df: pd.DataFrame,
     window: int = 100,
-    va_percentage: float = 0.70,
+    va_percentage: float = None,
     price_bin_step_pct: float = 0.002,
     use_delta: bool = False
 ) -> dict:
@@ -149,6 +149,10 @@ def calculate_volume_profile_va(
         'total_volume' (или total_abs_delta при use_delta=True),
         'va_volume', 'price_bins', 'volume_profile' (опционально)
     """
+    if va_percentage is None:
+        config = load_config()
+        va_percentage = config["features"].get("va_percentage", 0.60)  # по ТЗ 60%
+
     if len(df) < window:
         return {
             'poc_price': np.nan, 'poc_volume': np.nan,

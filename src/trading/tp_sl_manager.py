@@ -118,11 +118,30 @@ class TP_SL_Manager:
         entry = position.get('entry_price')
         remaining = position.get('remaining_size', position.get('size', 0.0))
 
+        # === НОВЫЙ АВТО РЕЖИМ ПО ТЗ ===
+        if self.config["trading"].get("partial_trailing_mode", "auto") == "auto":
+            # Первый уровень = TP
+            tp_price = position.get('tp')
+            if (direction == 'L' and current_price >= tp_price) or (direction == 'S' and current_price <= tp_price):
+                close_volume = remaining * 0.5
+                logger.info(f"Частичная фиксация 50% на уровне TP")
+                position['remaining_size'] = remaining - close_volume
+
+            # Второй уровень = половина TP
+            half_tp = (position.get('tp') + position.get('sl')) / 2
+            if (direction == 'L' and current_price >= half_tp) or (direction == 'S' and current_price <= half_tp):
+                close_volume = remaining * 0.3
+                logger.info(f"Частичная фиксация 30% на уровне TP/2")
+                position['remaining_size'] = remaining - close_volume
+
+            # Остаток 20% — trailing
+            return
+
+        # Ручной режим (оставляем как было)
         for i, level in enumerate(self.partial_tp_levels):
             tp_price = entry * (1 + level) if direction == 'L' else entry * (1 - level)
             if (direction == 'L' and current_price >= tp_price) or (direction == 'S' and current_price <= tp_price):
                 close_volume = remaining * (self.partial_tp_volumes[i] / 100.0)
-                # Здесь можно вызвать частичное закрытие (пока логируем)
                 logger.info(f"Частичная фиксация {self.partial_tp_volumes[i]}% на уровне {level}")
                 position['remaining_size'] = remaining - close_volume
 
