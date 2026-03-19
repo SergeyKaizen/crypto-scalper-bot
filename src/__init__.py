@@ -15,7 +15,7 @@ from src import BinanceClient, LiveLoop, Trainer и т.д.
 
 === Главные элементы и за что отвечают ===
 
-- __version__ = "0.1.0" — текущая версия проекта.
+- __version__ = "1.0.0" — текущая версия проекта (финальная).
 - Импорты ключевых классов — упрощают использование (например, from src import LiveLoop вместо длинного пути).
 - init() — функция, которая вызывается автоматически при импорте пакета src.
 - logging.basicConfig — глобальная настройка логов (если не настроена в модулях).
@@ -30,7 +30,7 @@ from src import BinanceClient, LiveLoop, Trainer и т.д.
 # =============================================
 # Версия проекта
 # =============================================
-__version__ = "0.1.0"
+__version__ = "1.0.0"  # ← обновлено до финальной версии
 
 # =============================================
 # Глобальные импорты для удобства использования
@@ -40,11 +40,13 @@ __version__ = "0.1.0"
 from .data.binance_client import BinanceClient
 from .data.downloader import download_full_history, download_new_candles
 from .data.storage import Storage
+from .data.resampler import Resampler  # ← добавлено (нужно в live_loop и backtest)
 
 # Features
 from .features.feature_engine import FeatureEngine
 from .features.anomaly_detector import AnomalyDetector
 from .features.channels import calculate_value_area
+from .features.half_comparator import HalfComparator  # ← добавлено (для feature_engine)
 
 # Model
 from .model.architectures import HybridMultiTFConvGRU, build_model
@@ -63,7 +65,7 @@ from .trading.tp_sl_manager import TP_SL_Manager
 from .trading.virtual_trader import VirtualTrader
 from .trading.order_executor import OrderExecutor
 from .trading.risk_manager import RiskManager
-from .trading.position_manager import PositionManager   # ← добавлен
+from .trading.position_manager import PositionManager
 from .trading.websocket_manager import WebSocketManager
 
 # Utils

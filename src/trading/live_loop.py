@@ -286,6 +286,8 @@ def process_candle(symbol: str, timeframe: str, storage: Storage, inference: Inf
         with open_positions_lock:   # ← Lock
             for pos in open_positions[symbol][:]:
                 current_price = resampler.get_window(timeframe, 1).row(-1)['close']
+                # === ВЫЗОВ PARTIAL TRAILING (фикс добавлен здесь) ===
+                tp_sl_manager._handle_partial_trailing(pos, current_price)
                 if tp_sl_manager.check_tp_sl(pos, current_price):
                     closed_pos = order_executor.close_position(pos, virtual_trader)
                     handle_closed_position(closed_pos, pr_calculator, risk_manager, config)
