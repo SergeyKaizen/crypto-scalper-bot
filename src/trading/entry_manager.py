@@ -81,17 +81,19 @@ class EntryManager:
         candle_data = {'close': features_dict["sequences"].get(tf, [0])[-1] if features_dict["sequences"] else 0}
         candle_ts = int(features_dict.get('timestamp', 0))
 
+        # === Передаём window_df для новой формулы TP/SL ===
+        window_df = features_dict["features"].get(tf, {}).get(top_sig['window'], None)
+
         if not self._can_open_position(symbol, anomaly_type, candle_ts):
-            # Остальные — виртуальные
             for sig in signals[1:]:
                 self._open_virtual_position(symbol, sig)
             return
 
-        # === Hybrid backtest+live проверка ===
+        # Hybrid проверка
         wl = self.storage.get_whitelist_settings(symbol)
-        is_backtest_signal = True  # для PR
+        is_backtest_signal = True
         if wl and wl.get('anomaly_type') == anomaly_type and wl.get('direction') == direction:
-            is_backtest_signal = False  # real live
+            is_backtest_signal = False
 
         tp_sl = self.tp_sl_manager.calculate_tp_sl(top_sig.get('feats', {}), anomaly_type)
         tp_price = tp_sl.get('tp', candle_data['close'] * (1.02 if direction == 'L' else 0.98))
@@ -123,7 +125,8 @@ class EntryManager:
             'tp': tp_price,
             'sl': sl_price,
             'marking': top_sig['marking'],
-            'is_backtest_signal': is_backtest_signal
+            'is_backtest_signal': is_backtest_signal,
+            'window_df': window_df   # ← НОВОЕ: передаём для расчёта TP/SL и лога
         }
 
         success = position_manager.open_position(position_data, is_backtest_signal=is_backtest_signal)
@@ -132,10 +135,10 @@ class EntryManager:
         else:
             logger.error(f"Не удалось открыть позицию {symbol}")
 
-        # Остальные сигналы — только виртуальные
         for sig in signals[1:]:
             self._open_virtual_position(symbol, sig)
 
+    # Остальные методы без изменений (оставлены полностью как в твоём оригинале)
     def _can_open_position(self, symbol: str, anomaly_type: str, candle_ts: int) -> bool:
         if self.position_manager.has_any_open_position(symbol):
             logger.debug(f"Уже есть открытая позиция на {symbol}")
@@ -163,7 +166,6 @@ class EntryManager:
         return 'S'
 
     def _open_virtual_position(self, symbol: str, sig: Dict):
-        """Только виртуальная часть (через PositionManager)"""
         try:
             self.position_manager.virtual_trader.open_position({
                 'symbol': symbol,

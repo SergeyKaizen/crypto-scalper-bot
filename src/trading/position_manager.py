@@ -48,7 +48,6 @@ class PositionManager:
     def open_position(self, pos_data: Dict, is_backtest_signal: bool = False):
         """
         Главный метод открытия позиции.
-        Вызывается из entry_manager и backtest engine.
         """
         pos_id = pos_data['pos_id']
         symbol = pos_data['symbol']
@@ -56,20 +55,20 @@ class PositionManager:
         entry_price = pos_data['entry_price']
         tp = pos_data.get('tp')
         sl = pos_data.get('sl')
-        marking = pos_data.get('marking')  # tf_Pwindow_anomaly_direction (для hybrid)
+        marking = pos_data.get('marking')
 
-        # === 1. Проверка всех risk-лимитов (10 параметров из config) ===
+        # 1. Проверка risk-лимитов
         risk_ok = self.risk_manager.check_all_limits(pos_data)
         if not risk_ok:
             logger.warning(f"Risk limits failed for {symbol}")
             return False
 
-        # === 2. Глобальный lock (одна позиция на символ) ===
+        # 2. Глобальный lock
         if self.has_any_open_position(symbol):
             logger.warning(f"Глобальный lock: уже есть открытая позиция на {symbol}")
             return False
 
-        # Расчёт размера позиции
+        # Расчёт размера
         size = pos_data.get('size', 0)
         if size <= 0 and tp and sl:
             size = self.risk_manager.calculate_position_size(symbol, entry_price, tp, sl)
@@ -79,7 +78,7 @@ class PositionManager:
             logger.error(f"Некорректный размер позиции для {symbol}")
             return False
 
-        # === 3. Исполнение (real / virtual) ===
+        # 3. Исполнение
         if pos_data.get('mode') == 'real':
             order_id = self.order_executor.place_order(pos_data)
             if not order_id:
@@ -88,7 +87,7 @@ class PositionManager:
         else:
             self.virtual_trader.open_position(pos_data)
 
-        # === 4. Сохранение в single source ===
+        # 4. Сохранение
         self.positions[pos_id] = {
             'data': pos_data,
             'state': PositionState.OPEN,
@@ -97,16 +96,43 @@ class PositionManager:
             'is_backtest_signal': is_backtest_signal
         }
 
-        # === НОВОЕ: передаём window_df для новой логики TP/SL ===
-        self.tp_sl_manager.add_open_position(pos_data, pos_data.get('window_df'))
+        self.tp_sl_manager.add_open_position(pos_data)
+
+        # ====================== НОВЫЙ ПОДРОБНЫЙ ЛОГ ======================
+        feats = pos_data.get('feats', {})
+        scenario_key = self.scenario_tracker._binarize_features(feats)
+        scenario_weight = self.scenario_tracker.get_weight(scenario_key)
+
+        log_msg = f"""
+🚀 ПОЗИЦИЯ ОТКРЫТА
+   • Монета: {symbol} | Направление: {direction}
+   • Цена входа: {entry_price:.4f} | Размер: {size:.6f}
+
+   === РАСЧЁТ ОБЪЁМА ===
+   • Режим: {self.risk_manager.risk_mode}
+   • Риск на сделку: {self.risk_manager.risk_pct if self.risk_manager.risk_mode == 'fixed' else '(auto по RR)'} 
+   • SL%: {abs(entry_price - sl)/entry_price*100:.2f}% | TP%: {abs(tp - entry_price)/entry_price*100:.2f}%
+
+   === СОСТОЯНИЕ ПРИЗНАКОВ ===
+   • Volume change: {feats.get('volume_change_pct', 0):+.2f}% {'↑' if feats.get('volume_increased', 0) else '↓'}
+   • Delta change: {feats.get('delta_change_pct', 0):+.2f}% 
+   • Price change diff: {feats.get('price_change_diff_pct', 0):+.2f}%
+   • VA position: {feats.get('va_position', 0):.3f}
+   • ASC position: {feats.get('asc_position_in_channel', 0):.3f}
+   • Regime: Bull {feats.get('regime_bull_strength', 0)} | Bear {feats.get('regime_bear_strength', 0)}
+
+   === СЦЕНАРИЙ И ПАТТЕРН ===
+   • Сценарий: {scenario_key}
+   • Винрейт сценария: {scenario_weight:.4f}
+   • Ожидаемое движение: TP {pos_data.get('tp_length', 0):.2f}% | SL {pos_data.get('sl_length', 0):.2f}% | RR {pos_data.get('tp_length', 1)/pos_data.get('sl_length', 1):.2f}
+"""
+        logger.info(log_msg.strip())
 
         logger.info(f"Позиция открыта: {pos_id} | {direction} {symbol} | size={size:.4f} | marking={marking}")
         return True
 
+    # Остальные методы без изменений
     def check_and_close(self, current_price: float, current_time: float):
-        """
-        Проверка TP/SL для всех открытых позиций
-        """
         for pos_id, pos_info in list(self.positions.items()):
             if pos_info['state'] != PositionState.OPEN:
                 continue
@@ -121,7 +147,6 @@ class PositionManager:
             hit_sl = (current_price <= sl) if direction == 'L' else (current_price >= sl)
 
             if hit_tp or hit_sl:
-                # Закрытие
                 if pos_data.get('mode') == 'real':
                     self.order_executor.close_position(pos_id)
                 else:
@@ -131,7 +156,6 @@ class PositionManager:
                 self.risk_manager.update_deposit(net_pnl)
 
                 outcome = 1 if hit_tp else 0
-                # Используем PR вместо pnl (tp_length / sl_length)
                 pr_value = pos_data.get('tp_length', 0) if hit_tp else -pos_data.get('sl_length', 0)
                 self.scenario_tracker.add_scenario(pos_data.get('feats', {}), outcome, pr_value)
 
@@ -142,7 +166,6 @@ class PositionManager:
                 logger.info(f"Позиция закрыта: {pos_id} | {'TP' if hit_tp else 'SL'} | PnL={net_pnl:.2f}")
 
     def has_any_open_position(self, symbol: str) -> bool:
-        """Глобальный lock — одна позиция на символ"""
         for pos_info in self.positions.values():
             if pos_info['state'] == PositionState.OPEN and pos_info['data']['symbol'] == symbol:
                 return True
@@ -152,7 +175,6 @@ class PositionManager:
         return self.positions.get(pos_id, {}).get('state', PositionState.CLOSED)
 
     def _calculate_net_pnl(self, pos_data: Dict, exit_price: float, hit_tp: bool) -> float:
-        """Расчёт net_pnl с комиссией"""
         entry_price = pos_data['entry_price']
         size = pos_data['size']
         direction = pos_data['direction']
@@ -162,5 +184,4 @@ class PositionManager:
         entry_comm = size * entry_price * commission_rate
         exit_comm = size * exit_price * commission_rate
         net_pnl = gross_pnl - entry_comm - exit_comm
-
         return net_pnl

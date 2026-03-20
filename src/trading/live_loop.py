@@ -33,11 +33,41 @@ from src.trading.risk_manager import RiskManager
 from src.backtest.pr_calculator import PRCalculator
 from src.trading.websocket_manager import WebSocketManager
 from src.data.resampler import Resampler
+from src.data.downloader import download_new_candles   # ← добавлено для catch-up
 from src.utils.logger import setup_logger
 
 logger = setup_logger('live_loop', logging.INFO)
 
 STATE_FILE = "live_state.pkl"  # оставлено для совместимости, но больше не используется (state в PositionManager)
+
+async def catch_up_missed_candles(config, storage, resampler, entry_manager, position_manager, risk_manager):
+    """CATCH-UP: догоняем все пропущенные свечи при перезапуске (даже после суток отключения)"""
+    logger.info("=== CATCH-UP: начинаем догонку пропущенных свечей ===")
+    
+    symbols = storage.get_whitelisted_symbols()
+    timeframes = config['timeframes']
+
+    for symbol in symbols:
+        for tf in timeframes:
+            try:
+                # 1. Докачиваем все пропущенные свечи
+                download_new_candles(symbol, tf)
+                
+                # 2. Прогоняем последние 100 свечей через полный цикл (чтобы не пропустить сигналы)
+                window_df = resampler.get_window(tf, config.get('seq_len', 100))
+                if window_df is not None and not window_df.empty:
+                    feature_engine = FeatureEngine(config)
+                    features_dict = await feature_engine.build_features({tf: window_df})
+                    anomalies = feature_engine.anomaly_detector.detect_anomalies(
+                        features_dict["features"], tf, symbol
+                    )
+                    await entry_manager.process_signals(
+                        symbol, tf, features_dict, anomalies, position_manager, risk_manager
+                    )
+            except Exception as e:
+                logger.warning(f"Catch-up ошибка для {symbol} {tf}: {e}")
+
+    logger.info("=== CATCH-UP завершён ===")
 
 async def live_loop():
     config = load_config()
@@ -54,6 +84,9 @@ async def live_loop():
     resampler = Resampler(config)
     websocket_manager = WebSocketManager(config, storage, resampler)
     websocket_manager.start()
+
+    # === CATCH-UP при каждом запуске (даже после суток отключения) ===
+    await catch_up_missed_candles(config, storage, resampler, entry_manager, position_manager, risk_manager)
 
     logger.info("Warm-up: прогрев на 1000 свечах...")
     symbols = storage.get_whitelisted_symbols()[:3]
