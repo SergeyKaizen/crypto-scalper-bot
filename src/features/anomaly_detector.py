@@ -28,6 +28,7 @@ src/features/anomaly_detector.py
 === Примечания ===
 - Consensus только для младших TF (1m, 3m, 5m) — старшие (10m, 15m) подтверждают сами себя
 - Quiet streak теперь per-symbol (исправлено для live_loop ThreadPool)
+- После аудита (Phase 2): новая VA-confirm логика long/short + исправлено получение ключей из config
 """
 
 import numpy as np
@@ -44,8 +45,10 @@ class AnomalyDetector:
         Главная функция: детекция по всем TF + consensus + quiet streak
         """
         config = load_config()
-        min_consensus = config.get('min_tf_consensus', 2)
-        va_confirm_enabled = config.get('va_confirm_enabled', False)
+        trading = config.get("trading", {})
+        filters = config.get("filters", {})
+        min_consensus = filters.get('min_tf_consensus', 2)
+        va_confirm_enabled = trading.get('va_confirm_enabled', False)
 
         # Детекция по каждому TF отдельно
         tf_anomalies = {}
@@ -73,7 +76,7 @@ class AnomalyDetector:
 
             confirmed = (anomaly_type != 'Q') and (consensus_count >= min_consensus)
 
-            # Опциональное VA/delta VA усиление (не блокирующее)
+            # Опциональное VA/delta VA усиление (не блокирующее) — новая long/short логика
             va_confirm = True
             if va_confirm_enabled:
                 va_confirm = self._check_delta_va_confirm(single_anom['details'], single_anom.get('half_changes', {}))
@@ -182,10 +185,23 @@ class AnomalyDetector:
         return consensus
 
     def _check_delta_va_confirm(self, w_feats: dict, half_feats: dict) -> bool:
-        """Опциональное усиление delta VA (не блокирующее)"""
+        """Опциональное усиление delta VA (не блокирующее) — НОВАЯ ЛОГИКА long/short"""
         delta_positive = w_feats.get('delta_positive', 0) == 1
         delta_increased = w_feats.get('delta_increased', 0) == 1
         vah_crossed = half_feats.get('current_crossed_delta_vah', 0) == 1
         val_crossed = half_feats.get('current_crossed_delta_val', 0) == 1
 
-        return (delta_positive or delta_increased) and (vah_crossed or val_crossed)
+        # Новые условия по твоему требованию
+        price_below_val = half_feats.get('price_below_val', 0) == 1
+        price_above_vah = half_feats.get('price_above_vah', 0) == 1
+
+        # Определяем направление по цене (из half_comparator)
+        price_change = half_feats.get('price_change_diff_pct', 0)
+        direction = "long" if price_change > 0 else "short"
+
+        if direction == "long":
+            long_va_confirm = (price_below_val or val_crossed) and (delta_positive or delta_increased)
+            return long_va_confirm
+        else:
+            short_va_confirm = (price_above_vah or vah_crossed) and (delta_positive or delta_increased)
+            return short_va_confirm

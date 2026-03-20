@@ -2,7 +2,12 @@
 src/backtest/engine.py
 
 Движок бэктеста — симулирует торговлю на исторических данных.
-Теперь поддерживает walk_forward_windows.
+Теперь поддерживает walk_forward_windows + hybrid backtest+live режим.
+
+После аудита (Phase 5):
+- Hybrid-режим по твоей логике: backtest-сигнал → виртуальная позиция + проверка маркировки → реальная live-позиция
+- Все open/close — только через PositionManager
+- PR рассчитывается через PRCalculator (expected length)
 """
 
 import logging
@@ -23,6 +28,7 @@ from src.trading.risk_manager import RiskManager
 from src.trading.tp_sl_manager import TP_SL_Manager
 from src.trading.virtual_trader import VirtualTrader
 from src.trading.position_manager import PositionManager
+from src.backtest.pr_calculator import PRCalculator
 from src.utils.logger import setup_logger
 
 logger = logging.getLogger(__name__)
@@ -38,13 +44,14 @@ class BacktestEngine:
         self.entry_manager = EntryManager(self.scenario_tracker)
         self.risk_manager = RiskManager()
         self.tp_sl_manager = TP_SL_Manager()
-        self.virtual_trader = VirtualTrader(config, symbol)
+        self.virtual_trader = VirtualTrader()
         self.position_manager = PositionManager()
+        self.pr_calculator = PRCalculator()
 
         self.timeframes = config["timeframes"]
         self.seq_len = config["seq_len"]
         self.min_tf_consensus = config.get("min_tf_consensus", 2)
-        self.walk_forward_windows = config["backtest"].get("walk_forward_windows", 5)  # ← добавлено
+        self.walk_forward_windows = config["backtest"].get("walk_forward_windows", 5)
 
         self.results = {
             "trades": [],
@@ -67,7 +74,6 @@ class BacktestEngine:
         if not data:
             return {"error": "no data"}
 
-        # === Walk-forward цикл (утверждённая настройка) ===
         segments = self._split_into_walk_forward_segments(data)
 
         for segment_data in segments:
@@ -102,7 +108,6 @@ class BacktestEngine:
             return {"trades": [], "equity_curve": []}
 
         for i in range(self.seq_len, len(base_df) - 1):
-            previous_candle = base_df.row(i-1)
             current_candle = base_df.row(i)
             current_time = current_candle["open_time"]
 
@@ -121,66 +126,77 @@ class BacktestEngine:
             prob_long, prob_short, uncertainty = self.inference.predict(features)
 
             if prob_long > self.config.get("trading", {}).get("min_prob", 0.65):
-                entry_signal = {"direction": "L", "confidence": prob_long, "anomaly_type": AnomalyType.C.value}
+                direction = "L"
+                anomaly_type = AnomalyType.C.value
             elif prob_short > self.config.get("trading", {}).get("min_prob", 0.65):
-                entry_signal = {"direction": "S", "confidence": prob_short, "anomaly_type": AnomalyType.C.value}
+                direction = "S"
+                anomaly_type = AnomalyType.C.value
             else:
-                entry_signal = None
+                equity.append(equity[-1])
+                continue
 
-            if entry_signal:
-                direction = entry_signal["direction"]
-                tp_sl = self.tp_sl_manager.calculate_tp_sl(features, entry_signal["anomaly_type"])
-                tp_price = tp_sl.get('tp', current_candle["close"] * (1.02 if direction == 'L' else 0.98))
-                sl_price = tp_sl.get('sl', current_candle["close"] * (0.98 if direction == 'L' else 1.02))
+            # === HYBRID LOGIC (по твоему ТЗ) ===
+            marking = f"{base_tf}_P{self.seq_len}_{anomaly_type}_{direction}"
+            wl = self.storage.get_whitelist_settings(self.symbol)
+            should_open_live = wl and wl.get('anomaly_type') == anomaly_type and wl.get('direction') == direction
 
-                size = self.risk_manager.calculate_position_size(
-                    symbol=self.symbol,
-                    entry_price=previous_candle["close"],
-                    tp_price=tp_price,
-                    sl_price=sl_price
-                )
+            tp_sl = self.tp_sl_manager.calculate_tp_sl(features, anomaly_type)
+            tp_price = tp_sl.get('tp', current_candle["close"] * (1.02 if direction == 'L' else 0.98))
+            sl_price = tp_sl.get('sl', current_candle["close"] * (0.98 if direction == 'L' else 1.02))
 
-                if size <= 0:
-                    equity.append(equity[-1])
-                    continue
+            size = self.risk_manager.calculate_position_size(
+                symbol=self.symbol,
+                entry_price=current_candle["close"],
+                tp_price=tp_price,
+                sl_price=sl_price
+            )
 
-                position_data = {
-                    'pos_id': f"bt_{self.symbol}_{current_time}",
-                    'symbol': self.symbol,
-                    'direction': direction,
-                    'entry_price': previous_candle["close"],
-                    'size': size,
-                    'tp': tp_price,
-                    'sl': sl_price,
-                    'mode': 'virtual',
-                    'feats': features,
-                    'anomaly_type': entry_signal["anomaly_type"]
-                }
+            if size <= 0:
+                equity.append(equity[-1])
+                continue
 
-                success = self.position_manager.open_position(position_data)
-                if success:
+            position_data = {
+                'pos_id': f"bt_{self.symbol}_{current_time}",
+                'symbol': self.symbol,
+                'anomaly_type': anomaly_type,
+                'direction': direction,
+                'entry_price': current_candle["close"],
+                'size': size,
+                'tp': tp_price,
+                'sl': sl_price,
+                'mode': 'virtual',
+                'feats': features,
+                'marking': marking,
+                'is_backtest_signal': True
+            }
+
+            # Всегда открываем виртуальную для PR
+            self.position_manager.open_position(position_data, is_backtest_signal=True)
+
+            # Если маркировка совпадает — открываем реальную live
+            if should_open_live:
+                live_data = position_data.copy()
+                live_data['mode'] = 'real'
+                self.position_manager.open_position(live_data, is_backtest_signal=False)
+                logger.info(f"Hybrid: открыта LIVE позиция {direction} {self.symbol} (marking совпала)")
+
+            equity.append(equity[-1])
+
+            # Проверка закрытия
+            closed = self.position_manager.check_and_close(current_candle["close"], current_time)
+            if closed:
+                for c in closed:
+                    pnl = c.get("net_pnl", 0)
                     trades.append({
                         "entry_time": current_time,
                         "direction": direction,
-                        "entry_price": previous_candle["close"],
-                        "exit_price": 0,
+                        "entry_price": current_candle["close"],
+                        "exit_price": current_candle["close"],
                         "size": size,
-                        "pnl": 0,
-                        "pnl_pct": 0,
-                        "reason": "open"
+                        "pnl": pnl,
+                        "pnl_pct": (pnl / size) * 100 if size else 0,
+                        "reason": "tp" if c.get("hit_tp") else "sl"
                     })
-                equity.append(equity[-1])
-            else:
-                closed = self.position_manager.check_and_close(current_candle["close"], current_time)
-                if closed:
-                    for c in closed:
-                        pnl = c.get("pnl", 0)
-                        exit_price = c.get("exit_price", current_candle["close"])
-                        trades[-1]["exit_price"] = exit_price if trades else 0
-                        trades[-1]["pnl"] = pnl
-                        trades[-1]["pnl_pct"] = (pnl / trades[-1]["size"]) * 100 if trades and trades[-1]["size"] else 0
-                        trades[-1]["reason"] = "tp" if c.get("hit_tp") else "sl"
-                equity.append(equity[-1])
 
         return {"trades": trades, "equity_curve": equity}
 

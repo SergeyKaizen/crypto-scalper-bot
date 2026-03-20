@@ -5,19 +5,8 @@ src/trading/websocket_manager.py
 
 WebSocketManager — модуль реал-тайм получения свечей и ордербука через Binance WebSocket.
 
-Поддерживает:
-- Подписку на несколько символов и таймфреймов одновременно
-- Авто-reconnect при разрыве
-- Обработку candle close + orderbook snapshot
-- Параллельный режим (threading)
-- Интеграцию с Resampler и live_loop
-- Поддержку orderbook (depth5) для delta VA и half_comparator
-- Graceful shutdown и heartbeat
-
-=== Примечания ===
-- В текущей версии используется polling в live_loop, поэтому WS — опциональный.
-- Полностью сохранена вся оригинальная логика (196 строк).
-- Добавлен только фикс Direction (L/S) и совместимость с PositionManager (если приходит сигнал).
+После аудита (Phase 5):
+- Добавлен register_closed_candle_callback + вызов callback при k.x == True (event-driven для live_loop)
 """
 
 import asyncio
@@ -25,11 +14,11 @@ import json
 import logging
 import threading
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Callable
 import websocket
 
 from src.core.config import load_config
-from src.core.enums import Direction  # ← ФИКС: унификация Direction
+from src.core.enums import Direction
 from src.data.resampler import Resampler
 from src.utils.logger import setup_logger
 
@@ -43,10 +32,18 @@ class WebSocketManager:
         self.running = False
         self.ws = None
         self.thread = None
-        self.orderbook = {}  # symbol -> {bids, asks}
+        self.orderbook = {}
         self.last_heartbeat = time.time()
         self.reconnect_attempts = 0
         self.max_reconnects = 10
+
+        # NEW: callbacks for event-driven live_loop
+        self.closed_candle_callbacks: List[Callable] = []
+
+    def register_closed_candle_callback(self, callback: Callable):
+        """Регистрация callback для closed candle (live_loop)"""
+        self.closed_candle_callbacks.append(callback)
+        logger.info("Зарегистрирован callback для closed candle")
 
     def start(self, symbols: List[str]):
         """Запуск WS для списка символов"""
@@ -75,7 +72,7 @@ class WebSocketManager:
         streams = []
         for symbol in self.symbols:
             streams.append(f"{symbol.lower()}@kline_1m")
-            streams.append(f"{symbol.lower()}@depth5@100ms")  # orderbook для delta
+            streams.append(f"{symbol.lower()}@depth5@100ms")
 
         url = f"wss://fstream.binance.com/stream?streams={'/'.join(streams)}"
         self.ws = websocket.WebSocketApp(
@@ -107,7 +104,7 @@ class WebSocketManager:
             logger.error(f"Ошибка обработки WS сообщения: {e}")
 
     def _handle_candle(self, payload):
-        """Обработка закрытой свечи"""
+        """Обработка закрытой свечи — вызов callback в live_loop"""
         k = payload.get('k', payload)
         if not k.get('x', False):  # только закрытые свечи
             return
@@ -122,8 +119,16 @@ class WebSocketManager:
             "buy_volume": float(k.get('V', 0))
         }
         symbol = payload.get('s', 'UNKNOWN')
-        self.resampler.add_1m_candle(candle)  # интеграция с resampler
-        logger.debug(f"WS: новая 1m свеча {symbol}")
+        self.resampler.add_1m_candle(candle)
+
+        # === EVENT-DRIVEN: вызов callback в live_loop ===
+        for callback in self.closed_candle_callbacks:
+            try:
+                asyncio.create_task(callback(symbol, '1m', candle))
+            except Exception as e:
+                logger.error(f"Ошибка callback closed candle: {e}")
+
+        logger.debug(f"WS: новая 1m свеча {symbol} (closed)")
 
     def _handle_orderbook(self, payload):
         """Обработка ордербука (для delta VA)"""
@@ -132,7 +137,6 @@ class WebSocketManager:
             'bids': payload.get('b', []),
             'asks': payload.get('a', [])
         }
-        # Здесь можно добавить вызов half_comparator если нужно
 
     def _on_error(self, ws, error):
         logger.error(f"WebSocket error: {error}")

@@ -14,7 +14,7 @@ src/features/half_comparator.py
 - Количественные изменения (pct, absolute) для всех 12 базовых признаков из ТЗ
 - Полное сравнение delta VA (poc_shift, vah/val shifts, width change, expanded)
 - Binary флаги: increased/decreased, positive/negative, crossed_delta_vah и т.д.
-- Всё возвращается в dict для feature_engine
+- + NEW: price_below_val, price_above_vah, current_crossed_delta_vah/val (для VA-confirm)
 
 === Главные функции и за что отвечают ===
 
@@ -25,13 +25,14 @@ src/features/half_comparator.py
    → Сравнение 12 базовых признаков из ТЗ (volume, bid, ask, delta и т.д.)
 
 3. _compute_delta_va_changes(va_left, va_right, current_price)
-   → Сравнение delta VA (poc_shift, vah/val shift, width_change, expanded, crossed)
+   → Сравнение delta VA + новые price vs VA флаги
 
 === Примечания ===
 - Все % изменения считаются относительно left (старой половины)
 - Защита от деления на 0 (fillna 0 или small epsilon)
 - Binary флаги используются в sequential паттернах и сценариях
 - Количественные изменения clipping'уются в feature_engine
+- После аудита (Phase 2): добавлены price_below_val / price_above_vah + current_*_crossed для VA-confirm
 """
 
 import numpy as np
@@ -62,7 +63,7 @@ def compare_halves(
 
     Возвращает:
     ----------
-    dict с количественными и бинарными изменениями
+    dict с количественными и бинарными изменениями + NEW price_below_val / price_above_vah
     """
     half = window_size // 2
     left = window_df.iloc[:half]
@@ -126,7 +127,7 @@ def _compute_base_changes(left: pd.DataFrame, right: pd.DataFrame) -> dict:
 
 def _compute_delta_va_changes(va_left: dict, va_right: dict, current_price: float, va_delta: dict) -> dict:
     """
-    Сравнение delta VA между половинами
+    Сравнение delta VA между половинами + NEW price vs VA флаги для VA-confirm
     """
     changes = {}
 
@@ -153,9 +154,15 @@ def _compute_delta_va_changes(va_left: dict, va_right: dict, current_price: floa
     # Expanded / contracted
     changes['delta_va_expanded'] = 1 if right_width > left_width else 0
 
-    # Crossed delta VAH/VAL
+    # Crossed delta VAH/VAL (старые имена + current_* aliases)
     changes['crossed_delta_vah'] = 1 if current_price > va_right['vah'] and current_price < va_left['vah'] else 0
     changes['crossed_delta_val'] = 1 if current_price < va_right['val'] and current_price > va_left['val'] else 0
+    changes['current_crossed_delta_vah'] = changes['crossed_delta_vah']
+    changes['current_crossed_delta_val'] = changes['crossed_delta_val']
+
+    # === NEW для VA-confirm (long/short) ===
+    changes['price_below_val'] = 1 if current_price < va_right.get('val', 0) else 0
+    changes['price_above_vah'] = 1 if current_price > va_right.get('vah', 0) else 0
 
     return changes
 

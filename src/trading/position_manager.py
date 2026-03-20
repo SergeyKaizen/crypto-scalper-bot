@@ -3,14 +3,14 @@ src/trading/position_manager.py
 
 === Основной принцип работы файла ===
 
-Централизованный менеджер позиций.
+Централизованный менеджер позиций — **SINGLE SOURCE OF TRUTH** (self.positions).
 
-Ключевые особенности:
-- State-machine: PositionState (OPEN, PENDING_CLOSE, CLOSED)
-- Открытие: через entry_manager → position_manager.open_position
-- Мониторинг и закрытие: через tp_sl_manager → position_manager.check_and_close
-- Проверки: глобальный lock (1 позиция на монету)
-- Интеграция: risk_manager (новая формула sizing), order_executor/virtual_trader
+Ключевые изменения после аудита (Phase 4):
+- Все open/close позиции идут только через этот класс
+- Перед открытием — enforce ВСЕХ risk-лимитов
+- Поддержка hybrid-режима (backtest + live одновременно)
+- Использует total_pr вместо pnl в ScenarioTracker
+- Глобальный lock на символ (одна позиция на монету)
 """
 
 from enum import Enum
@@ -42,35 +42,44 @@ class PositionManager:
         self.tp_sl_manager = TP_SL_Manager()
         self.scenario_tracker = ScenarioTracker()
 
-        self.positions = {}  # pos_id → {'data': dict, 'state': PositionState, 'open_time': float}
+        # === SINGLE SOURCE OF TRUTH ===
+        self.positions = {}  # pos_id → {'data': dict, 'state': PositionState, ...}
 
-    def open_position(self, pos_data: Dict):
+    def open_position(self, pos_data: Dict, is_backtest_signal: bool = False):
         """
-        Открытие позиции (вызывается из entry_manager)
+        Главный метод открытия позиции.
+        Вызывается из entry_manager и backtest engine.
         """
         pos_id = pos_data['pos_id']
         symbol = pos_data['symbol']
         direction = pos_data['direction']
-        size = pos_data['size']
         entry_price = pos_data['entry_price']
         tp = pos_data.get('tp')
         sl = pos_data.get('sl')
+        marking = pos_data.get('marking')  # tf_Pwindow_anomaly_direction (для hybrid)
 
+        # === 1. Проверка всех risk-лимитов (10 параметров из config) ===
+        risk_ok = self.risk_manager.check_all_limits(pos_data)
+        if not risk_ok:
+            logger.warning(f"Risk limits failed for {symbol}")
+            return False
+
+        # === 2. Глобальный lock (одна позиция на символ) ===
         if self.has_any_open_position(symbol):
             logger.warning(f"Глобальный lock: уже есть открытая позиция на {symbol}")
             return False
 
-        if size <= 0:
-            if tp and sl:
-                size = self.risk_manager.calculate_position_size(symbol, entry_price, tp, sl)
-            else:
-                logger.error(f"Нет TP/SL для расчёта размера {symbol}")
-                return False
+        # Расчёт размера позиции
+        size = pos_data.get('size', 0)
+        if size <= 0 and tp and sl:
+            size = self.risk_manager.calculate_position_size(symbol, entry_price, tp, sl)
+            pos_data['size'] = size
 
         if size <= 0:
             logger.error(f"Некорректный размер позиции для {symbol}")
             return False
 
+        # === 3. Исполнение (real / virtual) ===
         if pos_data.get('mode') == 'real':
             order_id = self.order_executor.place_order(pos_data)
             if not order_id:
@@ -79,20 +88,23 @@ class PositionManager:
         else:
             self.virtual_trader.open_position(pos_data)
 
+        # === 4. Сохранение в single source ===
         self.positions[pos_id] = {
             'data': pos_data,
             'state': PositionState.OPEN,
-            'open_time': time.time()
+            'open_time': time.time(),
+            'marking': marking,
+            'is_backtest_signal': is_backtest_signal
         }
 
         self.tp_sl_manager.add_open_position(pos_data)
 
-        logger.info(f"Позиция открыта: {pos_id}, {direction} {symbol}, size={size:.4f}, state=OPEN")
+        logger.info(f"Позиция открыта: {pos_id} | {direction} {symbol} | size={size:.4f} | marking={marking}")
         return True
 
     def check_and_close(self, current_price: float, current_time: float):
         """
-        Проверка и закрытие всех открытых позиций
+        Проверка TP/SL для всех открытых позиций
         """
         for pos_id, pos_info in list(self.positions.items()):
             if pos_info['state'] != PositionState.OPEN:
@@ -100,14 +112,15 @@ class PositionManager:
 
             pos_data = pos_info['data']
             symbol = pos_data['symbol']
+            direction = pos_data['direction']
             tp = pos_data.get('tp')
             sl = pos_data.get('sl')
-            direction = pos_data['direction']
 
             hit_tp = (current_price >= tp) if direction == 'L' else (current_price <= tp)
             hit_sl = (current_price <= sl) if direction == 'L' else (current_price >= sl)
 
             if hit_tp or hit_sl:
+                # Закрытие
                 if pos_data.get('mode') == 'real':
                     self.order_executor.close_position(pos_id)
                 else:
@@ -117,16 +130,18 @@ class PositionManager:
                 self.risk_manager.update_deposit(net_pnl)
 
                 outcome = 1 if hit_tp else 0
-                self.scenario_tracker.add_scenario(pos_data['feats'], outcome, net_pnl)
+                # Используем PR вместо pnl
+                pr_value = pos_data.get('expected_pr', net_pnl)
+                self.scenario_tracker.add_scenario(pos_data.get('feats', {}), outcome, pr_value)
 
                 pos_info['state'] = PositionState.CLOSED
                 pos_info['close_time'] = current_time
                 pos_info['net_pnl'] = net_pnl
 
-                logger.info(f"Позиция закрыта: {pos_id}, {'TP' if hit_tp else 'SL'}, net_pnl={net_pnl:.2f}")
+                logger.info(f"Позиция закрыта: {pos_id} | {'TP' if hit_tp else 'SL'} | PnL={net_pnl:.2f}")
 
     def has_any_open_position(self, symbol: str) -> bool:
-        """Глобальный lock: есть ли открытая позиция на монете"""
+        """Глобальный lock — одна позиция на символ"""
         for pos_info in self.positions.values():
             if pos_info['state'] == PositionState.OPEN and pos_info['data']['symbol'] == symbol:
                 return True
@@ -136,7 +151,7 @@ class PositionManager:
         return self.positions.get(pos_id, {}).get('state', PositionState.CLOSED)
 
     def _calculate_net_pnl(self, pos_data: Dict, exit_price: float, hit_tp: bool) -> float:
-        """Расчёт net_pnl (комиссия учтена)"""
+        """Расчёт net_pnl с комиссией"""
         entry_price = pos_data['entry_price']
         size = pos_data['size']
         direction = pos_data['direction']

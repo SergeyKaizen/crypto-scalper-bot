@@ -3,6 +3,7 @@
 Главный скрипт запуска бота (интрадей-режим).
 
 После всех фиксов:
+- live_loop полностью async + event-driven (WS closed candle)
 - Обучение и retrain происходят автоматически внутри live_loop
 - Warm-up происходит автоматически внутри live_loop
 - Бэктест можно запустить отдельно через backtest_all.py
@@ -32,7 +33,6 @@ def parse_args():
 def signal_handler(sig, frame):
     """Graceful shutdown — только лог, позиции НЕ закрываются"""
     logger.info("Получен сигнал остановки. Graceful shutdown...")
-    # State persistence вызывается внутри live_loop
     sys.exit(0)
 
 async def main():
@@ -52,11 +52,11 @@ async def main():
 
     logger.info("Запуск live-торговли (интрадей-режим)...")
     try:
-        asyncio.run(live_loop())  # watchdog и state persistence уже внутри live_loop
+        await live_loop()          # ← теперь полностью async (без вложенного asyncio.run)
     except KeyboardInterrupt:
         logger.info("Бот остановлен пользователем.")
     except Exception as e:
         logger.exception(f"Критическая ошибка в live_loop: {e}")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

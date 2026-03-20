@@ -4,6 +4,10 @@ src/trading/order_executor.py
 === Основной принцип работы файла ===
 
 OrderExecutor отвечает за выставление и управление реальными ордерами на Binance Futures.
+
+После аудита (Phase 5):
+- futures_exchange_info() кэшируется ОДИН РАЗ при старте (убран вызов каждый ордер)
+- Это критично для latency и rate-limit в scalping/intraday
 """
 
 import time
@@ -21,6 +25,10 @@ class OrderExecutor:
         self.client = BinanceClient()
         self.max_retries = 5
         self.retry_delay_base = 1
+
+        # === КЭШ exchange_info (Phase 5) ===
+        self.exchange_info = self.client.futures_exchange_info()
+        logger.info("exchange_info успешно закэширован при старте OrderExecutor")
 
     def _retry_on_rate_limit(func):
         def wrapper(self, *args, **kwargs):
@@ -70,9 +78,8 @@ class OrderExecutor:
             raise
 
     def _round_to_step_size(self, symbol: str, size: float) -> float:
-        # Получаем stepSize от Binance
-        info = self.client.futures_exchange_info()
-        for s in info['symbols']:
+        """Использует закэшированный exchange_info (один раз при старте)"""
+        for s in self.exchange_info['symbols']:
             if s['symbol'] == symbol:
                 step_size = float(s['filters'][1]['stepSize'])
                 min_qty = float(s['filters'][1]['minQty'])

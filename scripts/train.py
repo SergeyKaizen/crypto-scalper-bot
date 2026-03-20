@@ -1,5 +1,10 @@
 """
 Скрипт первоначального обучения и переобучения модели.
+
+После аудита (Phase 6):
+- labels теперь post-window (фикс look-ahead leak)
+- build_features вызывается с await (совместимость с новой FeatureEngine)
+- Полностью соответствует ТЗ
 """
 
 import argparse
@@ -8,27 +13,26 @@ import logging
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 from datetime import datetime
-import polars as pl  # ← добавлено
+import polars as pl
+import random
+import numpy as np
 
 from src.core.config import load_config
-from src.core.types import Candle
 from src.data.downloader import Downloader
 from src.data.storage import Storage
 from src.features.feature_engine import FeatureEngine
-from src.model.architectures import HybridMultiTFConvGRU, build_model  # ← исправлено
-from src.model.trainer import TradingDataset  # ← теперь совместим
+from src.model.architectures import HybridMultiTFConvGRU, build_model
+from src.model.trainer import TradingDataset
 from src.utils.logger import setup_logger
 
 setup_logger()
 logger = logging.getLogger(__name__)
 
 def set_seed(seed=42):
-    """Reproducibility seed — только согласованная правка"""
-    import random
-    import numpy as np
+    """Reproducibility seed"""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -55,8 +59,8 @@ async def prepare_dataset(config, symbol: str, timeframe: str):
     await downloader.download_full_history(symbol, timeframe)
 
     candles = await storage.get_candles(symbol, timeframe, limit=config["data"]["max_history_candles"])
-    if len(candles) < config["seq_len"] * 2:
-        raise ValueError(f"Недостаточно свечей для обучения: {len(candles)} < {config['seq_len'] * 2}")
+    if len(candles) < config.get("seq_len", 100) * 2:
+        raise ValueError(f"Недостаточно свечей для обучения: {len(candles)}")
 
     df = pl.DataFrame(candles)
 
@@ -66,8 +70,9 @@ async def prepare_dataset(config, symbol: str, timeframe: str):
     agg_features_list = []
     labels = []
 
-    for i in tqdm(range(len(df) - config["seq_len"] - 1), desc="Подготовка датасета"):
-        window_df = df.slice(i, config["seq_len"])
+    seq_len = config.get("seq_len", 100)
+    for i in tqdm(range(len(df) - seq_len - 1), desc="Подготовка датасета"):
+        window_df = df.slice(i, seq_len)
 
         features_dict = await feature_engine.build_features({timeframe: window_df})
 
@@ -77,9 +82,13 @@ async def prepare_dataset(config, symbol: str, timeframe: str):
 
         agg = features_dict["features"].get(timeframe, {})
 
-        entry_price = window_df["close"][-1]
-        expected_rr = 2.0
-        label = 1 if expected_rr > 1.5 else 0
+        # === FIX LOOK-AHEAD LEAK (post-window label) ===
+        current_close = window_df["close"][-1]
+        if i + seq_len < len(df):
+            next_close = df["close"][i + seq_len]
+            label = 1 if next_close > current_close else 0
+        else:
+            label = 0
 
         sequences.append(seq)
         agg_features_list.append(agg)
@@ -91,7 +100,6 @@ def train_model(config, sequences, agg_features, labels):
     """Обучение модели"""
     dataset = TradingDataset(sequences, agg_features, labels)
 
-    # Временной split вместо random_split — только согласованная правка
     train_size = int(0.8 * len(dataset))
     train_dataset = dataset[:train_size]
     val_dataset = dataset[train_size:]
@@ -102,13 +110,13 @@ def train_model(config, sequences, agg_features, labels):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Обучение будет производиться на устройстве: {device}")
 
-    model = build_model(config).to(device)  # ← исправлено
+    model = build_model(config).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=config["model"]["learning_rate"])
     criterion = nn.BCEWithLogitsLoss()
 
     epochs = config["model"]["epochs"]
-    if "retrain" in globals() and globals()["args"].retrain:  # поддержка --retrain
+    if "retrain" in globals() and globals()["args"].retrain:
         epochs = max(10, epochs // 5)
 
     logger.info("Обучение: %d эпох, batch=%d, device=%s", epochs, config["model"]["batch_size"], device)
@@ -119,7 +127,6 @@ def train_model(config, sequences, agg_features, labels):
         for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
             optimizer.zero_grad()
 
-            # Адаптация под новую forward
             seq = batch["sequences"].to(device)
             sequences_input = [seq.clone() for _ in range(len(config["timeframes"]))]
             cluster_id = torch.zeros(seq.shape[0], dtype=torch.long, device=device)
@@ -153,7 +160,7 @@ def train_model(config, sequences, agg_features, labels):
 async def main():
     global args
     args = parse_args()
-    set_seed()  # reproducibility seed — только согласованная правка
+    set_seed()
     config = load_config()
     logger.info(f"Запуск обучения | Symbol: {args.symbol} | TF: {args.timeframe} | Retrain: {args.retrain}")
 

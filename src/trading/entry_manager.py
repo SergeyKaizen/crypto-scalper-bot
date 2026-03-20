@@ -4,6 +4,12 @@ src/trading/entry_manager.py
 === Основной принцип работы файла ===
 
 Менеджер открытия позиций в live-режиме.
+
+После аудита (Phase 4):
+- Все open_position — ТОЛЬКО через PositionManager
+- Перед открытием — risk_manager.check_all_limits()
+- Добавлена маркировка для hybrid backtest+live (tf_Pwindow_anomaly_direction)
+- Полностью соответствует твоей логике hybrid-режима
 """
 
 from typing import List, Dict
@@ -34,41 +40,64 @@ class EntryManager:
     def process_signals(
         self,
         symbol: str,
-        signals: List[Dict],
-        candle_data: Dict,
-        candle_ts: int
+        tf: str,
+        features_dict: Dict,
+        anomalies: Dict,
+        position_manager: PositionManager,
+        risk_manager: RiskManager
     ):
-        if not signals:
+        """Обработка сигналов (вызывается из live_loop event-driven)"""
+        tf_anomalies = anomalies.get(tf, {})
+        if not tf_anomalies:
             return
 
-        scored_signals = []
-        for sig in signals:
-            feats = sig.get('feats', {})
+        signals = []
+        for window, anom in tf_anomalies.items():
+            if not anom.get('confirmed'):
+                continue
+
+            feats = features_dict["features"].get(tf, {}).get(window, {})
             weight = self.scenario_tracker.get_weight(
                 self.scenario_tracker._binarize_features(feats)
             )
-            scored_signals.append((sig, weight))
+            signals.append({
+                'anom': anom,
+                'window': window,
+                'feats': feats,
+                'prob': anom.get('prob', 0.0),
+                'weight': weight,
+                'marking': f"{tf}_P{window}_{anom['type']}_{self._resolve_direction(feats)}"
+            })
 
-        if not scored_signals:
+        if not signals:
             return
 
-        scored_signals.sort(key=lambda x: x[1], reverse=True)
-        top_sig, top_weight = scored_signals[0]
+        signals.sort(key=lambda x: x['weight'], reverse=True)
+        top_sig = signals[0]
 
         anomaly_type = top_sig['anom']['type']
         direction = self._resolve_direction(top_sig['feats'])
         prob = top_sig.get('prob', 0.0)
+        candle_data = {'close': features_dict["sequences"].get(tf, [0])[-1] if features_dict["sequences"] else 0}
+        candle_ts = int(features_dict.get('timestamp', 0))
 
         if not self._can_open_position(symbol, anomaly_type, candle_ts):
-            for sig, _ in scored_signals[1:]:
+            # Остальные — виртуальные
+            for sig in signals[1:]:
                 self._open_virtual_position(symbol, sig)
             return
 
+        # === Hybrid backtest+live проверка ===
+        wl = self.storage.get_whitelist_settings(symbol)
+        is_backtest_signal = True  # для PR
+        if wl and wl.get('anomaly_type') == anomaly_type and wl.get('direction') == direction:
+            is_backtest_signal = False  # real live
+
         tp_sl = self.tp_sl_manager.calculate_tp_sl(top_sig.get('feats', {}), anomaly_type)
-        tp_price = tp_sl.get('tp', candle_data['close'] * 1.02 if direction == 'L' else candle_data['close'] * 0.98)
+        tp_price = tp_sl.get('tp', candle_data['close'] * (1.02 if direction == 'L' else 0.98))
         sl_price = tp_sl.get('sl', self.tp_sl_manager.calculate_sl(candle_data, direction))
 
-        size = self.risk_manager.calculate_position_size(
+        size = risk_manager.calculate_position_size(
             symbol=symbol,
             entry_price=candle_data['close'],
             tp_price=tp_price,
@@ -92,16 +121,19 @@ class EntryManager:
             'feats': top_sig.get('feats', {}),
             'mode': self._resolve_mode(symbol, anomaly_type, direction),
             'tp': tp_price,
-            'sl': sl_price
+            'sl': sl_price,
+            'marking': top_sig['marking'],
+            'is_backtest_signal': is_backtest_signal
         }
 
-        success = self.position_manager.open_position(position_data)
+        success = position_manager.open_position(position_data, is_backtest_signal=is_backtest_signal)
         if success:
-            logger.info(f"Открыта позиция {anomaly_type} {direction} на {symbol}, size={size:.4f}, weight={top_weight:.4f}")
+            logger.info(f"Открыта позиция {anomaly_type} {direction} на {symbol}, size={size:.4f}, weight={top_sig['weight']:.4f}, marking={top_sig['marking']}")
         else:
             logger.error(f"Не удалось открыть позицию {symbol}")
 
-        for sig, _ in scored_signals[1:]:
+        # Остальные сигналы — только виртуальные
+        for sig in signals[1:]:
             self._open_virtual_position(symbol, sig)
 
     def _can_open_position(self, symbol: str, anomaly_type: str, candle_ts: int) -> bool:
@@ -125,19 +157,20 @@ class EntryManager:
         return 'virtual'
 
     def _resolve_direction(self, feats: Dict) -> str:
-        price_change = feats.get('price_change_pct', 0)
+        price_change = feats.get('price_change_diff_pct', 0)
         if price_change > 0:
             return 'L'
         return 'S'
 
     def _open_virtual_position(self, symbol: str, sig: Dict):
+        """Только виртуальная часть (через PositionManager)"""
         try:
-            self.position_manager.virtual_trader.open_virtual_position(
-                symbol,
-                sig['anom']['type'],
-                sig.get('prob', 0.0),
-                self.tp_sl_manager.calculate_tp_sl(sig.get('feats', {}), sig['anom']['type'])
-            )
+            self.position_manager.virtual_trader.open_position({
+                'symbol': symbol,
+                'anomaly_type': sig['anom']['type'],
+                'prob': sig.get('prob', 0.0),
+                'tp_sl': self.tp_sl_manager.calculate_tp_sl(sig.get('feats', {}), sig['anom']['type'])
+            })
         except Exception as e:
             logger.debug(f"Ошибка открытия виртуальной позиции: {e}")
 

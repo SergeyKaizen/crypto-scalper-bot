@@ -9,21 +9,22 @@ FeatureEngine — основной модуль генерации призна�
 
 import polars as pl
 import numpy as np
-from typing import Dict, Optional
+import torch
+from typing import Dict, Any
 from src.core.config import load_config
 from src.features.anomaly_detector import AnomalyDetector
-from src.features.channels import PriceChannel
-from src.features.half_comparator import HalfComparator
 from src.utils.logger import setup_logger
+
+# Импортируем реальные функции (repo-style, без классов)
+from src.features.half_comparator import compare_halves
+from src.features.channels import anomalous_surge_channel_feature, calculate_volume_profile_va
 
 logger = setup_logger('feature_engine', logging.INFO)
 
 class FeatureEngine:
     def __init__(self, config: dict):
         self.config = config
-        self.anomaly_detector = AnomalyDetector(config)
-        self.channel = PriceChannel(config)
-        self.half_comparator = HalfComparator(config)
+        self.anomaly_detector = AnomalyDetector()  # FIX: без config
 
         # === НОВАЯ НАСТРОЙКА: feature_selection ===
         self.feature_selection = config["features"].get("selection", "all")
@@ -78,13 +79,15 @@ class FeatureEngine:
         }
 
     def _aggregate_features(self, df: pl.DataFrame) -> Dict[str, float]:
+        """Обновлённый метод: теперь включает half_changes + channel features"""
         if df.is_empty():
             return {}
 
         features = {}
-        va_info = self._compute_value_area(df)
-        current_close = df["close"].last()
+        current_close = float(df["close"].last())
 
+        # Value Area (оставлено)
+        va_info = self._compute_value_area(df)
         if va_info["VAH"] is None or va_info["VAL"] is None or va_info["VAH"] == va_info["VAL"]:
             va_position = 0.5
         else:
@@ -92,8 +95,23 @@ class FeatureEngine:
             va_position = max(0.0, min(1.0, va_position))
 
         features["va_position"] = va_position
-        quiet_streak = self._compute_quiet_streak(df)
-        features["quiet_streak"] = quiet_streak
+
+        # === NEW: Half Comparator (полные half_changes по ТЗ) ===
+        # Используем реальную функцию из repo
+        half_changes = compare_halves(
+            window_df=df.to_pandas(),
+            window_size=len(df),
+            va_std=calculate_volume_profile_va(df.to_pandas()),
+            va_delta=calculate_volume_profile_va(df.to_pandas(), use_delta=True),
+            current_price=current_close
+        )
+        features.update(half_changes)
+
+        # === NEW: Channel features (anomalous surge + VA) ===
+        channel_df = anomalous_surge_channel_feature(df.to_pandas(), period=self.half_comparison_period)
+        features["asc_norm_dist_to_upper"] = float(channel_df["asc_norm_dist_to_upper"].iloc[-1])
+        features["asc_norm_dist_to_lower"] = float(channel_df["asc_norm_dist_to_lower"].iloc[-1])
+        features["asc_position_in_channel"] = float(channel_df["asc_position_in_channel"].iloc[-1])
 
         return features
 
@@ -109,30 +127,6 @@ class FeatureEngine:
         val = poc - (self.va_percentage / 100) * price_range
 
         return {"VAH": vah, "VAL": val, "POC": poc}
-
-    def _compute_quiet_streak(self, df: pl.DataFrame) -> int:
-        if len(df) < 2:
-            return 0
-
-        ranges = df["high"] - df["low"]
-        window = min(len(ranges), self.quiet_window)
-        avg_range = ranges.tail(window).mean()
-
-        if avg_range == 0:
-            return 0
-
-        current_range = ranges.last()
-        if current_range >= self.quiet_threshold * avg_range:
-            return 0
-
-        streak = 1
-        for i in range(2, len(ranges) + 1):
-            prev_range = ranges[-i]
-            if prev_range < self.quiet_threshold * avg_range:
-                streak += 1
-            else:
-                break
-        return streak
 
     def _normalize_sequence(self, df: pl.DataFrame) -> np.ndarray:
         closes = df["close"].to_numpy()

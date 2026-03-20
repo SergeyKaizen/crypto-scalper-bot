@@ -60,7 +60,6 @@ async def prepare_dataset(config, symbol: str, timeframe: str):
 
     df = pl.DataFrame(candles)
     feature_engine = FeatureEngine(config)
-    tp_sl_manager = TP_SL_Manager()
     sequences = []
     agg_features_list = []
     labels = []
@@ -73,11 +72,15 @@ async def prepare_dataset(config, symbol: str, timeframe: str):
             continue
         agg = features_dict["features"].get(timeframe, {})
 
-        # Реальные labels по ТЗ (используем длину TP/SL)
-        tp_sl = tp_sl_manager.calculate_tp_sl(features_dict, "C")
-        tp_length = abs(tp_sl.get('tp', 0) - window_df["close"][-1])
-        sl_length = abs(window_df["close"][-1] - tp_sl.get('sl', 0))
-        label = 1 if tp_length > sl_length else 0
+        # === FIX LOOK-AHEAD LEAK (утверждено) ===
+        # labels теперь post-window price movement (после закрытия окна)
+        # Убрали calculate_tp_sl на том же окне — это был leak
+        current_close = window_df["close"][-1]
+        if i + config["seq_len"] < len(df):
+            next_close = df["close"][i + config["seq_len"]]
+            label = 1 if next_close > current_close else 0   # post-window движение
+        else:
+            label = 0
 
         sequences.append(seq)
         agg_features_list.append(agg)

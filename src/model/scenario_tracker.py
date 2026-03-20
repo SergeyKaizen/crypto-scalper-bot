@@ -9,11 +9,10 @@ src/model/scenario_tracker.py
 - Bayesian smoothing в get_weight (prior_wins=1, prior_losses=3 из конфига)
 - Time-decay веса: exp(-days_since_last / half_life_days), half_life_days=90 (из конфига)
 - Regime separation: 2 бинарных признака в конце ключа (regime_bull_strength, regime_bear_strength)
-  - на основе delta_diff_norm > 0.65 / < -0.65 (порог из конфига)
 - Ограничение памяти: deque(maxlen=max_scenarios)
 
 === Главные методы ===
-- add_scenario(pred_features, outcome, pnl) — добавление после закрытия
+- add_scenario(pred_features, outcome, pr) — добавление после закрытия
 - get_weight(scenario) — Bayesian + time-decay
 - _binarize_features(feats) — ключ сценария с regime признаками
 
@@ -21,7 +20,7 @@ src/model/scenario_tracker.py
 - Bayesian: сглаживает редкие сценарии (1/1 не даёт 100%)
 - Time-decay: старые сценарии теряют вес (half_life=90 дней)
 - Regime: разделяет статистику на бычий/медвежий тренд и флэт
-- Полностью соответствует ТЗ + утверждённым 3 пунктам
+- После аудита (Phase 3): total_pr вместо total_pnl + save_every_trades + backup + удалён HDBSCAN weight_cache
 """
 
 import numpy as np
@@ -31,6 +30,7 @@ from collections import defaultdict, deque
 import pickle
 import os
 import logging
+import shutil
 
 from src.core.config import load_config
 from src.utils.logger import setup_logger
@@ -45,7 +45,7 @@ class ScenarioTracker:
         self.scenario_dict = defaultdict(lambda: {
             'wins': 0,
             'count': 0,
-            'total_pnl': 0.0,
+            'total_pr': 0.0,          # ← изменено на total_pr
             'last_update': datetime.utcnow()
         })
         self.scenarios = deque(maxlen=self.max_scenarios)
@@ -60,7 +60,8 @@ class ScenarioTracker:
         self.decay_enabled = self.config['scenario_tracker'].get('decay_enabled', True)
         self.delta_threshold = self.config['scenario_tracker']['regime']['delta_norm_threshold']
 
-        self.weight_cache = {}   # ← кэш весов HDBSCAN (добавлено)
+        # НОВАЯ НАСТРОЙКА ИЗ CONFIG
+        self.save_every_trades = self.config['scenario_tracker'].get('save_every_trades', 50)
 
         self._load_from_pickle()
 
@@ -72,7 +73,7 @@ class ScenarioTracker:
                     self.scenario_dict = defaultdict(lambda: {
                         'wins': 0,
                         'count': 0,
-                        'total_pnl': 0.0,
+                        'total_pr': 0.0,
                         'last_update': datetime.utcnow()
                     }, loaded['scenario_dict'])
                     self.scenarios = deque(loaded['scenarios'], maxlen=self.max_scenarios)
@@ -82,11 +83,19 @@ class ScenarioTracker:
 
     def _save_to_pickle(self):
         try:
+            # Основное сохранение
             with open(self.pickle_path, 'wb') as f:
                 pickle.dump({
                     'scenario_dict': dict(self.scenario_dict),
                     'scenarios': list(self.scenarios)
                 }, f)
+            
+            # BACKUP (по твоему требованию)
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M')
+            backup_path = os.path.join(self.data_dir, f'scenario_tracker_backup_{timestamp}.pkl')
+            shutil.copy2(self.pickle_path, backup_path)
+            logger.info(f"Сохранён backup: {backup_path}")
+            
         except Exception as e:
             logger.warning(f"Ошибка сохранения pickle: {e}")
 
@@ -130,14 +139,14 @@ class ScenarioTracker:
 
         return tuple(states)
 
-    def add_scenario(self, pred_features: Dict, outcome: int, pnl: float = 0.0):
+    def add_scenario(self, pred_features: Dict, outcome: int, pr: float = 0.0):
         key = self._binarize_features(pred_features)
 
         if key not in self.scenario_dict:
             self.scenario_dict[key] = {
                 'wins': 0,
                 'count': 0,
-                'total_pnl': 0.0,
+                'total_pr': 0.0,          # ← изменено на total_pr
                 'last_update': datetime.utcnow()
             }
             self.scenarios.append(key)
@@ -146,40 +155,35 @@ class ScenarioTracker:
         entry['count'] += 1
         if outcome == 1:
             entry['wins'] += 1
-        entry['total_pnl'] += pnl
+        entry['total_pr'] += pr          # ← используем total_pr
         entry['last_update'] = datetime.utcnow()
 
         total = sum(e['count'] for e in self.scenario_dict.values())
-        if total % 1000 == 0:
-            self.export_statistics()
-        if total % 500 == 0:
+        
+        # Сохранение каждые N сделок (из config)
+        if total % self.save_every_trades == 0:
             self._save_to_pickle()
+            self.export_statistics()
 
     def get_weight(self, scenario):
-        """Вес с Bayesian smoothing + time-decay + кэш"""
-        if scenario in self.weight_cache:   # ← кэш HDBSCAN
-            return self.weight_cache[scenario]
-
+        """Вес с Bayesian smoothing + time-decay"""
         if scenario not in self.scenario_dict:
-            weight = 0.0
+            return 0.0
+
+        entry = self.scenario_dict[scenario]
+        count = entry['count']
+        if count == 0:
+            return 0.0
+
+        smoothed_winrate = (entry['wins'] + self.prior_w) / (count + self.prior_w + self.prior_l)
+        raw_weight = smoothed_winrate * np.log(count + 1)
+
+        if self.decay_enabled:
+            days_since = (datetime.utcnow() - entry['last_update']).days
+            decay = np.exp(-days_since / self.half_life)
         else:
-            entry = self.scenario_dict[scenario]
-            count = entry['count']
-            if count == 0:
-                weight = 0.0
-            else:
-                smoothed_winrate = (entry['wins'] + self.prior_w) / (count + self.prior_w + self.prior_l)
-                raw_weight = smoothed_winrate * np.log(count + 1)
-
-                if self.decay_enabled:
-                    days_since = (datetime.utcnow() - entry['last_update']).days
-                    decay = np.exp(-days_since / self.half_life)
-                else:
-                    decay = 1.0
-                weight = raw_weight * decay
-
-        self.weight_cache[scenario] = weight   # ← сохраняем в кэш
-        return weight
+            decay = 1.0
+        return raw_weight * decay
 
     def export_statistics(self):
         data = []

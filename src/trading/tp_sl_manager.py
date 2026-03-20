@@ -5,6 +5,11 @@ src/trading/tp_sl_manager.py
 
 TP/SL Manager — модуль управления тейк-профитами и стоп-лоссами.
 Теперь поддерживает trailing_mode (manual/auto) и partial_trailing с объёмами фиксации.
+
+После аудита (Phase 5):
+- calculate_tp_sl возвращает expected TP/SL **на момент сигнала** (для корректного PR)
+- add_open_position сохраняет expected_tp_length / expected_sl_length
+- check_tp_sl возвращает расширенный dict (для PRCalculator)
 """
 
 import logging
@@ -27,11 +32,15 @@ class TP_SL_Manager:
         self.open_positions = {}
 
     def calculate_tp_sl(self, features: Dict, anomaly_type: str) -> Dict[str, Optional[float]]:
+        """
+        Возвращает expected TP/SL **на момент сигнала** (для PR).
+        Это значение фиксируется и передаётся в PRCalculator.
+        """
         entry_price = features.get('close', 0.0)
         atr = features.get('atr', 0.0)
 
         if entry_price <= 0:
-            return {'tp': None, 'sl': None}
+            return {'tp': None, 'sl': None, 'expected_tp_length': 0.0, 'expected_sl_length': 0.0}
 
         tp_multiplier = self.config["trading"].get("tp_multiplier", 1.0)
         sl_multiplier = self.config["trading"].get("sl_multiplier", 1.0)
@@ -54,7 +63,15 @@ class TP_SL_Manager:
             tp = entry_price - tp_distance
             sl = entry_price + sl_distance
 
-        return {'tp': round(tp, 4), 'sl': round(sl, 4)}
+        expected_tp_length = abs(tp - entry_price) / entry_price * 100
+        expected_sl_length = abs(sl - entry_price) / entry_price * 100
+
+        return {
+            'tp': round(tp, 4),
+            'sl': round(sl, 4),
+            'expected_tp_length': expected_tp_length,
+            'expected_sl_length': expected_sl_length
+        }
 
     def calculate_sl(self, candle_data: Dict, direction: str) -> float:
         close = candle_data.get('close', 0.0)
@@ -74,15 +91,20 @@ class TP_SL_Manager:
 
         position['trailing_active'] = False
         position['trailing_stop_price'] = position.get('sl')
-        position['remaining_size'] = position.get('size', 0.0)   # для partial_tp
+        position['remaining_size'] = position.get('size', 0.0)
+
+        # Сохраняем expected длины для PR
+        tp_sl = self.calculate_tp_sl(position.get('feats', {}), position.get('anomaly_type', 'C'))
+        position['expected_tp_length'] = tp_sl.get('expected_tp_length', 0.0)
+        position['expected_sl_length'] = tp_sl.get('expected_sl_length', 0.0)
 
         self.open_positions[pos_id] = position
 
-    def check_tp_sl(self, position: Dict, candle_data: Dict) -> bool:
+    def check_tp_sl(self, position: Dict, candle_data: Dict) -> Dict:
         """Проверяет TP/SL + partial_trailing + trailing_mode"""
         pos_id = position.get('pos_id')
         if pos_id not in self.open_positions:
-            return False
+            return {'hit': False}
 
         direction = position.get('direction')
         current_price = candle_data.get('close', 0.0)
@@ -103,12 +125,16 @@ class TP_SL_Manager:
 
         if hit_tp or hit_sl:
             del self.open_positions[pos_id]
-            return True
+            return {
+                'hit': True,
+                'hit_tp': hit_tp,
+                'exit_price': current_price
+            }
 
         # Partial trailing + trailing_mode
         self._handle_partial_trailing(position, current_price)
         self.update_trailing_stop(position, current_price)
-        return False
+        return {'hit': False}
 
     def _handle_partial_trailing(self, position: Dict, current_price: float):
         if self.config["trading"].get("tp_sl_mode") != "partial_trailing":
@@ -118,26 +144,21 @@ class TP_SL_Manager:
         entry = position.get('entry_price')
         remaining = position.get('remaining_size', position.get('size', 0.0))
 
-        # === НОВЫЙ АВТО РЕЖИМ ПО ТЗ ===
         if self.config["trading"].get("partial_trailing_mode", "auto") == "auto":
-            # Первый уровень = TP
             tp_price = position.get('tp')
             if (direction == 'L' and current_price >= tp_price) or (direction == 'S' and current_price <= tp_price):
                 close_volume = remaining * 0.5
                 logger.info(f"Частичная фиксация 50% на уровне TP")
                 position['remaining_size'] = remaining - close_volume
 
-            # Второй уровень = половина TP
             half_tp = (position.get('tp') + position.get('sl')) / 2
             if (direction == 'L' and current_price >= half_tp) or (direction == 'S' and current_price <= half_tp):
                 close_volume = remaining * 0.3
                 logger.info(f"Частичная фиксация 30% на уровне TP/2")
                 position['remaining_size'] = remaining - close_volume
 
-            # Остаток 20% — trailing
             return
 
-        # Ручной режим (оставляем как было)
         for i, level in enumerate(self.partial_tp_levels):
             tp_price = entry * (1 + level) if direction == 'L' else entry * (1 - level)
             if (direction == 'L' and current_price >= tp_price) or (direction == 'S' and current_price <= tp_price):
@@ -152,7 +173,6 @@ class TP_SL_Manager:
         direction = position.get('direction')
         entry_price = position.get('entry_price', 0.0)
 
-        # trailing_mode: auto = % от TP
         if self.trailing_mode == "auto":
             tp_distance = abs(position.get('tp', 0) - entry_price)
             activation_pct = tp_distance / entry_price
