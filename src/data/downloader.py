@@ -1,5 +1,5 @@
+#src/data/downloader.py
 """
-src/data/downloader.py
 
 === Основной принцип работы файла ===
 

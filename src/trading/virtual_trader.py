@@ -74,7 +74,6 @@ class VirtualTrader:
         Симуляция закрытия — возвращает net_pnl
         Реальное обновление позиции — в PositionManager
         """
-        # Получаем данные позиции из PositionManager
         if not self.position_manager:
             logger.error("PositionManager not set in VirtualTrader")
             return None

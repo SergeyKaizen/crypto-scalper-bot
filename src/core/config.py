@@ -54,6 +54,8 @@ def load_config() -> Dict[str, Any]:
         ("min_prob", 0.01),
         ("min_prob_q", 0.01),
         ("min_confidence", 0.01),
+        ("tp_multiplier", 0.01),      # ← добавлено по твоему требованию
+        ("sl_multiplier", 0.01),      # ← добавлено по твоему требованию
     ]
 
     for key, min_value in required_positive:

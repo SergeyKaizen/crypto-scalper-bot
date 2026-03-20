@@ -21,8 +21,8 @@ class PRCalculator:
                 window INTEGER,
                 tp_count INTEGER DEFAULT 0,
                 sl_count INTEGER DEFAULT 0,
-                expected_tp_length FLOAT DEFAULT 0,
-                expected_sl_length FLOAT DEFAULT 0,
+                tp_length FLOAT DEFAULT 0,
+                sl_length FLOAT DEFAULT 0,
                 last_update TIMESTAMP,
                 PRIMARY KEY (symbol, anomaly_type, direction, tf, window)
             )
@@ -32,36 +32,36 @@ class PRCalculator:
         """
         Обновление PR строго по ТЗ (утверждено):
         PR = (tp_count * tp_length) - (sl_count * sl_length)
-        где tp_length / sl_length — ожидаемые значения НА МОМЕНТ СИГНАЛА (из calculate_tp_sl).
+        где tp_length / sl_length — значения НА МОМЕНТ СИГНАЛА (из calculate_tp_sl).
         Суммы по истории убраны полностью.
         """
         tp_count_delta = 1 if hit_tp else 0
         sl_count_delta = 0 if hit_tp else 1
-        expected_tp = tp_length if hit_tp else 0
-        expected_sl = sl_length if not hit_tp else 0
+        tp_len = tp_length if hit_tp else 0
+        sl_len = sl_length if not hit_tp else 0
 
         self.con.execute("""
             INSERT INTO pr_snapshots 
             (symbol, anomaly_type, direction, tf, window, 
-             tp_count, sl_count, expected_tp_length, expected_sl_length, last_update)
+             tp_count, sl_count, tp_length, sl_length, last_update)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(symbol, anomaly_type, direction, tf, window) DO UPDATE SET
                 tp_count = tp_count + excluded.tp_count,
                 sl_count = sl_count + excluded.sl_count,
-                expected_tp_length = COALESCE(expected_tp_length, excluded.expected_tp_length),
-                expected_sl_length = COALESCE(expected_sl_length, excluded.expected_sl_length),
+                tp_length = COALESCE(tp_length, excluded.tp_length),
+                sl_length = COALESCE(sl_length, excluded.sl_length),
                 last_update = CURRENT_TIMESTAMP
         """, (symbol, anomaly_type, direction, tf, window, 
-              tp_count_delta, sl_count_delta, expected_tp, expected_sl))
+              tp_count_delta, sl_count_delta, tp_len, sl_len))
 
         self.con.commit()
 
     def get_best_config(self, symbol: str):
-        """Выбор лучшего условия по формуле ТЗ (PR = tp_count * expected_tp - sl_count * expected_sl)"""
+        """Выбор лучшего условия по формуле ТЗ (PR = tp_count * tp_length - sl_count * sl_length)"""
         row = self.con.execute("""
             SELECT anomaly_type, direction, tf, window,
-                   tp_count, sl_count, expected_tp_length, expected_sl_length,
-                   (tp_count * expected_tp_length - sl_count * expected_sl_length) as pr_value
+                   tp_count, sl_count, tp_length, sl_length,
+                   (tp_count * tp_length - sl_count * sl_length) as pr_value
             FROM pr_snapshots 
             WHERE symbol = ?
             ORDER BY pr_value DESC LIMIT 1
@@ -85,8 +85,8 @@ class PRCalculator:
             "window": window,
             "pr_value": pr_value,
             "setting": setting,
-            "expected_tp_length": row[6] or 0,
-            "expected_sl_length": row[7] or 0
+            "tp_length": row[6] or 0,
+            "sl_length": row[7] or 0
         }
 
     def get_stats(self, symbol: str):

@@ -97,7 +97,8 @@ class PositionManager:
             'is_backtest_signal': is_backtest_signal
         }
 
-        self.tp_sl_manager.add_open_position(pos_data)
+        # === НОВОЕ: передаём window_df для новой логики TP/SL ===
+        self.tp_sl_manager.add_open_position(pos_data, pos_data.get('window_df'))
 
         logger.info(f"Позиция открыта: {pos_id} | {direction} {symbol} | size={size:.4f} | marking={marking}")
         return True
@@ -130,8 +131,8 @@ class PositionManager:
                 self.risk_manager.update_deposit(net_pnl)
 
                 outcome = 1 if hit_tp else 0
-                # Используем PR вместо pnl
-                pr_value = pos_data.get('expected_pr', net_pnl)
+                # Используем PR вместо pnl (tp_length / sl_length)
+                pr_value = pos_data.get('tp_length', 0) if hit_tp else -pos_data.get('sl_length', 0)
                 self.scenario_tracker.add_scenario(pos_data.get('feats', {}), outcome, pr_value)
 
                 pos_info['state'] = PositionState.CLOSED

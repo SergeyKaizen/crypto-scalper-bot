@@ -7,13 +7,18 @@ TP/SL Manager — модуль управления тейк-профитами 
 Теперь поддерживает trailing_mode (manual/auto) и partial_trailing с объёмами фиксации.
 
 После аудита (Phase 5):
-- calculate_tp_sl возвращает expected TP/SL **на момент сигнала** (для корректного PR)
-- add_open_position сохраняет expected_tp_length / expected_sl_length
+- calculate_tp_sl возвращает tp/sl **на момент сигнала** (для корректного PR)
+- НОВАЯ ЛОГИКА ПО ТВОИМ ПРАВИЛАМ (без ATR):
+  - TP = средний размер свечи за всё окно * tp_multiplier
+  - SL Short = HH + 0.05%, с лимитом расстояния (средний размер * 2)
+  - SL Long = LL - 0.05%, с тем же лимитом
+- add_open_position сохраняет tp_length / sl_length
 - check_tp_sl возвращает расширенный dict (для PRCalculator)
 """
 
 import logging
 from typing import Dict, Optional
+import polars as pl
 
 from src.core.config import load_config
 from src.core.enums import AnomalyType, Direction
@@ -31,60 +36,68 @@ class TP_SL_Manager:
         self.partial_tp_volumes = self.config["trading"].get("partial_tp_volumes", [50, 25])
         self.open_positions = {}
 
-    def calculate_tp_sl(self, features: Dict, anomaly_type: str) -> Dict[str, Optional[float]]:
+    def calculate_tp_sl(self, features: Dict, window_df: pl.DataFrame) -> Dict[str, Optional[float]]:
         """
-        Возвращает expected TP/SL **на момент сигнала** (для PR).
-        Это значение фиксируется и передаётся в PRCalculator.
+        НОВАЯ ЛОГИКА ПО ТВОИМ ПРАВИЛАМ (без ATR):
+        - TP = средний размер свечи за всё окно * tp_multiplier
+        - SL Short = HH + 0.05%, с лимитом расстояния (средний размер * 2)
+        - SL Long = LL - 0.05%, с тем же лимитом
+        Возвращает tp, sl, tp_length, sl_length (для PR).
         """
         entry_price = features.get('close', 0.0)
-        atr = features.get('atr', 0.0)
-
-        if entry_price <= 0:
-            return {'tp': None, 'sl': None, 'expected_tp_length': 0.0, 'expected_sl_length': 0.0}
+        if entry_price <= 0 or window_df.is_empty():
+            return {'tp': None, 'sl': None, 'tp_length': 0.0, 'sl_length': 0.0}
 
         tp_multiplier = self.config["trading"].get("tp_multiplier", 1.0)
         sl_multiplier = self.config["trading"].get("sl_multiplier", 1.0)
 
-        if anomaly_type == AnomalyType.C.value:
-            tp_distance = atr * tp_multiplier * 1.2
-            sl_distance = atr * sl_multiplier * 0.8
-        elif anomaly_type == AnomalyType.V.value:
-            tp_distance = atr * tp_multiplier * 0.8
-            sl_distance = atr * sl_multiplier * 1.2
-        else:
-            tp_distance = atr * tp_multiplier
-            sl_distance = atr * sl_multiplier
+        # Средний размер свечи за ВСЁ окно (в %)
+        candle_sizes = (window_df["high"] - window_df["low"]) / window_df["high"] * 100
+        avg_candle_size_pct = candle_sizes.mean()
 
+        # TP
+        tp_distance = (avg_candle_size_pct / 100) * entry_price * tp_multiplier
         direction = features.get('direction', 'L')
         if direction == 'L':
             tp = entry_price + tp_distance
-            sl = entry_price - sl_distance
         else:
             tp = entry_price - tp_distance
-            sl = entry_price + sl_distance
 
-        expected_tp_length = abs(tp - entry_price) / entry_price * 100
-        expected_sl_length = abs(sl - entry_price) / entry_price * 100
+        # SL (поиск HH/LL с лимитом)
+        if direction == 'S':
+            highs = window_df["high"].sort(descending=True)
+            sl = None
+            for hh in highs:
+                candidate = hh + (hh * 0.0005)  # +0.05%
+                distance = candidate - entry_price
+                if distance <= (avg_candle_size_pct / 100 * entry_price * 2):
+                    sl = candidate
+                    break
+            if sl is None:
+                sl = highs[0] + (highs[0] * 0.0005)  # fallback
+        else:  # Long
+            lows = window_df["low"].sort(ascending=True)
+            sl = None
+            for ll in lows:
+                candidate = ll - (ll * 0.0005)  # -0.05%
+                distance = entry_price - candidate
+                if distance <= (avg_candle_size_pct / 100 * entry_price * 2):
+                    sl = candidate
+                    break
+            if sl is None:
+                sl = lows[0] - (lows[0] * 0.0005)  # fallback
+
+        tp_length = abs(tp - entry_price) / entry_price * 100
+        sl_length = abs(sl - entry_price) / entry_price * 100
 
         return {
             'tp': round(tp, 4),
             'sl': round(sl, 4),
-            'expected_tp_length': expected_tp_length,
-            'expected_sl_length': expected_sl_length
+            'tp_length': tp_length,
+            'sl_length': sl_length
         }
 
-    def calculate_sl(self, candle_data: Dict, direction: str) -> float:
-        close = candle_data.get('close', 0.0)
-        atr = candle_data.get('atr', 0.0)
-        sl_multiplier = self.config["trading"].get("sl_multiplier", 1.0)
-        sl_distance = atr * sl_multiplier
-
-        if direction == 'L':
-            return round(close - sl_distance, 4)
-        else:
-            return round(close + sl_distance, 4)
-
-    def add_open_position(self, position: Dict):
+    def add_open_position(self, position: Dict, window_df: pl.DataFrame):
         pos_id = position.get('pos_id')
         if not pos_id:
             return
@@ -93,10 +106,10 @@ class TP_SL_Manager:
         position['trailing_stop_price'] = position.get('sl')
         position['remaining_size'] = position.get('size', 0.0)
 
-        # Сохраняем expected длины для PR
-        tp_sl = self.calculate_tp_sl(position.get('feats', {}), position.get('anomaly_type', 'C'))
-        position['expected_tp_length'] = tp_sl.get('expected_tp_length', 0.0)
-        position['expected_sl_length'] = tp_sl.get('expected_sl_length', 0.0)
+        # Сохраняем длины для PR (без "expected")
+        tp_sl = self.calculate_tp_sl(position.get('feats', {}), window_df)
+        position['tp_length'] = tp_sl.get('tp_length', 0.0)
+        position['sl_length'] = tp_sl.get('sl_length', 0.0)
 
         self.open_positions[pos_id] = position
 
@@ -136,6 +149,7 @@ class TP_SL_Manager:
         self.update_trailing_stop(position, current_price)
         return {'hit': False}
 
+    # _handle_partial_trailing и update_trailing_stop оставлены без изменений (как ты утвердил)
     def _handle_partial_trailing(self, position: Dict, current_price: float):
         if self.config["trading"].get("tp_sl_mode") != "partial_trailing":
             return

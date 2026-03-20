@@ -21,6 +21,7 @@ src/model/scenario_tracker.py
 - Time-decay: старые сценарии теряют вес (half_life=90 дней)
 - Regime: разделяет статистику на бычий/медвежий тренд и флэт
 - После аудита (Phase 3): total_pr вместо total_pnl + save_every_trades + backup + удалён HDBSCAN weight_cache
+- Добавлен общий sequential_pattern_vector (по твоему утверждению пункта 8)
 """
 
 import numpy as np
@@ -45,7 +46,7 @@ class ScenarioTracker:
         self.scenario_dict = defaultdict(lambda: {
             'wins': 0,
             'count': 0,
-            'total_pr': 0.0,          # ← изменено на total_pr
+            'total_pr': 0.0,
             'last_update': datetime.utcnow()
         })
         self.scenarios = deque(maxlen=self.max_scenarios)
@@ -60,7 +61,6 @@ class ScenarioTracker:
         self.decay_enabled = self.config['scenario_tracker'].get('decay_enabled', True)
         self.delta_threshold = self.config['scenario_tracker']['regime']['delta_norm_threshold']
 
-        # НОВАЯ НАСТРОЙКА ИЗ CONFIG
         self.save_every_trades = self.config['scenario_tracker'].get('save_every_trades', 50)
 
         self._load_from_pickle()
@@ -83,14 +83,12 @@ class ScenarioTracker:
 
     def _save_to_pickle(self):
         try:
-            # Основное сохранение
             with open(self.pickle_path, 'wb') as f:
                 pickle.dump({
                     'scenario_dict': dict(self.scenario_dict),
                     'scenarios': list(self.scenarios)
                 }, f)
             
-            # BACKUP (по твоему требованию)
             timestamp = datetime.now().strftime('%Y%m%d_%H%M')
             backup_path = os.path.join(self.data_dir, f'scenario_tracker_backup_{timestamp}.pkl')
             shutil.copy2(self.pickle_path, backup_path)
@@ -102,6 +100,7 @@ class ScenarioTracker:
     def _binarize_features(self, feats: Dict) -> tuple:
         states = []
 
+        # Базовые признаки
         for key in ['volume', 'bid', 'ask', 'delta', 'mid_price_left', 'mid_price_right',
                     'price_change', 'volatility', 'price_channel_position', 'va_position',
                     'delta_mid_dist', 'delta_means']:
@@ -116,6 +115,7 @@ class ScenarioTracker:
         states.append(1 if feats.get('norm_dist_to_delta_vah', 0) > 0 else 0)
         states.append(1 if feats.get('norm_dist_to_delta_val', 0) < 0 else 0)
 
+        # === ОБЩИЙ SEQUENTIAL_PATTERN_VECTOR (по твоему утверждению пункта 8) ===
         seq_keys = [
             'sequential_delta_positive_count', 'sequential_delta_increased_count',
             'sequential_volume_increased_count', 'sequential_bid_increased_count',
@@ -128,9 +128,9 @@ class ScenarioTracker:
             states.append(1 if count >= 2 else 0)
             states.append(1 if count >= 4 else 0)
 
-        states.append(1 if feats.get('quiet_streak', 0) >= 3 else 0)
-        states.append(1 if feats.get('quiet_streak', 0) >= 5 else 0)
+        # quiet_streak полностью удалён (как утверждено)
 
+        # Regime
         states.append(feats.get('regime_bull_strength', 0))
         states.append(feats.get('regime_bear_strength', 0))
 
@@ -146,7 +146,7 @@ class ScenarioTracker:
             self.scenario_dict[key] = {
                 'wins': 0,
                 'count': 0,
-                'total_pr': 0.0,          # ← изменено на total_pr
+                'total_pr': 0.0,
                 'last_update': datetime.utcnow()
             }
             self.scenarios.append(key)
@@ -155,12 +155,11 @@ class ScenarioTracker:
         entry['count'] += 1
         if outcome == 1:
             entry['wins'] += 1
-        entry['total_pr'] += pr          # ← используем total_pr
+        entry['total_pr'] += pr
         entry['last_update'] = datetime.utcnow()
 
         total = sum(e['count'] for e in self.scenario_dict.values())
         
-        # Сохранение каждые N сделок (из config)
         if total % self.save_every_trades == 0:
             self._save_to_pickle()
             self.export_statistics()

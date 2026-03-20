@@ -1,5 +1,6 @@
+# src/core/enums.py
+
 """
-src/core/enums.py
 
 === Основной принцип работы файла ===
 

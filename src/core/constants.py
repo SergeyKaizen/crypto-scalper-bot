@@ -1,3 +1,5 @@
+# src/core/constants.py
+
 WINDOWS_SIZES = [24, 50, 74, 100]
 
 LOOKBACK_ANOMALY = 25

@@ -1,5 +1,6 @@
+#src/data/binance_client.py
+
 """
-src/data/binance_client.py
 
 === Основной принцип работы файла ===
 
