@@ -286,6 +286,11 @@ features:
 
   # Период ценового канала
   price_channel_period: 100
+  
+monitoring:
+  telegram_token: "ТОКЕН_БОТА"
+  telegram_chat_id: "ВАШ_CHAT_ID"
+  enable_telegram: true
 
 paths:
   data_dir: "data"

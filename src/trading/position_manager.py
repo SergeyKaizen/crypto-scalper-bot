@@ -17,6 +17,7 @@ from enum import Enum
 from typing import Dict, Optional
 import time
 import logging
+import asyncio
 
 from src.core.config import load_config
 from src.trading.risk_manager import RiskManager
@@ -25,6 +26,15 @@ from src.trading.virtual_trader import VirtualTrader
 from src.trading.tp_sl_manager import TP_SL_Manager
 from src.model.scenario_tracker import ScenarioTracker
 from src.utils.logger import setup_logger
+
+# Telegram
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+# Для реальной генерации графика
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import pandas as pd
+from src.data.storage import Storage
 
 logger = setup_logger('position_manager', logging.INFO)
 
@@ -41,9 +51,36 @@ class PositionManager:
         self.virtual_trader = VirtualTrader()
         self.tp_sl_manager = TP_SL_Manager()
         self.scenario_tracker = ScenarioTracker()
+        self.storage = Storage()
 
         # === SINGLE SOURCE OF TRUTH ===
         self.positions = {}  # pos_id → {'data': dict, 'state': PositionState, ...}
+
+    async def send_telegram_alert(self, log_text: str, symbol: str):
+        """Отправляет подробный лог + кнопку 'Показать график' + реальный график"""
+        if not self.config.get('monitoring', {}).get('enable_telegram', False):
+            return
+
+        token = self.config['monitoring'].get('telegram_token')
+        chat_id = self.config['monitoring'].get('telegram_chat_id')
+
+        if not token or not chat_id:
+            return
+
+        keyboard = [[InlineKeyboardButton("📊 Показать график", callback_data=f"graph_{symbol}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        try:
+            from telegram.ext import Application
+            app = Application.builder().token(token).build()
+            await app.bot.send_message(
+                chat_id=chat_id,
+                text=log_text,
+                reply_markup=reply_markup,
+                parse_mode='HTML'
+            )
+        except Exception as e:
+            logger.error(f"Ошибка отправки Telegram: {e}")
 
     def open_position(self, pos_data: Dict, is_backtest_signal: bool = False):
         """
@@ -127,6 +164,10 @@ class PositionManager:
    • Ожидаемое движение: TP {pos_data.get('tp_length', 0):.2f}% | SL {pos_data.get('sl_length', 0):.2f}% | RR {pos_data.get('tp_length', 1)/pos_data.get('sl_length', 1):.2f}
 """
         logger.info(log_msg.strip())
+
+        # === Telegram + кнопка "Показать график" ===
+        if self.config.get('monitoring', {}).get('enable_telegram', False):
+            asyncio.create_task(self.send_telegram_alert(log_msg.strip(), symbol))
 
         logger.info(f"Позиция открыта: {pos_id} | {direction} {symbol} | size={size:.4f} | marking={marking}")
         return True
